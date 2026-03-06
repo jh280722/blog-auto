@@ -140,34 +140,89 @@
   }
 
   /**
-   * 본문 입력 (HTML)
+   * TinyMCE activeEditor 가져오기 (안전하게)
+   */
+  function getTinyMCEEditor() {
+    if (window.tinymce?.activeEditor) return window.tinymce.activeEditor;
+    try {
+      const iframe = document.querySelector(S.editor.iframe);
+      const win = iframe?.contentWindow;
+      if (win?.tinymce?.activeEditor) return win.tinymce.activeEditor;
+    } catch (e) { /* cross-origin */ }
+    try {
+      if (window.tinymce?.editors?.length > 0) return window.tinymce.editors[0];
+    } catch (e) { /* not available */ }
+    return null;
+  }
+
+  /**
+   * 본문 입력 (HTML) — TinyMCE API 우선, DOM fallback
+   * TinyMCE setContent + save를 사용하여 내부 textarea 동기화 보장
    */
   async function setContent(htmlContent) {
     try {
-      await delay(500); // 에디터 로딩 대기
+      if (!htmlContent || htmlContent.trim().length === 0) {
+        return { success: false, error: '본문 내용이 비어있습니다.', status: 'content_empty' };
+      }
 
-      const editorDoc = getEditorDocument();
-      if (!editorDoc) throw new Error('에디터 문서를 찾을 수 없음');
+      await delay(500);
 
-      const body = getEditorBody(editorDoc);
-      if (!body) throw new Error('에디터 본문 영역을 찾을 수 없음');
+      let contentSet = false;
 
-      // 기존 내용 비우고 새 내용 삽입
-      body.innerHTML = htmlContent;
-
-      // TinyMCE에 변경 사항 알리기
-      body.dispatchEvent(new Event('input', { bubbles: true }));
-      body.dispatchEvent(new Event('change', { bubbles: true }));
-
-      // TinyMCE API가 있으면 직접 호출
-      try {
-        const win = document.querySelector(S.editor.iframe)?.contentWindow;
-        if (win?.tinymce?.activeEditor) {
-          win.tinymce.activeEditor.setContent(htmlContent);
+      // 1차: TinyMCE API (가장 안전한 경로 — 내부 textarea 동기화 포함)
+      const editor = getTinyMCEEditor();
+      if (editor) {
+        try {
+          editor.setContent(htmlContent);
+          editor.save();
+          editor.fire('change');
+          contentSet = true;
+          console.log('[TistoryAuto] TinyMCE API로 본문 입력 완료');
+        } catch (e) {
+          console.warn('[TistoryAuto] TinyMCE setContent 실패, fallback 시도:', e);
         }
-      } catch (e) { /* tinymce API 없으면 무시 */ }
+      }
 
-      console.log('[TistoryAuto] 본문 입력 완료');
+      // 2차: DOM fallback (TinyMCE API 불가 시 — 에디터 body에 직접 삽입)
+      if (!contentSet) {
+        const editorDoc = getEditorDocument();
+        if (!editorDoc) {
+          return { success: false, error: '에디터를 찾을 수 없음', status: 'editor_not_ready' };
+        }
+        const body = getEditorBody(editorDoc);
+        if (!body) {
+          return { success: false, error: '에디터 본문 영역을 찾을 수 없음', status: 'editor_not_ready' };
+        }
+        // DOM 조작으로 콘텐츠 설정 (사용자 입력 HTML을 에디터에 반영)
+        body.textContent = '';
+        const temp = editorDoc.createElement('div');
+        temp.innerHTML = htmlContent; // eslint-disable-line -- 사용자 본인의 HTML 콘텐츠
+        while (temp.firstChild) {
+          body.appendChild(temp.firstChild);
+        }
+        body.dispatchEvent(new Event('input', { bubbles: true }));
+        body.dispatchEvent(new Event('change', { bubbles: true }));
+        contentSet = true;
+        console.log('[TistoryAuto] DOM fallback으로 본문 입력 완료');
+      }
+
+      // 검증: 본문이 실제로 들어갔는지 확인
+      await delay(300);
+      const verifyEditor = getTinyMCEEditor();
+      if (verifyEditor) {
+        const currentContent = verifyEditor.getContent();
+        if (!currentContent || currentContent.trim().length === 0) {
+          return { success: false, error: '본문이 에디터에 반영되지 않음', status: 'verification_failed' };
+        }
+      } else {
+        const editorDoc = getEditorDocument();
+        const body = editorDoc ? getEditorBody(editorDoc) : null;
+        const bodyText = body ? body.textContent.trim() : '';
+        if (body && bodyText.length === 0) {
+          return { success: false, error: '본문이 에디터에 반영되지 않음', status: 'verification_failed' };
+        }
+      }
+
       return { success: true };
     } catch (error) {
       console.error('[TistoryAuto] 본문 입력 실패:', error);
@@ -415,28 +470,131 @@
   }
 
   /**
-   * 발행 실행 ("완료" 버튼)
+   * CAPTCHA/차단 상태 감지
+   */
+  function detectCaptcha() {
+    // DKAPTCHA, reCAPTCHA, 또는 기타 보안 요소 감지
+    const captchaSelectors = [
+      '#dkaptcha', '.dkaptcha', '[class*="captcha"]', '[id*="captcha"]',
+      '.g-recaptcha', '#recaptcha', 'iframe[src*="captcha"]',
+      '.captcha-wrap', '#captchaImg'
+    ];
+    for (const sel of captchaSelectors) {
+      const el = document.querySelector(sel);
+      if (el && el.offsetParent !== null) return true; // visible captcha
+    }
+    return false;
+  }
+
+  /**
+   * "저장중" 스피너가 사라질 때까지 대기
+   */
+  async function waitForSaveComplete(timeout = 15000) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      // 저장중/발행중 인디케이터 체크
+      const saving = document.querySelector('.saving, .btn-publish.disabled, .loading, [class*="saving"]');
+      if (!saving || saving.offsetParent === null) return true;
+      await delay(500);
+    }
+    return false; // 타임아웃
+  }
+
+  /**
+   * 발행 실행 ("완료" 버튼) — captcha 감지 + 발행 검증 포함
    */
   async function publish() {
     try {
-      // "완료" 버튼 클릭 → 발행 설정 레이어 열림
-      const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
-      if (!completeBtn) throw new Error('완료 버튼을 찾을 수 없음');
-
-      completeBtn.click();
-      await delay(1000);
-
-      // 발행 레이어가 열렸을 경우 최종 확인 버튼 클릭
-      const confirmBtn = findElement(S.publish.confirmButton, null);
-      if (confirmBtn) {
-        confirmBtn.click();
-        console.log('[TistoryAuto] 발행 완료!');
-        return { success: true };
+      // 사전 체크: CAPTCHA가 이미 표시되어 있는지
+      if (detectCaptcha()) {
+        console.warn('[TistoryAuto] CAPTCHA 감지됨 — 수동 처리 필요');
+        return { success: false, error: 'CAPTCHA가 감지되었습니다. 수동으로 처리해주세요.', status: 'captcha_required' };
       }
 
-      // 발행 레이어 없이 바로 발행된 경우
-      console.log('[TistoryAuto] 완료 버튼 클릭 완료 (바로 발행됨)');
-      return { success: true };
+      // TinyMCE save() 호출하여 에디터 내용을 textarea에 동기화
+      const editor = getTinyMCEEditor();
+      if (editor) {
+        try { editor.save(); } catch (e) { /* 무시 */ }
+      }
+
+      // "완료" 버튼 클릭 → 발행 설정 레이어 열림
+      const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
+      if (!completeBtn) {
+        return { success: false, error: '완료 버튼을 찾을 수 없음', status: 'editor_not_ready' };
+      }
+
+      completeBtn.click();
+      await delay(1500);
+
+      // CAPTCHA 체크 (완료 버튼 클릭 후 나타날 수 있음)
+      if (detectCaptcha()) {
+        console.warn('[TistoryAuto] 발행 시도 후 CAPTCHA 감지됨');
+        return { success: false, error: '발행 중 CAPTCHA가 감지되었습니다.', status: 'captcha_required' };
+      }
+
+      // 발행 레이어가 열렸는지 확인
+      const publishLayer = document.querySelector('.publish-layer, #publish-layer, .layer-publish');
+      const confirmBtn = findElement(S.publish.confirmButton, null);
+
+      if (confirmBtn) {
+        // 발행 레이어 내에서 공개 설정이 올바른지 확인 가능
+        const urlBefore = window.location.href;
+
+        confirmBtn.click();
+        console.log('[TistoryAuto] 최종 발행 버튼 클릭');
+        await delay(2000);
+
+        // CAPTCHA 체크 (최종 발행 후)
+        if (detectCaptcha()) {
+          return { success: false, error: '최종 발행 후 CAPTCHA가 감지되었습니다.', status: 'captcha_required' };
+        }
+
+        // "저장중" 스피너 대기
+        const saveComplete = await waitForSaveComplete(15000);
+        if (!saveComplete) {
+          return { success: false, error: '"저장중" 상태가 15초 이상 지속됨', status: 'save_timeout' };
+        }
+
+        // 발행 성공 검증: URL 변경 또는 성공 알림 확인
+        await delay(1000);
+        const urlAfter = window.location.href;
+        const urlChanged = urlAfter !== urlBefore;
+        const hasSuccessIndicator = !!document.querySelector('.success, .alert-success, [class*="complete"]');
+        const isStillOnNewPost = urlAfter.includes('/manage/newpost');
+
+        // 에러 메시지 체크
+        const errorEl = document.querySelector('.error-message, .alert-error, [class*="error"]:not([class*="error-hide"])');
+        if (errorEl && errorEl.offsetParent !== null && errorEl.textContent.trim().length > 0) {
+          return { success: false, error: `발행 오류: ${errorEl.textContent.trim()}`, status: 'publish_error' };
+        }
+
+        if (urlChanged || hasSuccessIndicator) {
+          console.log('[TistoryAuto] 발행 완료! URL:', urlAfter);
+          return { success: true, status: 'published', url: urlAfter };
+        }
+
+        // URL 변경 없이 여전히 newpost 페이지라면 의심
+        if (isStillOnNewPost) {
+          console.warn('[TistoryAuto] 발행 후에도 글쓰기 페이지에 머물러 있음');
+          return { success: false, error: '발행 후에도 글쓰기 페이지에서 이동하지 않음', status: 'verification_failed' };
+        }
+
+        return { success: true, status: 'published' };
+      }
+
+      // 발행 레이어 없이 바로 발행 시도된 경우 — 검증 수행
+      await delay(2000);
+      const saveComplete = await waitForSaveComplete(15000);
+      if (!saveComplete) {
+        return { success: false, error: '"저장중" 상태가 지속됨', status: 'save_timeout' };
+      }
+
+      if (detectCaptcha()) {
+        return { success: false, error: 'CAPTCHA 감지됨', status: 'captcha_required' };
+      }
+
+      console.log('[TistoryAuto] 완료 버튼으로 발행됨 (레이어 없음)');
+      return { success: true, status: 'published' };
     } catch (error) {
       console.error('[TistoryAuto] 발행 실패:', error);
       return { success: false, error: error.message };
@@ -487,15 +645,36 @@
 
     // 7. 발행 (autoPublish가 true인 경우)
     if (postData.autoPublish) {
+      // 발행 전 에디터 내용 최종 확인 — publish() 호출 이전에 수행
+      if (results.content?.success) {
+        const editor = getTinyMCEEditor();
+        if (editor) {
+          const finalContent = editor.getContent();
+          if (!finalContent || finalContent.trim().length === 0) {
+            return {
+              success: false,
+              status: 'content_empty',
+              results,
+              message: '발행 직전 에디터 본문이 비어있어 발행을 중단합니다.'
+            };
+          }
+        }
+      }
+
       await delay(500);
       results.publish = await publish();
     }
 
     const allSuccess = Object.values(results).every(r => r.success);
+    // 개별 단계에서 특수 상태가 반환된 경우 전파
+    const failedStep = Object.entries(results).find(([, r]) => !r.success && r.status);
+    const status = failedStep ? failedStep[1].status : (allSuccess ? 'published' : 'partial_failure');
+
     console.log('[TistoryAuto] 글 작성 결과:', results);
 
     return {
       success: allSuccess,
+      status,
       results,
       message: allSuccess ? '글 작성이 완료되었습니다.' : '일부 단계에서 오류가 발생했습니다.'
     };

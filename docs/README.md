@@ -92,6 +92,35 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - 글쓰기 페이지(`/manage/newpost`)가 **열려있어야** 발행이 동작합니다
 - 티스토리 에디터 업데이트 시 `content/selectors.js`의 셀렉터를 조정해야 할 수 있습니다
 
+## 🔒 발행 상태 코드 (v1.1.0)
+
+응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
+
+| 상태 | 설명 |
+|------|------|
+| `published` | 발행 성공 |
+| `captcha_required` | CAPTCHA(DKAPTCHA 등)가 감지됨 — 수동 처리 필요. 큐 처리도 자동 중단됨 |
+| `editor_not_ready` | 에디터/콘텐츠 스크립트가 준비되지 않음 |
+| `content_empty` | 본문이 비어있거나 에디터에 반영되지 않음 |
+| `verification_failed` | 발행 후 검증 실패 (URL 미변경, 본문 손실 등) |
+| `save_timeout` | "저장중" 상태가 15초 이상 지속됨 |
+| `publish_error` | 티스토리가 에러 메시지를 표시함 |
+| `partial_failure` | 일부 단계(제목, 태그 등)에서 실패 |
+| `unknown_error` | 분류되지 않은 오류 |
+
+### 예시 응답
+
+```javascript
+// 성공
+{ success: true, status: "published", url: "https://blog.tistory.com/123" }
+
+// CAPTCHA 차단
+{ success: false, status: "captcha_required", error: "CAPTCHA가 감지되었습니다." }
+
+// 빈 본문 방지
+{ success: false, status: "content_empty", error: "본문 내용이 비어있습니다." }
+```
+
 ## 📡 API 액션 목록
 
 | 액션 | 설명 |

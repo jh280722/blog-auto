@@ -99,9 +99,19 @@ async function processNextInQueue() {
     if (response.success) {
       item.status = 'completed';
       item.completedAt = new Date().toISOString();
+      item.publishStatus = response.status || 'published';
     } else {
+      // captcha_required는 즉시 큐 처리를 중단해야 함
       item.status = 'failed';
-      item.error = response.message || '발행 실패';
+      item.error = response.error || response.message || '발행 실패';
+      item.publishStatus = response.status || 'unknown_error';
+
+      if (response.status === 'captcha_required') {
+        console.warn('[TistoryAuto BG] CAPTCHA 감지 — 큐 처리를 중단합니다.');
+        await saveQueueState();
+        isProcessing = false;
+        return; // 다음 항목 처리하지 않음
+      }
     }
   } catch (error) {
     item.status = 'failed';
@@ -111,10 +121,12 @@ async function processNextInQueue() {
   await saveQueueState();
   isProcessing = false;
 
-  // 다음 항목 처리 (딜레이 포함)
+  // 다음 항목 처리 (사용자 설정 간격 사용)
   const nextPending = publishQueue.find(i => i.status === 'pending');
   if (nextPending) {
-    setTimeout(() => processNextInQueue(), 5000); // 5초 간격
+    const settings = await chrome.storage.local.get('publishInterval');
+    const intervalMs = ((settings.publishInterval || 5) * 1000);
+    setTimeout(() => processNextInQueue(), intervalMs);
   }
 }
 
@@ -124,6 +136,31 @@ async function processNextInQueue() {
 async function getBlogName() {
   const result = await chrome.storage.local.get('blogName');
   return result.blogName || null;
+}
+
+/**
+ * 최적의 티스토리 글쓰기 탭 찾기
+ * 우선순위: newpost 탭 > 현재 추적 중인 탭 > 아무 manage 탭
+ */
+async function findBestTistoryTab() {
+  const allTabs = await chrome.tabs.query({ url: '*://*.tistory.com/manage/*' });
+  if (allTabs.length === 0) return null;
+
+  // 1순위: newpost 탭 (새 글쓰기)
+  const newPostTab = allTabs.find(t => t.url?.includes('/manage/newpost'));
+  if (newPostTab) return newPostTab;
+
+  // 2순위: 현재 추적 중인 탭이 아직 살아있으면
+  if (currentTabId) {
+    const tracked = allTabs.find(t => t.id === currentTabId);
+    if (tracked) return tracked;
+  }
+
+  // 3순위: 편집 탭
+  const editTab = allTabs.find(t => t.url?.includes('/manage/post/'));
+  if (editTab) return editTab;
+
+  return allTabs[0];
 }
 
 // ── 공통 메시지 처리 함수 ──────────────────────────
@@ -144,19 +181,25 @@ async function handleMessage(message, sender) {
     case 'INSERT_IMAGES':
     case 'PUBLISH':
     case 'GET_PAGE_INFO': {
-      // 모든 tistory 글쓰기 탭에서 찾기 (active가 아닐 수도 있음)
-      const allTabs = await chrome.tabs.query({ url: '*://*.tistory.com/manage/*' });
-      const tistoryTab = allTabs[0];
+      const tistoryTab = await findBestTistoryTab();
 
       if (!tistoryTab) {
-        return { success: false, error: '티스토리 글쓰기 페이지를 열어주세요.' };
+        return { success: false, error: '티스토리 글쓰기 페이지를 열어주세요.', status: 'editor_not_ready' };
+      }
+
+      // PING으로 content script 생존 확인
+      try {
+        const pingResult = await chrome.tabs.sendMessage(tistoryTab.id, { action: 'PING' });
+        if (!pingResult?.success) throw new Error('content script not ready');
+      } catch (pingErr) {
+        return { success: false, error: '콘텐츠 스크립트가 준비되지 않았습니다. 페이지를 새로고침해주세요.', status: 'editor_not_ready' };
       }
 
       try {
         const response = await chrome.tabs.sendMessage(tistoryTab.id, message);
         return response;
       } catch (err) {
-        return { success: false, error: '콘텐츠 스크립트와 통신 실패. 페이지를 새로고침해주세요.' };
+        return { success: false, error: '콘텐츠 스크립트와 통신 실패. 페이지를 새로고침해주세요.', status: 'editor_not_ready' };
       }
     }
 

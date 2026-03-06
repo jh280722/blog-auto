@@ -75,6 +75,20 @@ const SELECTORS = {
     bottomBar: '.editor-bottom-bar'
   },
 
+  // CAPTCHA / 보안 레이어
+  captcha: {
+    dkaptcha: '#dkaptcha, .dkaptcha',
+    recaptcha: '.g-recaptcha, #recaptcha',
+    generic: '[class*="captcha"], [id*="captcha"], iframe[src*="captcha"]'
+  },
+
+  // 저장/발행 상태 인디케이터
+  status: {
+    saving: '.saving, .btn-publish.disabled, .loading, [class*="saving"]',
+    error: '.error-message, .alert-error',
+    success: '.success, .alert-success, [class*="complete"]'
+  },
+
   // 글쓰기 페이지 URL 패턴
   page: {
     newPost: '/manage/newpost',

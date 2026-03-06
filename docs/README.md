@@ -2,6 +2,12 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
+> 현재 운영 기준: **v1.3.0**
+> - DKAPTCHA 핸드오프/재개 지원
+> - stale tab 회피 + live content script 확인
+> - 자동저장 복구 팝업 자동 dismiss
+> - **비공개 발행 visibility 강제 보정(MAIN world XHR/fetch interceptor)**
+
 ## 주요 기능
 
 - **팝업 UI**: 확장 프로그램 아이콘 클릭 → 직접 글 작성/발행
@@ -96,6 +102,12 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 
 `api/api-page.html`을 로컬 서버에서 열어 사용하거나, 코드로 직접 호출:
 
+**운영 권장값**
+- 실제 발행: `visibility: "public"`
+- 테스트 발행: `visibility: "private"`
+- DKAPTCHA 발생 시: 브라우저에서 해결 후 `RESUME_DIRECT_PUBLISH`
+- `editor_not_ready` 발생 시: 새 `manage/newpost` 탭을 열고 다시 호출
+
 ```javascript
 const EXTENSION_ID = "your-extension-id";
 
@@ -156,7 +168,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 
 ---
 
-## 발행 상태 코드 (v1.2.0)
+## 발행 상태 코드 (v1.3.0)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 

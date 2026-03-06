@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=600, initial-scale=1.0">
+  <title>Tistory Auto Publisher</title>
+  <link rel="stylesheet" href="popup.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app">
+    <!-- 헤더 -->
+    <header class="header">
+      <div class="header-brand">
+        <div class="logo-icon">✍️</div>
+        <h1>Tistory Auto</h1>
+      </div>
+      <div class="header-status" id="status-indicator">
+        <span class="status-dot"></span>
+        <span class="status-text">대기 중</span>
+      </div>
+    </header>
+
+    <!-- 탭 네비게이션 -->
+    <nav class="tabs">
+      <button class="tab active" data-tab="write">
+        <span class="tab-icon">📝</span> 글쓰기
+      </button>
+      <button class="tab" data-tab="queue">
+        <span class="tab-icon">📋</span> 큐
+        <span class="tab-badge" id="queue-badge" style="display: none;">0</span>
+      </button>
+      <button class="tab" data-tab="settings">
+        <span class="tab-icon">⚙️</span> 설정
+      </button>
+    </nav>
+
+    <!-- 글쓰기 탭 -->
+    <div class="tab-content active" id="tab-write">
+      <!-- 제목 -->
+      <div class="form-group">
+        <label class="form-label">제목</label>
+        <input type="text" id="post-title" class="form-input" placeholder="글 제목을 입력하세요">
+      </div>
+
+      <!-- 카테고리 -->
+      <div class="form-group">
+        <label class="form-label">카테고리</label>
+        <input type="text" id="post-category" class="form-input" placeholder="카테고리명 (비우면 기본값)">
+      </div>
+
+      <!-- 본문 -->
+      <div class="form-group">
+        <label class="form-label">본문 (HTML)</label>
+        <textarea id="post-content" class="form-textarea" placeholder="<p>HTML 형식의 본문을 입력하세요</p>" rows="8"></textarea>
+      </div>
+
+      <!-- 이미지 -->
+      <div class="form-group">
+        <label class="form-label">이미지</label>
+        <div class="image-upload-area" id="image-upload-area">
+          <div class="image-drop-zone" id="image-drop-zone">
+            <span class="drop-icon">🖼️</span>
+            <span class="drop-text">이미지를 드래그하거나 클릭하여 추가</span>
+            <span class="drop-subtext">또는 URL을 아래에 입력하세요</span>
+            <input type="file" id="image-file-input" multiple accept="image/*" style="display: none;">
+          </div>
+          <div class="image-url-input">
+            <input type="text" id="image-url" class="form-input" placeholder="이미지 URL (Enter로 추가)">
+          </div>
+          <div class="image-preview-list" id="image-preview-list"></div>
+        </div>
+      </div>
+
+      <!-- 태그 -->
+      <div class="form-group">
+        <label class="form-label">태그</label>
+        <input type="text" id="post-tags" class="form-input" placeholder="태그1, 태그2, 태그3 (쉼표로 구분)">
+      </div>
+
+      <!-- 공개 설정 -->
+      <div class="form-group">
+        <label class="form-label">공개 설정</label>
+        <div class="radio-group">
+          <label class="radio-label">
+            <input type="radio" name="visibility" value="public" checked> 공개
+          </label>
+          <label class="radio-label">
+            <input type="radio" name="visibility" value="protected"> 보호
+          </label>
+          <label class="radio-label">
+            <input type="radio" name="visibility" value="private"> 비공개
+          </label>
+        </div>
+      </div>
+
+      <!-- 액션 버튼 -->
+      <div class="action-buttons">
+        <button class="btn btn-secondary" id="btn-add-queue">
+          📋 큐에 추가
+        </button>
+        <button class="btn btn-primary" id="btn-publish">
+          🚀 발행
+        </button>
+      </div>
+    </div>
+
+    <!-- 큐 탭 -->
+    <div class="tab-content" id="tab-queue">
+      <div class="queue-header">
+        <span class="queue-count" id="queue-count">0개 항목</span>
+        <div class="queue-actions">
+          <button class="btn btn-sm btn-primary" id="btn-start-queue">▶ 시작</button>
+          <button class="btn btn-sm btn-danger" id="btn-clear-queue">🗑 초기화</button>
+        </div>
+      </div>
+      <div class="queue-list" id="queue-list">
+        <div class="queue-empty">
+          <span class="empty-icon">📭</span>
+          <span>큐가 비어있습니다</span>
+        </div>
+      </div>
+
+      <!-- JSON 대량 입력 -->
+      <div class="form-group" style="margin-top: 12px;">
+        <label class="form-label">📦 JSON 대량 입력</label>
+        <textarea id="batch-json" class="form-textarea" placeholder='[{"title": "제목", "content": "<p>본문</p>", "tags": ["태그"]}]' rows="5"></textarea>
+        <button class="btn btn-secondary btn-full" id="btn-batch-add" style="margin-top: 8px;">
+          JSON 큐에 추가
+        </button>
+      </div>
+    </div>
+
+    <!-- 설정 탭 -->
+    <div class="tab-content" id="tab-settings">
+      <div class="form-group">
+        <label class="form-label">블로그 이름</label>
+        <div class="input-hint">https://<b>{블로그명}</b>.tistory.com</div>
+        <input type="text" id="setting-blog-name" class="form-input" placeholder="your-blog-name">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">발행 간격 (초)</label>
+        <input type="number" id="setting-interval" class="form-input" value="5" min="1" max="60">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">확장 프로그램 ID</label>
+        <div class="extension-id" id="extension-id">로딩 중...</div>
+        <div class="input-hint">외부 API 연동 시 이 ID가 필요합니다</div>
+      </div>
+
+      <button class="btn btn-primary btn-full" id="btn-save-settings">💾 설정 저장</button>
+
+      <div class="settings-footer">
+        <p class="version">v1.0.0</p>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

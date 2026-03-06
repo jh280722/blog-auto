@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Tistory Auto Publisher",
+  "version": "1.0.0",
+  "description": "티스토리 블로그 자동 발행 확장 프로그램 - 심플 UI + 외부 API 지원",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "*://*.tistory.com/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.tistory.com/manage/newpost*", "*://*.tistory.com/manage/post/*"],
+      "js": ["content/selectors.js", "utils/image-handler.js", "content/tistory.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "externally_connectable": {
+    "matches": ["http://localhost/*", "http://127.0.0.1/*"]
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/*"],
+      "matches": ["*://*.tistory.com/*"]
+    }
+  ]
+}

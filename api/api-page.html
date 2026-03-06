@@ -173,6 +173,17 @@
         .code-block .str {
             color: #5cfc8c;
         }
+
+        .tip {
+            margin-top: 14px;
+            padding: 12px 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(92, 140, 252, 0.18);
+            background: rgba(92, 140, 252, 0.08);
+            color: var(--text2);
+            font-size: 12px;
+            line-height: 1.6;
+        }
     </style>
 </head>
 
@@ -186,8 +197,18 @@
             <h2>1. 확장 프로그램 연결</h2>
             <label>Extension ID</label>
             <input type="text" id="ext-id" placeholder="확장 프로그램 설정에서 ID를 확인하세요">
-            <button class="btn btn-primary" id="btn-test-connect">🔌 연결 테스트</button>
+            <label>Blog Name (선택)</label>
+            <input type="text" id="api-blog-name" placeholder="your-blog-name">
+            <div class="actions">
+                <button class="btn btn-primary" id="btn-test-connect">🔌 연결 테스트</button>
+                <button class="btn btn-secondary" id="btn-prepare-editor">🛠️ PREPARE_EDITOR</button>
+            </div>
+            <div class="tip">
+                권장 순서: <strong>PREPARE_EDITOR → WRITE_POST</strong><br>
+                브라우저를 새로 열었거나 티스토리 탭이 stale 상태일 때 먼저 호출하면 `tabId`, `url`, `blogName`, `diagnostics`를 확인할 수 있습니다.
+            </div>
             <div class="result" id="connect-result"></div>
+            <div class="result" id="prepare-result"></div>
         </div>
 
         <!-- 단건 발행 -->
@@ -244,10 +265,17 @@
             <div class="code-block">
                 <span class="key">const</span> EXTENSION_ID = <span class="str">"YOUR_EXTENSION_ID"</span>;
 
-                <span class="key">// 단건 발행</span>
+                <span class="key">// 1) 에디터 준비</span>
+                chrome.runtime.sendMessage(EXTENSION_ID, {
+                <span class="key">action</span>: <span class="str">"PREPARE_EDITOR"</span>,
+                <span class="key">data</span>: { <span class="key">blogName</span>: <span class="str">"your-blog-name"</span> }
+                }, (response) => console.log(response));
+
+                <span class="key">// 2) 단건 발행</span>
                 chrome.runtime.sendMessage(EXTENSION_ID, {
                 <span class="key">action</span>: <span class="str">"WRITE_POST"</span>,
                 <span class="key">data</span>: {
+                <span class="key">blogName</span>: <span class="str">"your-blog-name"</span>,
                 <span class="key">title</span>: <span class="str">"글 제목"</span>,
                 <span class="key">content</span>: <span class="str">"&lt;p&gt;본문 HTML&lt;/p&gt;"</span>,
                 <span class="key">category</span>: <span class="str">"카테고리명"</span>,
@@ -278,6 +306,16 @@
 
         function getExtId() {
             return $('#ext-id').value.trim();
+        }
+
+        function getRequestedBlogName() {
+            return $('#api-blog-name').value.trim() || null;
+        }
+
+        function getPreparePayload() {
+            return {
+                blogName: getRequestedBlogName()
+            };
         }
 
         function showResult(elementId, data, isError = false) {
@@ -318,12 +356,22 @@
             }
         });
 
+        $('#btn-prepare-editor').addEventListener('click', async () => {
+            try {
+                const result = await sendToExtension('PREPARE_EDITOR', getPreparePayload());
+                showResult('#prepare-result', result, !result.success);
+            } catch (err) {
+                showResult('#prepare-result', err.message, true);
+            }
+        });
+
         // 단건 발행
         function getFormData() {
             const tagsRaw = $('#api-tags').value.trim();
             const imagesRaw = $('#api-images').value.trim();
 
             return {
+                blogName: getRequestedBlogName(),
                 title: $('#api-title').value.trim(),
                 content: $('#api-content').value.trim(),
                 category: $('#api-category').value.trim() || null,

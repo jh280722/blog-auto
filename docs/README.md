@@ -106,14 +106,26 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 - 실제 발행: `visibility: "public"`
 - 테스트 발행: `visibility: "private"`
 - DKAPTCHA 발생 시: 브라우저에서 해결 후 `RESUME_DIRECT_PUBLISH`
-- `editor_not_ready` 발생 시: 새 `manage/newpost` 탭을 열고 다시 호출
+- 브라우저 시작 직후/오래된 티스토리 탭 사용 시: 먼저 `PREPARE_EDITOR`
+- `editor_not_ready` 발생 시: `diagnostics` 확인 후 `PREPARE_EDITOR` 재호출
 
 ```javascript
 const EXTENSION_ID = "your-extension-id";
 
 chrome.runtime.sendMessage(EXTENSION_ID, {
+  action: "PREPARE_EDITOR",
+  data: {
+    blogName: "your-blog-name" // 선택: 저장된 설정이 있으면 생략 가능
+  }
+}, (response) => {
+  console.log(response);
+  // { success: true, status: "editor_ready", tabId, url, blogName, diagnostics }
+});
+
+chrome.runtime.sendMessage(EXTENSION_ID, {
   action: "WRITE_POST",
   data: {
+    blogName: "your-blog-name", // 선택: 저장된 설정이 있으면 생략 가능
     title: "글 제목",
     content: "<p>본문 HTML</p>",
     category: "카테고리명",
@@ -127,9 +139,18 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
     // CAPTCHA 감지 — 사용자가 해결 후 RESUME_DIRECT_PUBLISH 호출
     console.log('CAPTCHA 필요: 브라우저에서 해결 후 재개하세요');
   }
+  if (response.status === 'editor_not_ready') {
+    console.log(response.diagnostics);
+  }
   console.log(response);
 });
 ```
+
+**운영 권장 순서**
+1. `PREPARE_EDITOR` 호출
+2. `success: true`, `status: "editor_ready"` 확인
+3. `WRITE_POST` 호출
+4. `editor_not_ready`면 `diagnostics.attempts`를 보고 `PREPARE_EDITOR` 재호출
 
 ---
 
@@ -162,7 +183,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 ## 주의사항
 
 - 티스토리에 **로그인된 상태**에서 사용해야 합니다
-- 글쓰기 페이지(`/manage/newpost`)가 **열려있어야** 발행이 동작합니다
+- 저장된 `blogName` 또는 요청의 `data.blogName`이 있으면 `PREPARE_EDITOR`/`WRITE_POST`가 `/manage/newpost` 탭을 자동으로 복구하거나 새로 엽니다
 - CAPTCHA 해결 중 에디터 탭을 **닫거나 새로고침하지 마세요** — 내용이 초기화됩니다
 - 티스토리 에디터 업데이트 시 `content/selectors.js`의 셀렉터를 조정해야 할 수 있습니다
 
@@ -174,10 +195,12 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 
 | 상태 | 설명 | 다음 액션 |
 |------|------|-----------|
+| `editor_ready` | `PREPARE_EDITOR`가 사용 가능한 에디터 탭 확보 완료 | `WRITE_POST` 호출 |
+| `blog_not_configured` | 자동으로 열 블로그명을 알 수 없음 | 설정 저장 또는 `data.blogName` 전달 |
 | `published` | 발행 성공 | — |
 | `captcha_required` | CAPTCHA 감지됨 (직접 발행) | 해결 후 `RESUME_DIRECT_PUBLISH` |
 | `captcha_paused` | 큐 항목 CAPTCHA 일시정지 | 해결 후 `RESUME_AFTER_CAPTCHA` |
-| `editor_not_ready` | 에디터/스크립트 준비 안 됨 | 페이지 새로고침 |
+| `editor_not_ready` | 에디터 탭 확보/복구 실패 | `diagnostics` 확인 후 `PREPARE_EDITOR` 재호출 |
 | `item_not_found` | 재개할 큐 항목 없음 | 큐 확인 |
 | `content_empty` | 본문 비어있거나 에디터 미반영 | 본문 확인 후 재시도 |
 | `verification_failed` | 발행 후 URL 미변경 — 실제 저장 여부 불확실 | 관리자 페이지 직접 확인 |
@@ -189,6 +212,21 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 ### 응답 예시
 
 ```javascript
+// PREPARE_EDITOR 성공
+{
+  success: true,
+  status: "editor_ready",
+  tabId: 321,
+  url: "https://your-blog.tistory.com/manage/newpost",
+  blogName: "your-blog",
+  diagnostics: {
+    requestedBlogName: "your-blog",
+    blogName: "your-blog",
+    candidateCount: 1,
+    attempts: [...]
+  }
+}
+
 // 성공
 { success: true, status: "published", url: "https://blog.tistory.com/123" }
 
@@ -199,9 +237,43 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 // → 큐 항목 status가 "captcha_paused"로 변경됨
 // → 팝업 큐 탭에서 재개 버튼 표시
 
+// 준비 실패
+{
+  success: false,
+  status: "editor_not_ready",
+  error: "콘텐츠 스크립트가 준비된 티스토리 글쓰기 탭을 확보하지 못했습니다. diagnostics를 확인하세요.",
+  diagnostics: {
+    attempts: [
+      { step: "probe_existing", outcome: "not_ready", error: "ping_timeout" },
+      { step: "navigate_candidate", toUrl: "https://your-blog.tistory.com/manage/newpost" },
+      { step: "open_fresh_tab", toUrl: "https://your-blog.tistory.com/manage/newpost" }
+    ]
+  }
+}
+
 // CAPTCHA 해결 후 재개 성공
 { success: true, status: "published" }
 ```
+
+### 에디터 준비 diagnostics
+
+`PREPARE_EDITOR`와 `editor_not_ready` 응답에는 `diagnostics`가 포함됩니다.
+
+- `requestedBlogName`: 요청에서 넘긴 블로그명
+- `blogName`: 실제로 사용한 블로그명
+- `currentTabId`: 준비 시작 시점의 추적 탭
+- `candidateCount`: 검사한 `/manage/*` 탭 수
+- `attempts[]`: 준비 단계 로그
+
+자주 보게 될 `attempts[].step` 값:
+
+- `inspect_candidate`: 후보 탭 점검 시작
+- `probe_existing`: 현재 탭에 `PING` 재시도
+- `reload_candidate` / `navigate_candidate`: stale 탭을 `/manage/newpost`로 복구
+- `probe_after_navigation`: 복구 후 재프로브
+- `open_fresh_tab`: 새 글쓰기 탭 오픈
+- `probe_fresh_tab`: 새 탭 준비 확인
+- `skip_candidate`: 다른 블로그 탭이라 건너뜀
 
 ---
 
@@ -209,6 +281,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 
 | 액션 | 설명 |
 |------|------|
+| `PREPARE_EDITOR` | 사용 가능한 티스토리 에디터 탭 확보 + diagnostics 반환 |
 | `WRITE_POST` | 글 작성 + 발행 |
 | `SET_TITLE` | 제목만 입력 |
 | `SET_CONTENT` | 본문만 입력 |

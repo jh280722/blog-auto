@@ -10,6 +10,14 @@ let publishQueue = [];
 let isProcessing = false;
 let currentTabId = null;
 
+const EDITOR_PREPARE_DEFAULTS = {
+  loadTimeoutMs: 15000,
+  pingTimeoutMs: 1500,
+  pingRetries: 5,
+  pingIntervalMs: 800,
+  postLoadDelayMs: 700
+};
+
 /**
  * 큐 상태를 스토리지에 저장
  */
@@ -33,33 +41,159 @@ async function loadQueueState() {
   }
 }
 
-/**
- * 티스토리 글쓰기 탭 찾기 또는 생성
- */
-async function getTistoryTab(blogName) {
-  const url = `https://${blogName}.tistory.com/manage/newpost`;
-  
-  // 이미 열린 탭 찾기
-  const tabs = await chrome.tabs.query({ url: '*://*.tistory.com/manage/newpost*' });
-  if (tabs.length > 0) {
-    await chrome.tabs.update(tabs[0].id, { active: true });
-    return tabs[0].id;
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function buildNewPostUrl(blogName) {
+  return `https://${blogName}.tistory.com/manage/newpost`;
+}
+
+function getTabBlogName(url) {
+  try {
+    const parsed = new URL(url);
+    if (!parsed.hostname.endsWith('.tistory.com')) return null;
+    return parsed.hostname.replace(/\.tistory\.com$/, '');
+  } catch (_) {
+    return null;
+  }
+}
+
+function isManageTab(url) {
+  return typeof url === 'string' && url.includes('.tistory.com/manage/');
+}
+
+function isNewPostTab(url) {
+  return typeof url === 'string' && url.includes('/manage/newpost');
+}
+
+function isEditPostTab(url) {
+  return typeof url === 'string' && url.includes('/manage/post/');
+}
+
+function normalizeUrl(url) {
+  return typeof url === 'string' ? url.split('#')[0] : null;
+}
+
+function makePreparationResponse({ success, status, error = null, tab = null, url = null, tabId = null, blogName = null, diagnostics }) {
+  return {
+    success,
+    status,
+    error,
+    url: url ?? tab?.url ?? null,
+    tabId: tabId ?? tab?.id ?? null,
+    blogName: blogName || getTabBlogName(tab?.url) || null,
+    diagnostics
+  };
+}
+
+function withPreparationDetails(response, preparation) {
+  if (!preparation) return response;
+
+  const next = {
+    ...response,
+    tabId: response.tabId ?? preparation.tabId ?? null,
+    blogName: response.blogName ?? preparation.blogName ?? null,
+    diagnostics: preparation.diagnostics
+  };
+
+  if (!response.url && preparation.url) {
+    next.url = preparation.url;
+  } else if (response.url && preparation.url) {
+    next.editorUrl = preparation.url;
   }
 
-  // 새 탭 열기
-  const tab = await chrome.tabs.create({ url, active: true });
-  
-  // 페이지 로딩 완료 대기
+  return next;
+}
+
+async function sendTabMessageWithTimeout(tabId, message, timeoutMs = EDITOR_PREPARE_DEFAULTS.pingTimeoutMs) {
+  let timerId;
+
+  try {
+    return await Promise.race([
+      chrome.tabs.sendMessage(tabId, message),
+      new Promise((_, reject) => {
+        timerId = setTimeout(() => reject(new Error('ping_timeout')), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timerId) clearTimeout(timerId);
+  }
+}
+
+async function waitForTabLoadComplete(tabId, timeoutMs = EDITOR_PREPARE_DEFAULTS.loadTimeoutMs) {
+  try {
+    const existingTab = await chrome.tabs.get(tabId);
+    if (existingTab.status === 'complete') {
+      return { success: true, tab: existingTab };
+    }
+  } catch (error) {
+    return { success: false, error: 'tab_missing' };
+  }
+
   return new Promise((resolve) => {
-    const listener = (tabId, changeInfo) => {
-      if (tabId === tab.id && changeInfo.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(listener);
-        // Content script 로딩 추가 대기
-        setTimeout(() => resolve(tab.id), 2000);
+    let resolved = false;
+
+    const cleanup = () => {
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      chrome.tabs.onRemoved.removeListener(onRemoved);
+      clearTimeout(timerId);
+    };
+
+    const finish = (result) => {
+      if (resolved) return;
+      resolved = true;
+      cleanup();
+      resolve(result);
+    };
+
+    const onUpdated = (updatedTabId, changeInfo, tab) => {
+      if (updatedTabId === tabId && changeInfo.status === 'complete') {
+        finish({ success: true, tab });
       }
     };
-    chrome.tabs.onUpdated.addListener(listener);
+
+    const onRemoved = (removedTabId) => {
+      if (removedTabId === tabId) {
+        finish({ success: false, error: 'tab_closed' });
+      }
+    };
+
+    const timerId = setTimeout(() => finish({ success: false, error: 'load_timeout' }), timeoutMs);
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
   });
+}
+
+async function probeTabReady(tabId, diagnostics, step, options = {}) {
+  const retries = options.pingRetries || EDITOR_PREPARE_DEFAULTS.pingRetries;
+  const timeoutMs = options.pingTimeoutMs || EDITOR_PREPARE_DEFAULTS.pingTimeoutMs;
+  const intervalMs = options.pingIntervalMs || EDITOR_PREPARE_DEFAULTS.pingIntervalMs;
+
+  let lastError = 'ping_failed';
+
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      const pingResult = await sendTabMessageWithTimeout(tabId, { action: 'PING' }, timeoutMs);
+      if (pingResult?.success) {
+        diagnostics.attempts.push({ step, tabId, attempt, outcome: 'ready' });
+        return { success: true, attempts: attempt };
+      }
+
+      lastError = pingResult?.error || 'unexpected_ping_response';
+      diagnostics.attempts.push({ step, tabId, attempt, outcome: 'not_ready', error: lastError });
+    } catch (error) {
+      lastError = error?.message || 'ping_failed';
+      diagnostics.attempts.push({ step, tabId, attempt, outcome: 'not_ready', error: lastError });
+    }
+
+    if (attempt < retries) {
+      await delay(intervalMs);
+    }
+  }
+
+  return { success: false, error: lastError };
 }
 
 /**
@@ -84,37 +218,43 @@ async function processNextInQueue() {
     const blogName = item.data.blogName || await getBlogName();
     if (!blogName) throw new Error('블로그 이름을 설정해주세요.');
 
-    // 티스토리 글쓰기 탭 열기/찾기
-    const tabId = await getTistoryTab(blogName);
-    currentTabId = tabId;
-
-    // Content Script에 글 작성 요청
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    await ensurePageWorldVisibilityInterceptor(tabId);
-
-    const response = await chrome.tabs.sendMessage(tabId, {
-      action: 'WRITE_POST',
-      data: { ...item.data, autoPublish: true }
-    });
-
-    if (response.success) {
-      item.status = 'completed';
-      item.completedAt = new Date().toISOString();
-      item.publishStatus = response.status || 'published';
-    } else if (response.status === 'captcha_required') {
-      // CAPTCHA 감지 — 실패가 아닌 일시정지 상태로 보존 (에디터 내용 유지됨)
-      item.status = 'captcha_paused';
-      item.error = 'CAPTCHA 감지 — 브라우저에서 해결 후 Resume 클릭';
-      item.publishStatus = 'captcha_required';
-      item.captchaTabId = currentTabId; // 에디터가 살아있는 탭 ID 보존
-      console.warn('[TistoryAuto BG] CAPTCHA 감지 — 큐 일시정지 (captcha_paused). tabId:', currentTabId);
-      await saveQueueState();
-      isProcessing = false;
-      return; // 다음 항목 처리하지 않음 (사용자가 Resume 해야 함)
-    } else {
+    const preparation = await prepareEditorTab({ blogName });
+    if (!preparation.success) {
       item.status = 'failed';
-      item.error = response.error || response.message || '발행 실패';
-      item.publishStatus = response.status || 'unknown_error';
+      item.error = preparation.error || '에디터 준비 실패';
+      item.publishStatus = preparation.status || 'editor_not_ready';
+      item.diagnostics = preparation.diagnostics;
+    } else {
+      currentTabId = preparation.tabId;
+      await ensurePageWorldVisibilityInterceptor(preparation.tabId);
+
+      const response = await chrome.tabs.sendMessage(preparation.tabId, {
+        action: 'WRITE_POST',
+        data: { ...item.data, autoPublish: true }
+      });
+      const responseWithPreparation = withPreparationDetails(response, preparation);
+
+      if (responseWithPreparation.success) {
+        item.status = 'completed';
+        item.completedAt = new Date().toISOString();
+        item.publishStatus = responseWithPreparation.status || 'published';
+      } else if (responseWithPreparation.status === 'captcha_required') {
+        // CAPTCHA 감지 — 실패가 아닌 일시정지 상태로 보존 (에디터 내용 유지됨)
+        item.status = 'captcha_paused';
+        item.error = 'CAPTCHA 감지 — 브라우저에서 해결 후 Resume 클릭';
+        item.publishStatus = 'captcha_required';
+        item.captchaTabId = currentTabId; // 에디터가 살아있는 탭 ID 보존
+        item.diagnostics = responseWithPreparation.diagnostics;
+        console.warn('[TistoryAuto BG] CAPTCHA 감지 — 큐 일시정지 (captcha_paused). tabId:', currentTabId);
+        await saveQueueState();
+        isProcessing = false;
+        return; // 다음 항목 처리하지 않음 (사용자가 Resume 해야 함)
+      } else {
+        item.status = 'failed';
+        item.error = responseWithPreparation.error || responseWithPreparation.message || '발행 실패';
+        item.publishStatus = responseWithPreparation.status || 'unknown_error';
+        item.diagnostics = responseWithPreparation.diagnostics;
+      }
     }
   } catch (error) {
     item.status = 'failed';
@@ -145,25 +285,24 @@ async function getBlogName() {
  * 최적의 티스토리 글쓰기 탭 후보 찾기
  * 우선순위: 현재 추적 중이며 살아있는 탭 > newpost 탭 > edit 탭 > 기타 manage 탭
  */
-async function getTistoryTabCandidates() {
+async function getTistoryTabCandidates(targetBlogName = null) {
   const allTabs = await chrome.tabs.query({ url: '*://*.tistory.com/manage/*' });
   if (allTabs.length === 0) return [];
 
-  const tracked = currentTabId ? allTabs.filter(t => t.id === currentTabId) : [];
-  const newPosts = allTabs.filter(t => t.url?.includes('/manage/newpost'));
-  const edits = allTabs.filter(t => t.url?.includes('/manage/post/'));
-  const others = allTabs.filter(t => !tracked.some(x => x.id === t.id) && !newPosts.some(x => x.id === t.id) && !edits.some(x => x.id === t.id));
+  return [...allTabs].sort((a, b) => {
+    const score = (tab) => {
+      const tabBlogName = getTabBlogName(tab.url);
+      const sameBlogScore = targetBlogName && tabBlogName !== targetBlogName ? 1 : 0;
+      const trackedScore = currentTabId && tab.id === currentTabId ? 0 : 1;
+      const pageScore = isNewPostTab(tab.url) ? 0 : isEditPostTab(tab.url) ? 1 : 2;
+      const accessScore = -(tab.lastAccessed || 0);
+      return [sameBlogScore, trackedScore, pageScore, accessScore];
+    };
 
-  return [...tracked, ...newPosts, ...edits, ...others];
-}
-
-async function pingTab(tabId) {
-  try {
-    const pingResult = await chrome.tabs.sendMessage(tabId, { action: 'PING' });
-    return !!pingResult?.success;
-  } catch (_) {
-    return false;
-  }
+    const [sameBlogA, trackedA, pageA, accessA] = score(a);
+    const [sameBlogB, trackedB, pageB, accessB] = score(b);
+    return sameBlogA - sameBlogB || trackedA - trackedB || pageA - pageB || accessA - accessB;
+  });
 }
 
 async function ensurePageWorldVisibilityInterceptor(tabId) {
@@ -233,34 +372,229 @@ async function ensurePageWorldVisibilityInterceptor(tabId) {
   }
 }
 
-/**
- * 실제로 content script와 통신 가능한 티스토리 탭 찾기
- * - stale 탭/닫힌 탭/주입 안 된 탭은 제외
- * - 필요하면 새 newpost 탭을 열고 재시도
- */
-async function findReadyTistoryTab() {
-  const candidates = await getTistoryTabCandidates();
+async function navigateCandidateToEditor(tab, targetUrl, diagnostics) {
+  diagnostics.attempts.push({
+    step: normalizeUrl(tab.url) === normalizeUrl(targetUrl) ? 'reload_candidate' : 'navigate_candidate',
+    tabId: tab.id,
+    fromUrl: tab.url || null,
+    toUrl: targetUrl
+  });
 
-  for (const tab of candidates) {
-    if (await pingTab(tab.id)) {
-      currentTabId = tab.id;
-      return tab;
+  try {
+    if (normalizeUrl(tab.url) === normalizeUrl(targetUrl)) {
+      await chrome.tabs.reload(tab.id);
+    } else {
+      await chrome.tabs.update(tab.id, { url: targetUrl, active: true });
     }
+  } catch (error) {
+    diagnostics.attempts.push({
+      step: 'navigate_candidate_result',
+      tabId: tab.id,
+      outcome: 'failed',
+      error: error.message
+    });
+    return { success: false, error: error.message };
   }
 
-  const blogName = await getBlogName();
-  if (blogName) {
-    const newTabId = await getTistoryTab(blogName);
-    await new Promise(resolve => setTimeout(resolve, 1500));
+  const loadResult = await waitForTabLoadComplete(tab.id);
+  diagnostics.attempts.push({
+    step: 'wait_for_load',
+    tabId: tab.id,
+    outcome: loadResult.success ? 'complete' : 'failed',
+    error: loadResult.error || null
+  });
 
-    if (await pingTab(newTabId)) {
-      currentTabId = newTabId;
-      const tab = await chrome.tabs.get(newTabId);
-      return tab;
-    }
+  if (!loadResult.success) {
+    return { success: false, error: loadResult.error, tab: tab };
   }
 
-  return null;
+  await delay(EDITOR_PREPARE_DEFAULTS.postLoadDelayMs);
+  return { success: true, tab: loadResult.tab };
+}
+
+function shouldReuseByNavigation(tab, targetBlogName) {
+  if (!isManageTab(tab.url)) return false;
+
+  const tabBlogName = getTabBlogName(tab.url);
+  if (targetBlogName && tabBlogName !== targetBlogName) return false;
+
+  return true;
+}
+
+async function tryPrepareCandidateTab(tab, diagnostics, targetBlogName = null) {
+  diagnostics.attempts.push({
+    step: 'inspect_candidate',
+    tabId: tab.id,
+    url: tab.url || null,
+    status: tab.status || 'unknown'
+  });
+
+  const initialLoad = await waitForTabLoadComplete(tab.id);
+  if (!initialLoad.success) {
+    diagnostics.attempts.push({
+      step: 'wait_for_load',
+      tabId: tab.id,
+      outcome: 'failed',
+      error: initialLoad.error
+    });
+    return { success: false, error: initialLoad.error, tab };
+  }
+
+  if (initialLoad.tab) {
+    tab = initialLoad.tab;
+  }
+
+  if (!targetBlogName) {
+    targetBlogName = getTabBlogName(tab.url);
+  }
+
+  const initialProbe = await probeTabReady(tab.id, diagnostics, 'probe_existing');
+  if (initialProbe.success) {
+    currentTabId = tab.id;
+    return makePreparationResponse({
+      success: true,
+      status: 'editor_ready',
+      tab,
+      blogName: targetBlogName,
+      diagnostics
+    });
+  }
+
+  if (!targetBlogName || !shouldReuseByNavigation(tab, targetBlogName)) {
+    return { success: false, error: initialProbe.error, tab };
+  }
+
+  const targetUrl = buildNewPostUrl(targetBlogName);
+  const navigation = await navigateCandidateToEditor(tab, targetUrl, diagnostics);
+  if (!navigation.success) {
+    return { success: false, error: navigation.error, tab };
+  }
+
+  const preparedTab = navigation.tab || tab;
+  const finalProbe = await probeTabReady(preparedTab.id, diagnostics, 'probe_after_navigation');
+  if (finalProbe.success) {
+    currentTabId = preparedTab.id;
+    return makePreparationResponse({
+      success: true,
+      status: 'editor_ready',
+      tab: preparedTab,
+      blogName: targetBlogName,
+      diagnostics
+    });
+  }
+
+  return { success: false, error: finalProbe.error, tab: preparedTab };
+}
+
+async function openFreshEditorTab(blogName, diagnostics) {
+  const url = buildNewPostUrl(blogName);
+  let createdTab;
+
+  diagnostics.attempts.push({
+    step: 'open_fresh_tab',
+    toUrl: url
+  });
+
+  try {
+    createdTab = await chrome.tabs.create({ url, active: true });
+  } catch (error) {
+    diagnostics.attempts.push({
+      step: 'open_fresh_tab_result',
+      outcome: 'failed',
+      error: error.message
+    });
+    return { success: false, error: error.message };
+  }
+
+  const loadResult = await waitForTabLoadComplete(createdTab.id);
+  diagnostics.attempts.push({
+    step: 'wait_for_fresh_tab_load',
+    tabId: createdTab.id,
+    outcome: loadResult.success ? 'complete' : 'failed',
+    error: loadResult.error || null
+  });
+
+  if (!loadResult.success) {
+    return { success: false, error: loadResult.error, tab: createdTab };
+  }
+
+  await delay(EDITOR_PREPARE_DEFAULTS.postLoadDelayMs);
+
+  const probeResult = await probeTabReady(createdTab.id, diagnostics, 'probe_fresh_tab');
+  if (!probeResult.success) {
+    return { success: false, error: probeResult.error, tab: loadResult.tab || createdTab };
+  }
+
+  currentTabId = createdTab.id;
+  return makePreparationResponse({
+    success: true,
+    status: 'editor_ready',
+    tab: loadResult.tab || createdTab,
+    blogName,
+    diagnostics
+  });
+}
+
+async function prepareEditorTab(options = {}) {
+  const requestedBlogName = options.blogName || null;
+  const blogName = requestedBlogName || await getBlogName();
+  const diagnostics = {
+    requestedBlogName,
+    blogName,
+    currentTabId,
+    candidateCount: 0,
+    attempts: []
+  };
+
+  const candidates = await getTistoryTabCandidates(blogName);
+  diagnostics.candidateCount = candidates.length;
+
+  let lastFailure = null;
+
+  for (const candidate of candidates) {
+    const candidateBlogName = getTabBlogName(candidate.url);
+
+    if (blogName && candidateBlogName && candidateBlogName !== blogName) {
+      diagnostics.attempts.push({
+        step: 'skip_candidate',
+        tabId: candidate.id,
+        url: candidate.url || null,
+        reason: 'blog_mismatch',
+        candidateBlogName
+      });
+      continue;
+    }
+
+    const result = await tryPrepareCandidateTab(candidate, diagnostics, blogName || candidateBlogName);
+    if (result?.success) {
+      return result;
+    }
+
+    lastFailure = result;
+  }
+
+  if (!blogName) {
+    return makePreparationResponse({
+      success: false,
+      status: 'blog_not_configured',
+      error: '블로그 이름이 설정되지 않았습니다. 설정을 저장하거나 PREPARE_EDITOR/WRITE_POST 호출 시 blogName을 함께 보내주세요.',
+      diagnostics
+    });
+  }
+
+  const freshTabResult = await openFreshEditorTab(blogName, diagnostics);
+  if (freshTabResult.success) {
+    return freshTabResult;
+  }
+
+  return makePreparationResponse({
+    success: false,
+    status: 'editor_not_ready',
+    error: '콘텐츠 스크립트가 준비된 티스토리 글쓰기 탭을 확보하지 못했습니다. diagnostics를 확인하세요.',
+    tab: freshTabResult.tab || lastFailure?.tab || null,
+    blogName,
+    diagnostics
+  });
 }
 
 // ── 공통 메시지 처리 함수 ──────────────────────────
@@ -288,20 +622,30 @@ async function handleMessage(message, sender) {
     case 'INSERT_IMAGES':
     case 'PUBLISH':
     case 'GET_PAGE_INFO': {
-      const tistoryTab = await findReadyTistoryTab();
-
-      if (!tistoryTab) {
-        return { success: false, error: '콘텐츠 스크립트가 준비된 티스토리 글쓰기 탭을 찾지 못했습니다. 새 글쓰기 탭을 새로 열어주세요.', status: 'editor_not_ready' };
+      const preparation = await prepareEditorTab({ blogName: message.data?.blogName || null });
+      if (!preparation.success) {
+        return preparation;
       }
 
       try {
-        await ensurePageWorldVisibilityInterceptor(tistoryTab.id);
-        const response = await chrome.tabs.sendMessage(tistoryTab.id, message);
-        return response;
+        await ensurePageWorldVisibilityInterceptor(preparation.tabId);
+        const response = await chrome.tabs.sendMessage(preparation.tabId, message);
+        return withPreparationDetails(response, preparation);
       } catch (err) {
-        return { success: false, error: '콘텐츠 스크립트와 통신 실패. 페이지를 새로고침해주세요.', status: 'editor_not_ready' };
+        return makePreparationResponse({
+          success: false,
+          status: 'editor_not_ready',
+          error: '콘텐츠 스크립트와 통신 실패. diagnostics를 확인한 뒤 페이지를 새로고침하거나 PREPARE_EDITOR를 다시 호출하세요.',
+          tabId: preparation.tabId,
+          url: preparation.url,
+          blogName: preparation.blogName,
+          diagnostics: preparation.diagnostics
+        });
       }
     }
+
+    case 'PREPARE_EDITOR':
+      return await prepareEditorTab({ blogName: message.data?.blogName || null });
 
     // 큐에 글 추가
     case 'ADD_TO_QUEUE': {
@@ -367,9 +711,23 @@ async function handleMessage(message, sender) {
         return { success: false, error: '에디터 탭을 찾을 수 없음. 페이지를 새로 열어주세요.', status: 'editor_not_ready' };
       }
 
-      // 탭 생존 확인
-      if (!(await pingTab(tabId))) {
-        return { success: false, error: '에디터 탭이 닫혔거나 새로고침됨. RETRY로 처음부터 다시 시도하세요.', status: 'editor_not_ready' };
+      const resumeDiagnostics = {
+        requestedBlogName: item.data?.blogName || null,
+        blogName: item.data?.blogName || null,
+        currentTabId,
+        candidateCount: 1,
+        attempts: []
+      };
+
+      const resumeProbe = await probeTabReady(tabId, resumeDiagnostics, 'probe_resume_tab');
+      if (!resumeProbe.success) {
+        return {
+          success: false,
+          error: '에디터 탭이 닫혔거나 새로고침됨. RETRY로 처음부터 다시 시도하세요.',
+          status: 'editor_not_ready',
+          tabId,
+          diagnostics: resumeDiagnostics
+        };
       }
 
       // CAPTCHA가 아직 표시되어 있는지 확인
@@ -436,25 +794,37 @@ async function handleMessage(message, sender) {
 
     // CAPTCHA 해결 후 직접 발행 재개 (큐 외부, 팝업 직접 발행)
     case 'RESUME_DIRECT_PUBLISH': {
-      const tistoryTab = await findReadyTistoryTab();
-      if (!tistoryTab) {
-        return { success: false, error: '티스토리 글쓰기 페이지를 찾을 수 없습니다.', status: 'editor_not_ready' };
+      const preparation = await prepareEditorTab({ blogName: message.data?.blogName || null });
+      if (!preparation.success) {
+        return preparation;
       }
 
       // CAPTCHA 상태 확인
       try {
-        const captchaCheck = await chrome.tabs.sendMessage(tistoryTab.id, { action: 'CHECK_CAPTCHA' });
+        const captchaCheck = await chrome.tabs.sendMessage(preparation.tabId, { action: 'CHECK_CAPTCHA' });
         if (captchaCheck?.captchaPresent) {
-          return { success: false, error: 'CAPTCHA가 아직 표시되어 있습니다.', status: 'captcha_required' };
+          return withPreparationDetails({
+            success: false,
+            error: 'CAPTCHA가 아직 표시되어 있습니다.',
+            status: 'captcha_required'
+          }, preparation);
         }
       } catch (e) { /* 진행 */ }
 
       // 발행 재시도
       try {
-        const response = await chrome.tabs.sendMessage(tistoryTab.id, { action: 'RESUME_PUBLISH' });
-        return response;
+        const response = await chrome.tabs.sendMessage(preparation.tabId, { action: 'RESUME_PUBLISH' });
+        return withPreparationDetails(response, preparation);
       } catch (e) {
-        return { success: false, error: e.message };
+        return makePreparationResponse({
+          success: false,
+          status: 'editor_not_ready',
+          error: e.message,
+          tabId: preparation.tabId,
+          url: preparation.url,
+          blogName: preparation.blogName,
+          diagnostics: preparation.diagnostics
+        });
       }
     }
 

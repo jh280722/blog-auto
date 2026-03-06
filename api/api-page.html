@@ -207,6 +207,7 @@
             <div class="actions">
                 <button class="btn btn-primary" id="btn-api-publish">🚀 즉시 발행</button>
                 <button class="btn btn-secondary" id="btn-api-queue">📋 큐에 추가</button>
+                <button class="btn btn-secondary" id="btn-api-resume">⏯️ 직접 발행 재개</button>
             </div>
             <div class="result" id="publish-result"></div>
         </div>
@@ -328,7 +329,7 @@
                 category: $('#api-category').value.trim() || null,
                 tags: tagsRaw ? tagsRaw.split(',').map(t => t.trim()) : [],
                 images: imagesRaw ? imagesRaw.split('\n').map(url => ({ url: url.trim() })).filter(i => i.url) : [],
-                visibility: 'public',
+                visibility: 'private',
                 autoPublish: true
             };
         }
@@ -345,6 +346,15 @@
         $('#btn-api-queue').addEventListener('click', async () => {
             try {
                 const result = await sendToExtension('ADD_TO_QUEUE', getFormData());
+                showResult('#publish-result', result, !result.success);
+            } catch (err) {
+                showResult('#publish-result', err.message, true);
+            }
+        });
+
+        $('#btn-api-resume').addEventListener('click', async () => {
+            try {
+                const result = await sendToExtension('RESUME_DIRECT_PUBLISH', {});
                 showResult('#publish-result', result, !result.success);
             } catch (err) {
                 showResult('#publish-result', err.message, true);
@@ -368,6 +378,17 @@
                 showResult('#batch-result', result, !result.success);
             } catch (err) {
                 showResult('#batch-result', err.message, true);
+            }
+        });
+
+        window.addEventListener('load', async () => {
+            if (location.hash === '#resume-direct') {
+                try {
+                    const result = await sendToExtension('RESUME_DIRECT_PUBLISH', {});
+                    showResult('#publish-result', result, !result.success);
+                } catch (err) {
+                    showResult('#publish-result', err.message, true);
+                }
             }
         });
     </script>

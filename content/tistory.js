@@ -10,6 +10,74 @@
   const S = window.__TISTORY_SELECTORS || SELECTORS;
   const IMG = window.__IMAGE_HANDLER || ImageHandler;
 
+  function visibilityToNumber(visibility = 'public') {
+    return visibility === 'private' ? 0 : visibility === 'protected' ? 15 : 20;
+  }
+
+  function installPostVisibilityInterceptor() {
+    const markerId = '__blog-auto-visibility-interceptor';
+    if (document.getElementById(markerId)) return;
+
+    const script = document.createElement('script');
+    script.id = markerId;
+    script.textContent = `(() => {
+      if (window.__BLOG_AUTO_VISIBILITY_INTERCEPTOR_INSTALLED__) return;
+      window.__BLOG_AUTO_VISIBILITY_INTERCEPTOR_INSTALLED__ = true;
+
+      const shouldRewrite = (url) => typeof url === 'string' && url.includes('/manage/post.json');
+      const getForcedVisibility = () => {
+        const raw = document.documentElement.dataset.blogAutoTargetVisibilityNum;
+        return raw == null || raw === '' ? null : Number(raw);
+      };
+      const logRewrite = (payload) => {
+        try {
+          localStorage.setItem('__blog_auto_forced_post_body', JSON.stringify(payload));
+        } catch (e) {}
+      };
+      const rewriteBody = (body) => {
+        const forcedVisibility = getForcedVisibility();
+        if (forcedVisibility == null) return body;
+        try {
+          if (typeof body === 'string') {
+            const parsed = JSON.parse(body);
+            parsed.visibility = forcedVisibility;
+            logRewrite(parsed);
+            console.log('[TistoryAuto:page] manage/post.json visibility 강제 적용:', forcedVisibility, parsed);
+            return JSON.stringify(parsed);
+          }
+        } catch (e) {
+          console.warn('[TistoryAuto:page] visibility rewrite 실패:', e);
+        }
+        return body;
+      };
+
+      const origOpen = XMLHttpRequest.prototype.open;
+      const origSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__blogAutoMeta = { method, url };
+        return origOpen.call(this, method, url, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function(body) {
+        const meta = this.__blogAutoMeta || {};
+        const nextBody = shouldRewrite(meta.url) ? rewriteBody(body) : body;
+        return origSend.call(this, nextBody);
+      };
+
+      if (typeof window.fetch === 'function') {
+        const origFetch = window.fetch.bind(window);
+        window.fetch = function(input, init) {
+          const url = typeof input === 'string' ? input : input?.url || '';
+          if (shouldRewrite(url) && init && 'body' in init) {
+            init = { ...init, body: rewriteBody(init.body) };
+          }
+          return origFetch(input, init);
+        };
+      }
+    })();`;
+
+    (document.head || document.documentElement).appendChild(script);
+  }
+
   // 유틸: 요소 대기 (최대 timeout ms)
   function waitForElement(selector, timeout = 10000) {
     return new Promise((resolve, reject) => {
@@ -333,13 +401,36 @@
           radio = findElement(S.visibility.openRadio, S.visibility.fallback);
       }
 
-      if (radio) {
-        radio.click();
-        await delay(100);
+      if (!radio) {
+        return { success: false, error: `공개 설정 라디오를 찾을 수 없음: ${visibility}` };
       }
 
-      console.log('[TistoryAuto] 공개 설정 완료:', visibility);
-      return { success: true };
+      const label = radio.id ? document.querySelector(`label[for="${radio.id}"]`) : null;
+      if (label) {
+        label.click();
+      } else {
+        radio.click();
+      }
+
+      if ('checked' in radio) {
+        radio.checked = true;
+      }
+      radio.dispatchEvent(new Event('input', { bubbles: true }));
+      radio.dispatchEvent(new Event('change', { bubbles: true }));
+      await delay(250);
+
+      const checked = document.querySelector(`${S.visibility.openRadio}:checked, ${S.visibility.protectedRadio}:checked, ${S.visibility.privateRadio}:checked, input[name="basicSet"]:checked, input[name="visibility"]:checked`);
+      const checkedValue = checked?.value || null;
+      const expectedValue = visibility === 'public' ? '20' : visibility === 'protected' ? '15' : '0';
+      const publishBtnText = findElement(S.publish.confirmButton, null)?.textContent?.trim() || null;
+      const textMatches = visibility === 'private'
+        ? /비공개/.test(publishBtnText || '')
+        : visibility === 'protected'
+          ? /(보호|공개)/.test(publishBtnText || '')
+          : /공개/.test(publishBtnText || '');
+
+      console.log('[TistoryAuto] 공개 설정 완료:', visibility, 'checked=', checkedValue, 'button=', publishBtnText);
+      return { success: checkedValue === expectedValue && textMatches, checkedValue, expectedValue, publishBtnText };
     } catch (error) {
       console.error('[TistoryAuto] 공개 설정 실패:', error);
       return { success: false, error: error.message };
@@ -503,7 +594,7 @@
   /**
    * 발행 실행 ("완료" 버튼) — captcha 감지 + 발행 검증 포함
    */
-  async function publish() {
+  async function publish(visibility = 'public') {
     try {
       // 사전 체크: CAPTCHA가 이미 표시되어 있는지
       if (detectCaptcha()) {
@@ -511,33 +602,67 @@
         return { success: false, error: 'CAPTCHA가 감지되었습니다. 수동으로 처리해주세요.', status: 'captcha_required' };
       }
 
+      // 최종 발행 직전에 MAIN world interceptor를 주입해 실제 페이지 XHR/fetch payload도 교정한다.
+      try {
+        await chrome.runtime.sendMessage({ action: 'INJECT_MAIN_WORLD_VISIBILITY_HELPER' });
+      } catch (e) {
+        console.warn('[TistoryAuto] MAIN world interceptor 주입 요청 실패:', e);
+      }
+      const forcedVisibilityNum = String(visibilityToNumber(visibility));
+      document.documentElement.dataset.blogAutoTargetVisibilityNum = forcedVisibilityNum;
+      document.documentElement.setAttribute('data-blog-auto-target-visibility-num', forcedVisibilityNum);
+      try { localStorage.setItem('__blog_auto_publish_marker', forcedVisibilityNum); } catch (_) {}
+
       // TinyMCE save() 호출하여 에디터 내용을 textarea에 동기화
       const editor = getTinyMCEEditor();
       if (editor) {
         try { editor.save(); } catch (e) { /* 무시 */ }
       }
 
-      // "완료" 버튼 클릭 → 발행 설정 레이어 열림
-      const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
-      if (!completeBtn) {
-        return { success: false, error: '완료 버튼을 찾을 수 없음', status: 'editor_not_ready' };
+      // 발행 레이어가 이미 열려 있으면 완료 버튼을 다시 누르지 않음
+      let publishLayer = document.querySelector('.publish-layer, #publish-layer, .layer-publish');
+      let confirmBtn = findElement(S.publish.confirmButton, null);
+      const layerAlreadyOpen = !!(publishLayer && confirmBtn);
+
+      if (!layerAlreadyOpen) {
+        // "완료" 버튼 클릭 → 발행 설정 레이어 열림
+        const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
+        if (!completeBtn) {
+          return { success: false, error: '완료 버튼을 찾을 수 없음', status: 'editor_not_ready' };
+        }
+
+        completeBtn.click();
+        await delay(1500);
+
+        // CAPTCHA 체크 (완료 버튼 클릭 후 나타날 수 있음)
+        if (detectCaptcha()) {
+          console.warn('[TistoryAuto] 발행 시도 후 CAPTCHA 감지됨');
+          return { success: false, error: '발행 중 CAPTCHA가 감지되었습니다.', status: 'captcha_required' };
+        }
+
+        publishLayer = document.querySelector('.publish-layer, #publish-layer, .layer-publish');
+        confirmBtn = findElement(S.publish.confirmButton, null);
+      } else {
+        console.log('[TistoryAuto] 발행 레이어가 이미 열려 있어 완료 버튼 클릭 생략');
       }
-
-      completeBtn.click();
-      await delay(1500);
-
-      // CAPTCHA 체크 (완료 버튼 클릭 후 나타날 수 있음)
-      if (detectCaptcha()) {
-        console.warn('[TistoryAuto] 발행 시도 후 CAPTCHA 감지됨');
-        return { success: false, error: '발행 중 CAPTCHA가 감지되었습니다.', status: 'captcha_required' };
-      }
-
-      // 발행 레이어가 열렸는지 확인
-      const publishLayer = document.querySelector('.publish-layer, #publish-layer, .layer-publish');
-      const confirmBtn = findElement(S.publish.confirmButton, null);
 
       if (confirmBtn) {
-        // 발행 레이어 내에서 공개 설정이 올바른지 확인 가능
+        // 발행 레이어가 열린 뒤 최종 공개 설정을 적용
+        const visibilityResult = await setVisibility(visibility);
+        if (!visibilityResult.success) {
+          return { success: false, error: `공개 설정 적용 실패 (${visibilityResult.expectedValue || visibility})`, status: 'visibility_failed' };
+        }
+
+        // React re-render로 confirmBtn 참조가 stale할 수 있으므로 다시 찾기
+        confirmBtn = findElement(S.publish.confirmButton, null);
+        if (!confirmBtn) {
+          // fallback: 텍스트 기반 검색
+          confirmBtn = Array.from(document.querySelectorAll('button')).find(b => /(발행|저장)/.test(b.textContent.trim()) && b.closest('.layer_foot, .wrap_btn, .ReactModal__Content'));
+        }
+        if (!confirmBtn) {
+          return { success: false, error: '최종 발행 버튼을 다시 찾을 수 없음 (React re-render)', status: 'editor_not_ready' };
+        }
+
         const urlBefore = window.location.href;
 
         confirmBtn.click();
@@ -638,9 +763,12 @@
     }
 
     // 6. 공개 설정
-    if (postData.visibility) {
+    // autoPublish=true인 경우 실제 공개 설정은 publish() 내부의 발행 레이어에서 최종 적용한다.
+    if (postData.visibility && !postData.autoPublish) {
       results.visibility = await setVisibility(postData.visibility);
       await delay(300);
+    } else if (postData.visibility && postData.autoPublish) {
+      results.visibility = { success: true, deferred: true, target: postData.visibility };
     }
 
     // 7. 발행 (autoPublish가 true인 경우)
@@ -662,7 +790,7 @@
       }
 
       await delay(500);
-      results.publish = await publish();
+      results.publish = await publish(postData.visibility || 'public');
     }
 
     const allSuccess = Object.values(results).every(r => r.success);
@@ -761,7 +889,20 @@
     return true; // 비동기 응답
   });
 
+  // ── 자동저장 복구 다이얼로그 자동 dismiss ──
+  // 티스토리 에디터는 이전 임시저장본이 있으면 confirm()을 띄움
+  // 원래 confirm을 오버라이드해서 항상 취소(false)로 응답
+  const _origConfirm = window.confirm;
+  window.confirm = function(msg) {
+    if (msg && /저장된 글이 있습니다|이어서 작성/.test(msg)) {
+      console.log('[TistoryAuto] 자동저장 복구 다이얼로그 자동 dismiss:', msg);
+      return false; // 취소 (새로 작성)
+    }
+    return _origConfirm.call(window, msg);
+  };
+
   // ── 초기화 ──────────────────────────────────
+  installPostVisibilityInterceptor();
   console.log('[TistoryAuto] Content Script 로드 완료 ✅');
   console.log('[TistoryAuto] 페이지:', window.location.href);
 

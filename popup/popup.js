@@ -16,6 +16,11 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
 
+  // ── HTML 이스케이프 ──────────────────────────
+  function esc(str) {
+    return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
   // ── 탭 전환 ─────────────────────────────────
   $$('.tab').forEach(tab => {
     tab.addEventListener('click', () => {
@@ -105,6 +110,15 @@
     renderImagePreviews();
   }
 
+  // ── CAPTCHA 배너 제어 ────────────────────────
+  function showCaptchaAlert() {
+    $('#captcha-alert').style.display = 'flex';
+  }
+
+  function hideCaptchaAlert() {
+    $('#captcha-alert').style.display = 'none';
+  }
+
   // ── 발행 버튼 ───────────────────────────────
   $('#btn-publish').addEventListener('click', async () => {
     const data = getFormData();
@@ -113,6 +127,7 @@
       return;
     }
 
+    hideCaptchaAlert();
     setStatus('발행 중...', 'processing');
     $('#btn-publish').disabled = true;
 
@@ -121,7 +136,12 @@
       if (result.success) {
         showToast('발행이 완료되었습니다!');
         setStatus('발행 완료', 'ready');
+        hideCaptchaAlert();
         clearForm();
+      } else if (result.status === 'captcha_required') {
+        showToast('CAPTCHA 감지 — 브라우저에서 해결 후 재개 클릭', 'error');
+        setStatus('CAPTCHA 대기 중', 'error');
+        showCaptchaAlert(); // 재개 버튼 배너 표시
       } else {
         showToast(result.error || '발행 실패', 'error');
         setStatus('오류 발생', 'error');
@@ -132,6 +152,33 @@
     }
 
     $('#btn-publish').disabled = false;
+  });
+
+  // ── CAPTCHA 재개 버튼 (직접 발행) ──────────
+  $('#btn-resume-publish').addEventListener('click', async () => {
+    $('#btn-resume-publish').disabled = true;
+    setStatus('발행 재개 중...', 'processing');
+
+    try {
+      const result = await sendMessage('RESUME_DIRECT_PUBLISH');
+      if (result.success) {
+        showToast('발행이 완료되었습니다!');
+        setStatus('발행 완료', 'ready');
+        hideCaptchaAlert();
+        clearForm();
+      } else if (result.status === 'captcha_required') {
+        showToast('CAPTCHA가 아직 표시되어 있습니다. 먼저 해결해주세요.', 'error');
+        setStatus('CAPTCHA 대기 중', 'error');
+      } else {
+        showToast(result.error || '재개 실패', 'error');
+        setStatus('오류 발생', 'error');
+      }
+    } catch (err) {
+      showToast(err.message, 'error');
+      setStatus('오류 발생', 'error');
+    }
+
+    $('#btn-resume-publish').disabled = false;
   });
 
   // ── 큐에 추가 ───────────────────────────────
@@ -190,10 +237,18 @@
     attachedImages.forEach((img, idx) => {
       const item = document.createElement('div');
       item.className = 'image-preview-item';
-      item.innerHTML = `
-        <img src="${img.src}" alt="${img.alt}">
-        <button class="remove-btn" data-idx="${idx}">×</button>
-      `;
+
+      const imgEl = document.createElement('img');
+      imgEl.src = img.src;
+      imgEl.alt = img.alt || '';
+
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'remove-btn';
+      removeBtn.dataset.idx = idx;
+      removeBtn.textContent = '\u00d7';
+
+      item.appendChild(imgEl);
+      item.appendChild(removeBtn);
       container.appendChild(item);
     });
 
@@ -268,20 +323,36 @@
 
       list.innerHTML = queue.map(item => {
         const statusIcon = {
-          pending: '⏳',
-          processing: '⚙️',
-          completed: '✅',
-          failed: '❌'
-        }[item.status] || '⏳';
+          pending: '&#9203;',
+          processing: '&#9881;',
+          completed: '&#9989;',
+          failed: '&#10060;',
+          captcha_paused: '&#9888;'
+        }[item.status] || '&#9203;';
+
+        const isCaptchaPaused = item.status === 'captcha_paused';
+        const isFailed = item.status === 'failed';
+        const extraClass = isCaptchaPaused ? ' captcha-paused' : (isFailed ? ' item-failed' : '');
+
+        const safeId = esc(item.id);
+        const resumeBtn = isCaptchaPaused
+          ? `<button class="btn btn-warning btn-sm queue-item-resume" data-id="${safeId}">재개</button>`
+          : '';
+        const retryBtn = (isFailed || isCaptchaPaused)
+          ? `<button class="btn btn-sm btn-secondary queue-item-retry" data-id="${safeId}">재시도</button>`
+          : '';
 
         return `
-          <div class="queue-item" data-id="${item.id}">
+          <div class="queue-item${extraClass}" data-id="${safeId}">
             <span class="queue-item-status">${statusIcon}</span>
             <div class="queue-item-info">
-              <div class="queue-item-title">${item.data.title || '(제목 없음)'}</div>
-              <div class="queue-item-meta">${item.status}${item.error ? ` - ${item.error}` : ''}</div>
+              <div class="queue-item-title">${esc(item.data.title) || '(제목 없음)'}</div>
+              <div class="queue-item-meta">${esc(item.status)}${item.error ? ` &mdash; ${esc(item.error)}` : ''}</div>
             </div>
-            <button class="queue-item-remove" data-id="${item.id}" title="삭제">×</button>
+            <div class="queue-item-actions">
+              ${resumeBtn}${retryBtn}
+              <button class="queue-item-remove" data-id="${safeId}" title="삭제">&#215;</button>
+            </div>
           </div>
         `;
       }).join('');
@@ -290,6 +361,32 @@
       list.querySelectorAll('.queue-item-remove').forEach(btn => {
         btn.addEventListener('click', async () => {
           await sendMessage('REMOVE_FROM_QUEUE', { id: btn.dataset.id });
+          refreshQueue();
+        });
+      });
+
+      // CAPTCHA 재개 버튼 (에디터 내용 유지 상태에서 발행만 재시도)
+      list.querySelectorAll('.queue-item-resume').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          showToast('발행 재개 중...');
+          const result = await sendMessage('RESUME_AFTER_CAPTCHA', { id: btn.dataset.id });
+          if (result.success) {
+            showToast('발행이 완료되었습니다!');
+          } else if (result.status === 'captcha_required') {
+            showToast('CAPTCHA가 아직 표시되어 있습니다. 먼저 해결해주세요.', 'error');
+          } else {
+            showToast(result.error || '재개 실패', 'error');
+          }
+          refreshQueue();
+        });
+      });
+
+      // 재시도 버튼 (처음부터 — 새 탭 열어 전체 재작성)
+      list.querySelectorAll('.queue-item-retry').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          await sendMessage('RETRY_ITEM', { id: btn.dataset.id });
+          showToast('대기 상태로 복원됐습니다. 시작 버튼을 눌러 재시도하세요.');
           refreshQueue();
         });
       });

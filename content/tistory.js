@@ -735,6 +735,14 @@
         case 'PUBLISH':
           return await publish();
 
+        // CAPTCHA 해결 후 발행만 재시도 (에디터 내용은 이미 입력됨)
+        case 'RESUME_PUBLISH':
+          return await publish();
+
+        // CAPTCHA 표시 여부 확인
+        case 'CHECK_CAPTCHA':
+          return { success: true, captchaPresent: detectCaptcha() };
+
         case 'GET_PAGE_INFO':
           return getPageInfo();
 

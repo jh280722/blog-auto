@@ -100,18 +100,20 @@ async function processNextInQueue() {
       item.status = 'completed';
       item.completedAt = new Date().toISOString();
       item.publishStatus = response.status || 'published';
+    } else if (response.status === 'captcha_required') {
+      // CAPTCHA 감지 — 실패가 아닌 일시정지 상태로 보존 (에디터 내용 유지됨)
+      item.status = 'captcha_paused';
+      item.error = 'CAPTCHA 감지 — 브라우저에서 해결 후 Resume 클릭';
+      item.publishStatus = 'captcha_required';
+      item.captchaTabId = currentTabId; // 에디터가 살아있는 탭 ID 보존
+      console.warn('[TistoryAuto BG] CAPTCHA 감지 — 큐 일시정지 (captcha_paused). tabId:', currentTabId);
+      await saveQueueState();
+      isProcessing = false;
+      return; // 다음 항목 처리하지 않음 (사용자가 Resume 해야 함)
     } else {
-      // captcha_required는 즉시 큐 처리를 중단해야 함
       item.status = 'failed';
       item.error = response.error || response.message || '발행 실패';
       item.publishStatus = response.status || 'unknown_error';
-
-      if (response.status === 'captcha_required') {
-        console.warn('[TistoryAuto BG] CAPTCHA 감지 — 큐 처리를 중단합니다.');
-        await saveQueueState();
-        isProcessing = false;
-        return; // 다음 항목 처리하지 않음
-      }
     }
   } catch (error) {
     item.status = 'failed';
@@ -252,6 +254,121 @@ async function handleMessage(message, sender) {
     case 'LOAD_SETTINGS': {
       const settings = await chrome.storage.local.get(null);
       return { success: true, settings };
+    }
+
+    // CAPTCHA 해결 후 발행 재개 (큐 항목)
+    case 'RESUME_AFTER_CAPTCHA': {
+      const itemId = message.data?.id;
+      const item = publishQueue.find(i => i.id === itemId && i.status === 'captcha_paused');
+      if (!item) {
+        return { success: false, error: '재개할 captcha_paused 항목을 찾을 수 없음', status: 'item_not_found' };
+      }
+
+      const tabId = item.captchaTabId || currentTabId;
+      if (!tabId) {
+        return { success: false, error: '에디터 탭을 찾을 수 없음. 페이지를 새로 열어주세요.', status: 'editor_not_ready' };
+      }
+
+      // 탭 생존 확인
+      try {
+        const ping = await chrome.tabs.sendMessage(tabId, { action: 'PING' });
+        if (!ping?.success) throw new Error('content script not responding');
+      } catch (e) {
+        return { success: false, error: '에디터 탭이 닫혔거나 새로고침됨. RETRY로 처음부터 다시 시도하세요.', status: 'editor_not_ready' };
+      }
+
+      // CAPTCHA가 아직 표시되어 있는지 확인
+      try {
+        const captchaCheck = await chrome.tabs.sendMessage(tabId, { action: 'CHECK_CAPTCHA' });
+        if (captchaCheck?.captchaPresent) {
+          return { success: false, error: 'CAPTCHA가 아직 표시되어 있습니다. 먼저 해결해주세요.', status: 'captcha_required' };
+        }
+      } catch (e) { /* 확인 실패 시 발행 시도 진행 */ }
+
+      // 발행 재시도 (에디터 내용은 이미 입력되어 있음 — RESUME_PUBLISH만 호출)
+      item.status = 'processing';
+      await saveQueueState();
+
+      try {
+        const response = await chrome.tabs.sendMessage(tabId, { action: 'RESUME_PUBLISH' });
+        if (response.success) {
+          item.status = 'completed';
+          item.completedAt = new Date().toISOString();
+          item.publishStatus = response.status || 'published';
+          item.captchaTabId = null;
+          await saveQueueState();
+          isProcessing = false;
+          // 다음 대기 항목 처리
+          processNextInQueue();
+          return { success: true, status: 'published', url: response.url };
+        } else if (response.status === 'captcha_required') {
+          item.status = 'captcha_paused';
+          item.error = 'CAPTCHA 재발생 — 다시 해결 후 Resume 클릭';
+          item.captchaTabId = tabId;
+          await saveQueueState();
+          isProcessing = false;
+          return response;
+        } else {
+          item.status = 'failed';
+          item.error = response.error || '재개 후 발행 실패';
+          item.publishStatus = response.status;
+          await saveQueueState();
+          isProcessing = false;
+          return response;
+        }
+      } catch (e) {
+        item.status = 'failed';
+        item.error = e.message;
+        await saveQueueState();
+        isProcessing = false;
+        return { success: false, error: e.message };
+      }
+    }
+
+    // 실패/일시정지 항목 처음부터 재시도
+    case 'RETRY_ITEM': {
+      const itemId = message.data?.id;
+      const item = publishQueue.find(i => i.id === itemId);
+      if (!item) return { success: false, error: '항목을 찾을 수 없음' };
+      item.status = 'pending';
+      item.error = null;
+      item.captchaTabId = null;
+      item.completedAt = null;
+      item.publishStatus = null;
+      await saveQueueState();
+      return { success: true };
+    }
+
+    // CAPTCHA 해결 후 직접 발행 재개 (큐 외부, 팝업 직접 발행)
+    case 'RESUME_DIRECT_PUBLISH': {
+      const tistoryTab = await findBestTistoryTab();
+      if (!tistoryTab) {
+        return { success: false, error: '티스토리 글쓰기 페이지를 찾을 수 없습니다.', status: 'editor_not_ready' };
+      }
+
+      // content script 생존 확인
+      try {
+        const ping = await chrome.tabs.sendMessage(tistoryTab.id, { action: 'PING' });
+        if (!ping?.success) throw new Error('not ready');
+      } catch (e) {
+        return { success: false, error: '콘텐츠 스크립트가 준비되지 않았습니다. 페이지를 새로고침해주세요.', status: 'editor_not_ready' };
+      }
+
+      // CAPTCHA 상태 확인
+      try {
+        const captchaCheck = await chrome.tabs.sendMessage(tistoryTab.id, { action: 'CHECK_CAPTCHA' });
+        if (captchaCheck?.captchaPresent) {
+          return { success: false, error: 'CAPTCHA가 아직 표시되어 있습니다.', status: 'captcha_required' };
+        }
+      } catch (e) { /* 진행 */ }
+
+      // 발행 재시도
+      try {
+        const response = await chrome.tabs.sendMessage(tistoryTab.id, { action: 'RESUME_PUBLISH' });
+        return response;
+      } catch (e) {
+        return { success: false, error: e.message };
+      }
     }
 
     default:

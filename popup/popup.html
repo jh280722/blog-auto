@@ -94,6 +94,16 @@
         </div>
       </div>
 
+      <!-- CAPTCHA 경고 배너 (captcha_required 시 표시) -->
+      <div class="captcha-alert" id="captcha-alert" style="display: none;">
+        <div class="captcha-alert-icon">&#9888;</div>
+        <div class="captcha-alert-body">
+          <div class="captcha-alert-title">CAPTCHA 감지</div>
+          <div class="captcha-alert-desc">브라우저에서 CAPTCHA를 해결한 후 아래 버튼을 클릭하세요.<br>에디터 내용은 그대로 유지됩니다.</div>
+        </div>
+        <button class="btn btn-warning btn-sm" id="btn-resume-publish">재개</button>
+      </div>
+
       <!-- 액션 버튼 -->
       <div class="action-buttons">
         <button class="btn btn-secondary" id="btn-add-queue">
@@ -153,7 +163,7 @@
       <button class="btn btn-primary btn-full" id="btn-save-settings">💾 설정 저장</button>
 
       <div class="settings-footer">
-        <p class="version">v1.0.0</p>
+        <p class="version">v1.2.0</p>
       </div>
     </div>
   </div>

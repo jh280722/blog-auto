@@ -608,6 +608,72 @@ body::-webkit-scrollbar-thumb {
   border-color: rgba(252, 92, 124, 0.3);
 }
 
+/* ── CAPTCHA Alert ────────────────────────── */
+.captcha-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  background: rgba(252, 188, 92, 0.1);
+  border: 1px solid rgba(252, 188, 92, 0.35);
+  border-radius: var(--radius-md);
+  margin-bottom: 12px;
+  animation: fadeIn 0.2s ease;
+}
+
+.captcha-alert-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+  line-height: 1.2;
+  color: var(--warning);
+}
+
+.captcha-alert-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.captcha-alert-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--warning);
+  margin-bottom: 3px;
+}
+
+.captcha-alert-desc {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* ── Warning Button ───────────────────────── */
+.btn-warning {
+  background: rgba(252, 188, 92, 0.15);
+  color: var(--warning);
+  border: 1px solid rgba(252, 188, 92, 0.3);
+}
+
+.btn-warning:hover {
+  background: rgba(252, 188, 92, 0.28);
+}
+
+/* ── Queue Item Actions ───────────────────── */
+.queue-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.queue-item.captcha-paused {
+  border-color: rgba(252, 188, 92, 0.35);
+  background: rgba(252, 188, 92, 0.05);
+}
+
+.queue-item.item-failed {
+  border-color: rgba(252, 92, 124, 0.25);
+}
+
 /* ── Loading Spinner ──────────────────────── */
 .spinner {
   width: 14px;

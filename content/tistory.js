@@ -577,6 +577,102 @@
     return false;
   }
 
+  function isVisibleElement(el) {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  }
+
+  function compactText(value, maxLength = 160) {
+    if (!value) return null;
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (!normalized) return null;
+    return normalized.slice(0, maxLength);
+  }
+
+  function serializeRect(rect) {
+    if (!rect) return null;
+    return {
+      left: Math.round(rect.left * 100) / 100,
+      top: Math.round(rect.top * 100) / 100,
+      width: Math.round(rect.width * 100) / 100,
+      height: Math.round(rect.height * 100) / 100,
+      right: Math.round(rect.right * 100) / 100,
+      bottom: Math.round(rect.bottom * 100) / 100
+    };
+  }
+
+  function summarizeElement(el, selector, kind = 'captcha_candidate') {
+    return {
+      kind,
+      selector,
+      tagName: el.tagName?.toLowerCase() || null,
+      id: el.id || null,
+      className: compactText(el.className || '', 120),
+      text: compactText(el.textContent || '', 220),
+      ariaLabel: el.getAttribute?.('aria-label') || null,
+      title: el.getAttribute?.('title') || null,
+      name: el.getAttribute?.('name') || null,
+      src: (el.tagName === 'IFRAME' || el.tagName === 'IMG') ? (el.getAttribute('src') || null) : null,
+      rect: serializeRect(el.getBoundingClientRect())
+    };
+  }
+
+  function getCaptchaContext() {
+    const selectorSpecs = [
+      { selector: '#dkaptcha', kind: 'captcha_root' },
+      { selector: '.dkaptcha', kind: 'captcha_root' },
+      { selector: '.captcha-wrap', kind: 'captcha_root' },
+      { selector: '[class*="captcha"]', kind: 'captcha_generic' },
+      { selector: '[id*="captcha"]', kind: 'captcha_generic' },
+      { selector: '.g-recaptcha', kind: 'captcha_root' },
+      { selector: '#recaptcha', kind: 'captcha_root' },
+      { selector: 'iframe[src*="dkaptcha"]', kind: 'captcha_iframe' },
+      { selector: 'iframe[src*="captcha"]', kind: 'captcha_iframe' },
+      { selector: '#captchaImg', kind: 'captcha_image' }
+    ];
+
+    const seen = new Set();
+    const candidates = [];
+
+    for (const spec of selectorSpecs) {
+      const elements = document.querySelectorAll(spec.selector);
+      elements.forEach((el) => {
+        if (!isVisibleElement(el)) return;
+        const key = `${spec.selector}::${el.tagName}::${el.id || ''}::${el.getAttribute('src') || ''}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        candidates.push(summarizeElement(el, spec.selector, spec.kind));
+      });
+    }
+
+    const publishLayer = document.querySelector('.publish-layer, #publish-layer, .layer-publish');
+    const confirmBtn = findElement(S.publish.confirmButton, null)
+      || Array.from(document.querySelectorAll('button')).find(b => /(발행|저장)/.test((b.textContent || '').trim()) && b.closest('.layer_foot, .wrap_btn, .ReactModal__Content'));
+    const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
+
+    return {
+      success: true,
+      url: window.location.href,
+      title: document.title,
+      captchaPresent: detectCaptcha(),
+      candidateCount: candidates.length,
+      candidates,
+      publishLayerPresent: !!(publishLayer && isVisibleElement(publishLayer)),
+      publishLayerText: compactText(publishLayer?.textContent || '', 320),
+      confirmButtonText: compactText(confirmBtn?.textContent || '', 80),
+      completeButtonText: compactText(completeBtn?.textContent || '', 80),
+      viewport: {
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        scrollX: window.scrollX,
+        scrollY: window.scrollY,
+        devicePixelRatio: window.devicePixelRatio || 1
+      }
+    };
+  }
+
   /**
    * "저장중" 스피너가 사라질 때까지 대기
    */
@@ -870,6 +966,9 @@
         // CAPTCHA 표시 여부 확인
         case 'CHECK_CAPTCHA':
           return { success: true, captchaPresent: detectCaptcha() };
+
+        case 'GET_CAPTCHA_CONTEXT':
+          return getCaptchaContext();
 
         case 'GET_PAGE_INFO':
           return getPageInfo();

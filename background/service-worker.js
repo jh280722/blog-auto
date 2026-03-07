@@ -5,10 +5,13 @@
  * - 발행 큐 관리
  */
 
-// ── 발행 큐 ──────────────────────────────────
+// ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
 let isProcessing = false;
 let currentTabId = null;
+let directPublishState = null;
+
+const DIRECT_PUBLISH_STATE_KEY = 'directPublishState';
 
 const EDITOR_PREPARE_DEFAULTS = {
   loadTimeoutMs: 15000,
@@ -39,6 +42,41 @@ async function loadQueueState() {
   if (result.publishQueue) {
     publishQueue = result.publishQueue;
   }
+}
+
+async function loadDirectPublishState() {
+  const result = await chrome.storage.local.get(DIRECT_PUBLISH_STATE_KEY);
+  directPublishState = result[DIRECT_PUBLISH_STATE_KEY] || null;
+}
+
+async function persistDirectPublishState() {
+  if (directPublishState) {
+    await chrome.storage.local.set({ [DIRECT_PUBLISH_STATE_KEY]: directPublishState });
+  } else {
+    await chrome.storage.local.remove(DIRECT_PUBLISH_STATE_KEY);
+  }
+}
+
+async function setDirectPublishState(state) {
+  directPublishState = state ? { ...state } : null;
+  await persistDirectPublishState();
+  return directPublishState;
+}
+
+async function clearDirectPublishState() {
+  directPublishState = null;
+  await persistDirectPublishState();
+}
+
+async function updateDirectPublishState(patch = {}) {
+  if (!directPublishState) return null;
+  directPublishState = {
+    ...directPublishState,
+    ...patch,
+    updatedAt: new Date().toISOString()
+  };
+  await persistDirectPublishState();
+  return directPublishState;
 }
 
 function delay(ms) {
@@ -104,6 +142,112 @@ function withPreparationDetails(response, preparation) {
   }
 
   return next;
+}
+
+function buildDirectPublishState({ response, preparation, requestData = {}, captchaContext = null }) {
+  return {
+    tabId: response?.tabId ?? preparation?.tabId ?? null,
+    blogName: requestData.blogName || response?.blogName || preparation?.blogName || null,
+    url: response?.editorUrl || response?.url || preparation?.url || null,
+    visibility: requestData.visibility || null,
+    status: response?.status || 'captcha_required',
+    detectedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    diagnostics: preparation?.diagnostics || null,
+    captchaContext: captchaContext || null
+  };
+}
+
+function attachDirectPublishState(response, state = directPublishState) {
+  if (!state) return response;
+  return {
+    ...response,
+    directPublish: { ...state }
+  };
+}
+
+async function getLiveDirectPublishState(options = {}) {
+  if (!directPublishState) return null;
+
+  const snapshot = { ...directPublishState };
+
+  if (!snapshot.tabId) {
+    return snapshot;
+  }
+
+  try {
+    const tab = await chrome.tabs.get(snapshot.tabId);
+    if (tab?.url && tab.url !== snapshot.url) {
+      snapshot.url = tab.url;
+      await updateDirectPublishState({ url: tab.url });
+    }
+  } catch (error) {
+    await clearDirectPublishState();
+    return null;
+  }
+
+  if (options.includeCaptchaContext) {
+    try {
+      const captchaContext = await chrome.tabs.sendMessage(snapshot.tabId, { action: 'GET_CAPTCHA_CONTEXT' });
+      snapshot.captchaContext = captchaContext;
+      await updateDirectPublishState({ captchaContext, url: captchaContext?.url || snapshot.url });
+    } catch (error) {
+      snapshot.captchaContext = { success: false, error: error.message };
+    }
+  }
+
+  return snapshot;
+}
+
+async function buildPreparationFromDirectPublishState(options = {}) {
+  const requestedBlogName = options.blogName || null;
+  const liveState = await getLiveDirectPublishState();
+  if (!liveState?.tabId) {
+    return null;
+  }
+
+  const diagnostics = {
+    requestedBlogName,
+    blogName: liveState.blogName || requestedBlogName || null,
+    currentTabId,
+    candidateCount: 1,
+    source: 'direct_publish_state',
+    attempts: []
+  };
+
+  const resumeProbe = await probeTabReady(liveState.tabId, diagnostics, 'probe_saved_direct_publish_tab');
+  if (!resumeProbe.success) {
+    await updateDirectPublishState({
+      lastProbeError: resumeProbe.error,
+      lastProbeAt: new Date().toISOString(),
+      diagnostics
+    });
+    return null;
+  }
+
+  const tab = await chrome.tabs.get(liveState.tabId);
+  currentTabId = liveState.tabId;
+
+  return makePreparationResponse({
+    success: true,
+    status: 'editor_ready',
+    tab,
+    blogName: liveState.blogName || requestedBlogName || null,
+    diagnostics
+  });
+}
+
+async function getCaptchaContextForTab(tabId) {
+  if (!tabId) {
+    return { success: false, status: 'editor_not_ready', error: 'CAPTCHA 컨텍스트를 읽을 탭 ID가 없습니다.' };
+  }
+
+  try {
+    const captchaContext = await chrome.tabs.sendMessage(tabId, { action: 'GET_CAPTCHA_CONTEXT' });
+    return { success: true, tabId, captchaContext };
+  } catch (error) {
+    return { success: false, status: 'editor_not_ready', error: error.message, tabId };
+  }
 }
 
 async function sendTabMessageWithTimeout(tabId, message, timeoutMs = EDITOR_PREPARE_DEFAULTS.pingTimeoutMs) {
@@ -612,8 +756,49 @@ async function handleMessage(message, sender) {
       return { success: injected };
     }
 
-    // Popup → Content Script로 전달
-    case 'WRITE_POST':
+    // Popup / API → Content Script로 직접 발행
+    case 'WRITE_POST': {
+      await clearDirectPublishState();
+      const preparation = await prepareEditorTab({ blogName: message.data?.blogName || null });
+      if (!preparation.success) {
+        return preparation;
+      }
+
+      try {
+        await ensurePageWorldVisibilityInterceptor(preparation.tabId);
+        const response = await chrome.tabs.sendMessage(preparation.tabId, message);
+        const responseWithPreparation = withPreparationDetails(response, preparation);
+
+        if (responseWithPreparation.status === 'captcha_required') {
+          const captchaContextResult = await getCaptchaContextForTab(preparation.tabId);
+          const directState = buildDirectPublishState({
+            response: responseWithPreparation,
+            preparation,
+            requestData: message.data || {},
+            captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
+          });
+          await setDirectPublishState(directState);
+          return attachDirectPublishState(responseWithPreparation, directState);
+        }
+
+        if (responseWithPreparation.success) {
+          await clearDirectPublishState();
+        }
+
+        return responseWithPreparation;
+      } catch (err) {
+        return makePreparationResponse({
+          success: false,
+          status: 'editor_not_ready',
+          error: '콘텐츠 스크립트와 통신 실패. diagnostics를 확인한 뒤 페이지를 새로고침하거나 PREPARE_EDITOR를 다시 호출하세요.',
+          tabId: preparation.tabId,
+          url: preparation.url,
+          blogName: preparation.blogName,
+          diagnostics: preparation.diagnostics
+        });
+      }
+    }
+
     case 'SET_TITLE':
     case 'SET_CONTENT':
     case 'SET_CATEGORY':
@@ -696,6 +881,37 @@ async function handleMessage(message, sender) {
     case 'LOAD_SETTINGS': {
       const settings = await chrome.storage.local.get(null);
       return { success: true, settings };
+    }
+
+    case 'GET_DIRECT_PUBLISH_STATE': {
+      const state = await getLiveDirectPublishState({ includeCaptchaContext: !!message.data?.includeCaptchaContext });
+      return { success: true, directPublish: state };
+    }
+
+    case 'GET_CAPTCHA_CONTEXT': {
+      const explicitTabId = message.data?.tabId || null;
+      const savedState = explicitTabId ? null : await getLiveDirectPublishState();
+      const tabId = explicitTabId || savedState?.tabId || currentTabId;
+      const captchaContextResult = await getCaptchaContextForTab(tabId);
+
+      if (!captchaContextResult.success) {
+        return captchaContextResult;
+      }
+
+      if (savedState?.tabId && savedState.tabId === tabId) {
+        await updateDirectPublishState({
+          url: captchaContextResult.captchaContext?.url || savedState.url,
+          captchaContext: captchaContextResult.captchaContext,
+          lastCheckedAt: new Date().toISOString()
+        });
+      }
+
+      return {
+        success: true,
+        tabId,
+        captchaContext: captchaContextResult.captchaContext,
+        directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
+      };
     }
 
     // CAPTCHA 해결 후 발행 재개 (큐 항목)
@@ -792,31 +1008,73 @@ async function handleMessage(message, sender) {
       return { success: true };
     }
 
-    // CAPTCHA 해결 후 직접 발행 재개 (큐 외부, 팝업 직접 발행)
+    // CAPTCHA 해결 후 직접 발행 재개 (큐 외부, 팝업/API 직접 발행)
     case 'RESUME_DIRECT_PUBLISH': {
-      const preparation = await prepareEditorTab({ blogName: message.data?.blogName || null });
+      let preparation = await buildPreparationFromDirectPublishState({ blogName: message.data?.blogName || null });
+      if (!preparation) {
+        preparation = await prepareEditorTab({ blogName: message.data?.blogName || directPublishState?.blogName || null });
+      }
       if (!preparation.success) {
-        return preparation;
+        return attachDirectPublishState(preparation);
       }
 
       // CAPTCHA 상태 확인
       try {
         const captchaCheck = await chrome.tabs.sendMessage(preparation.tabId, { action: 'CHECK_CAPTCHA' });
         if (captchaCheck?.captchaPresent) {
-          return withPreparationDetails({
+          const captchaContextResult = await getCaptchaContextForTab(preparation.tabId);
+          const liveState = await getLiveDirectPublishState();
+          const nextState = liveState || buildDirectPublishState({
+            response: { ...captchaCheck, status: 'captcha_required', tabId: preparation.tabId },
+            preparation,
+            requestData: message.data || {},
+            captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
+          });
+          await setDirectPublishState({
+            ...nextState,
+            tabId: preparation.tabId,
+            blogName: message.data?.blogName || nextState.blogName || preparation.blogName,
+            url: preparation.url || nextState.url,
+            status: 'captcha_required',
+            captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
+          });
+          return attachDirectPublishState(withPreparationDetails({
             success: false,
             error: 'CAPTCHA가 아직 표시되어 있습니다.',
             status: 'captcha_required'
-          }, preparation);
+          }, preparation));
         }
       } catch (e) { /* 진행 */ }
 
       // 발행 재시도
       try {
         const response = await chrome.tabs.sendMessage(preparation.tabId, { action: 'RESUME_PUBLISH' });
-        return withPreparationDetails(response, preparation);
+        const responseWithPreparation = withPreparationDetails(response, preparation);
+
+        if (responseWithPreparation.success) {
+          await clearDirectPublishState();
+          return responseWithPreparation;
+        }
+
+        if (responseWithPreparation.status === 'captcha_required') {
+          const captchaContextResult = await getCaptchaContextForTab(preparation.tabId);
+          const directState = buildDirectPublishState({
+            response: responseWithPreparation,
+            preparation,
+            requestData: {
+              ...(message.data || {}),
+              blogName: message.data?.blogName || directPublishState?.blogName || preparation.blogName,
+              visibility: message.data?.visibility || directPublishState?.visibility || null
+            },
+            captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
+          });
+          await setDirectPublishState(directState);
+          return attachDirectPublishState(responseWithPreparation, directState);
+        }
+
+        return attachDirectPublishState(responseWithPreparation);
       } catch (e) {
-        return makePreparationResponse({
+        return attachDirectPublishState(makePreparationResponse({
           success: false,
           status: 'editor_not_ready',
           error: e.message,
@@ -824,7 +1082,7 @@ async function handleMessage(message, sender) {
           url: preparation.url,
           blogName: preparation.blogName,
           diagnostics: preparation.diagnostics
-        });
+        }));
       }
     }
 
@@ -862,7 +1120,15 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   return true; // 비동기 응답
 });
 
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (directPublishState?.tabId === tabId) {
+    clearDirectPublishState().catch((error) => {
+      console.warn('[TistoryAuto BG] directPublishState 정리 실패:', error);
+    });
+  }
+});
+
 // ── 초기화 ──────────────────────────────────
-loadQueueState().then(() => {
-  console.log('[TistoryAuto BG] Service Worker 시작 ✅, 큐 항목:', publishQueue.length);
+Promise.all([loadQueueState(), loadDirectPublishState()]).then(() => {
+  console.log('[TistoryAuto BG] Service Worker 시작 ✅, 큐 항목:', publishQueue.length, 'directPublishState:', !!directPublishState);
 });

@@ -15,67 +15,10 @@
   }
 
   function installPostVisibilityInterceptor() {
-    const markerId = '__blog-auto-visibility-interceptor';
-    if (document.getElementById(markerId)) return;
-
-    const script = document.createElement('script');
-    script.id = markerId;
-    script.textContent = `(() => {
-      if (window.__BLOG_AUTO_VISIBILITY_INTERCEPTOR_INSTALLED__) return;
-      window.__BLOG_AUTO_VISIBILITY_INTERCEPTOR_INSTALLED__ = true;
-
-      const shouldRewrite = (url) => typeof url === 'string' && url.includes('/manage/post.json');
-      const getForcedVisibility = () => {
-        const raw = document.documentElement.dataset.blogAutoTargetVisibilityNum;
-        return raw == null || raw === '' ? null : Number(raw);
-      };
-      const logRewrite = (payload) => {
-        try {
-          localStorage.setItem('__blog_auto_forced_post_body', JSON.stringify(payload));
-        } catch (e) {}
-      };
-      const rewriteBody = (body) => {
-        const forcedVisibility = getForcedVisibility();
-        if (forcedVisibility == null) return body;
-        try {
-          if (typeof body === 'string') {
-            const parsed = JSON.parse(body);
-            parsed.visibility = forcedVisibility;
-            logRewrite(parsed);
-            console.log('[TistoryAuto:page] manage/post.json visibility 강제 적용:', forcedVisibility, parsed);
-            return JSON.stringify(parsed);
-          }
-        } catch (e) {
-          console.warn('[TistoryAuto:page] visibility rewrite 실패:', e);
-        }
-        return body;
-      };
-
-      const origOpen = XMLHttpRequest.prototype.open;
-      const origSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-        this.__blogAutoMeta = { method, url };
-        return origOpen.call(this, method, url, ...rest);
-      };
-      XMLHttpRequest.prototype.send = function(body) {
-        const meta = this.__blogAutoMeta || {};
-        const nextBody = shouldRewrite(meta.url) ? rewriteBody(body) : body;
-        return origSend.call(this, nextBody);
-      };
-
-      if (typeof window.fetch === 'function') {
-        const origFetch = window.fetch.bind(window);
-        window.fetch = function(input, init) {
-          const url = typeof input === 'string' ? input : input?.url || '';
-          if (shouldRewrite(url) && init && 'body' in init) {
-            init = { ...init, body: rewriteBody(init.body) };
-          }
-          return origFetch(input, init);
-        };
-      }
-    })();`;
-
-    (document.head || document.documentElement).appendChild(script);
+    chrome.runtime.sendMessage({ action: 'INJECT_MAIN_WORLD_VISIBILITY_HELPER' })
+      .catch((error) => {
+        console.warn('[TistoryAuto] MAIN world interceptor 초기 주입 실패:', error);
+      });
   }
 
   // 유틸: 요소 대기 (최대 timeout ms)
@@ -118,6 +61,178 @@
   // 유틸: 짧은 딜레이
   function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function normalizeText(value) {
+    return String(value ?? '').replace(/\s+/g, ' ').trim();
+  }
+
+  function matchesVisibilityText(text, visibility = 'public') {
+    const normalized = normalizeText(text);
+    if (!normalized) return false;
+
+    if (visibility === 'private') {
+      return /비공개/.test(normalized);
+    }
+
+    if (visibility === 'protected') {
+      return /보호/.test(normalized);
+    }
+
+    return /공개/.test(normalized) && !/비공개|보호/.test(normalized);
+  }
+
+  function isActionText(text) {
+    return /(발행|저장|닫기|취소|완료|확인)/.test(normalizeText(text));
+  }
+
+  function getVisibilitySpec(visibility = 'public') {
+    switch (visibility) {
+      case 'private':
+        return { expectedValue: '0', visibility };
+      case 'protected':
+        return { expectedValue: '15', visibility };
+      case 'public':
+      default:
+        return { expectedValue: '20', visibility: 'public' };
+    }
+  }
+
+  function getVisiblePublishLayer() {
+    const selectors = [
+      '.publish-layer',
+      '#publish-layer',
+      '.layer-publish',
+      '.ReactModal__Content',
+      '[role="dialog"]',
+      '[class*="publish"][class*="layer"]'
+    ];
+
+    for (const selector of selectors) {
+      const candidates = document.querySelectorAll(selector);
+      for (const candidate of candidates) {
+        if (isVisibleElement(candidate)) {
+          return candidate;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function getAssociatedText(element) {
+    if (!element) return '';
+
+    const parts = [
+      element.getAttribute?.('aria-label'),
+      element.getAttribute?.('title'),
+      element.textContent
+    ];
+
+    if (element.matches?.('input, textarea, select')) {
+      parts.push(element.value);
+
+      const closestLabel = element.closest('label');
+      if (closestLabel) {
+        parts.push(closestLabel.textContent);
+      }
+
+      if (element.id) {
+        const linkedLabel = document.querySelector(`label[for="${element.id}"]`);
+        if (linkedLabel) {
+          parts.push(linkedLabel.textContent);
+        }
+      }
+
+      parts.push(element.parentElement?.textContent || '');
+    }
+
+    return normalizeText(parts.filter(Boolean).join(' '));
+  }
+
+  function getConfirmButton() {
+    return findElement(S.publish.confirmButton, null)
+      || Array.from(document.querySelectorAll('button')).find((button) => {
+        const text = normalizeText(button.textContent);
+        return /(발행|저장)/.test(text) && button.closest('.layer_foot, .wrap_btn, .ReactModal__Content, .publish-layer, #publish-layer, .layer-publish');
+      })
+      || null;
+  }
+
+  function resolveVisibilityControl(scope, visibility = 'public') {
+    const spec = getVisibilitySpec(visibility);
+    const radios = Array.from(scope.querySelectorAll('input[type="radio"]'));
+
+    const radio = radios.find((candidate) => normalizeText(candidate.value) === spec.expectedValue)
+      || radios.find((candidate) => matchesVisibilityText(getAssociatedText(candidate), visibility));
+
+    if (radio) {
+      const linkedLabel = radio.id ? document.querySelector(`label[for="${radio.id}"]`) : null;
+      const closestLabel = radio.closest('label');
+      return {
+        radio,
+        clickTarget: linkedLabel || closestLabel || radio,
+        source: linkedLabel || closestLabel ? 'label' : 'radio'
+      };
+    }
+
+    const clickables = Array.from(scope.querySelectorAll('label, [role="radio"], button, [aria-checked], [aria-pressed]'));
+    const clickable = clickables.find((candidate) => {
+      const text = getAssociatedText(candidate);
+      if (!matchesVisibilityText(text, visibility)) return false;
+      if (isActionText(text)) return false;
+      return isVisibleElement(candidate) || isVisibleElement(candidate.parentElement) || isVisibleElement(candidate.closest('label, div, li'));
+    });
+
+    if (!clickable) return null;
+
+    const linkedRadio = clickable.getAttribute?.('for')
+      ? document.getElementById(clickable.getAttribute('for'))
+      : clickable.querySelector?.('input[type="radio"]')
+        || clickable.closest('label')?.querySelector?.('input[type="radio"]')
+        || null;
+
+    return {
+      radio: linkedRadio || null,
+      clickTarget: clickable,
+      source: 'clickable'
+    };
+  }
+
+  function verifyVisibilitySelection(visibility = 'public') {
+    const spec = getVisibilitySpec(visibility);
+    const publishLayer = getVisiblePublishLayer() || document;
+    const checkedRadio = Array.from(document.querySelectorAll('input[type="radio"]:checked')).find((candidate) => {
+      return normalizeText(candidate.value) === spec.expectedValue
+        || matchesVisibilityText(getAssociatedText(candidate), visibility);
+    });
+
+    const statefulMatch = Array.from(publishLayer.querySelectorAll('[role="radio"][aria-checked="true"], [aria-pressed="true"], .selected, .active, .checked')).find((candidate) => {
+      const text = getAssociatedText(candidate);
+      return matchesVisibilityText(text, visibility) && !isActionText(text);
+    });
+
+    const confirmBtn = getConfirmButton();
+    const publishBtnText = normalizeText(confirmBtn?.textContent || '');
+    const buttonMatches = matchesVisibilityText(publishBtnText, visibility);
+    const checkedValue = normalizeText(checkedRadio?.value || '');
+
+    return {
+      success: !!(checkedRadio || statefulMatch || buttonMatches),
+      checkedValue: checkedValue || null,
+      expectedValue: spec.expectedValue,
+      publishBtnText: publishBtnText || null
+    };
+  }
+
+  function triggerVisibilityClick(target) {
+    if (!target) return;
+    target.focus?.();
+    if (typeof target.click === 'function') {
+      target.click();
+    } else {
+      target.dispatchEvent?.(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    }
   }
 
   // 유틸: input/textarea 이벤트 시뮬레이션 (React/Vue 호환)
@@ -386,51 +501,51 @@
    */
   async function setVisibility(visibility = 'public') {
     try {
-      let radio;
-      switch (visibility) {
-        case 'public':
-          radio = findElement(S.visibility.openRadio, S.visibility.fallback);
-          break;
-        case 'protected':
-          radio = findElement(S.visibility.protectedRadio, null);
-          break;
-        case 'private':
-          radio = findElement(S.visibility.privateRadio, null);
-          break;
-        default:
-          radio = findElement(S.visibility.openRadio, S.visibility.fallback);
+      const publishLayer = getVisiblePublishLayer() || document;
+      const scopes = [publishLayer, document].filter((scope, index, array) => scope && array.indexOf(scope) === index);
+
+      let resolved = null;
+      for (const scope of scopes) {
+        resolved = resolveVisibilityControl(scope, visibility);
+        if (resolved) break;
       }
 
-      if (!radio) {
+      if (!resolved) {
+        const fallbackVerification = verifyVisibilitySelection(visibility);
+        if (fallbackVerification.success) {
+          console.log('[TistoryAuto] 공개 설정 UI 직접 클릭 없이 확인됨:', visibility, fallbackVerification);
+          return fallbackVerification;
+        }
+
         return { success: false, error: `공개 설정 라디오를 찾을 수 없음: ${visibility}` };
       }
 
-      const label = radio.id ? document.querySelector(`label[for="${radio.id}"]`) : null;
-      if (label) {
-        label.click();
-      } else {
-        radio.click();
+      triggerVisibilityClick(resolved.clickTarget);
+
+      if (resolved.radio && 'checked' in resolved.radio) {
+        resolved.radio.checked = true;
+        resolved.radio.dispatchEvent(new Event('input', { bubbles: true }));
+        resolved.radio.dispatchEvent(new Event('change', { bubbles: true }));
       }
 
-      if ('checked' in radio) {
-        radio.checked = true;
+      await delay(300);
+
+      let verification = verifyVisibilitySelection(visibility);
+      if (!verification.success && resolved.radio && resolved.clickTarget !== resolved.radio) {
+        triggerVisibilityClick(resolved.radio);
+        resolved.radio.dispatchEvent(new Event('input', { bubbles: true }));
+        resolved.radio.dispatchEvent(new Event('change', { bubbles: true }));
+        await delay(250);
+        verification = verifyVisibilitySelection(visibility);
       }
-      radio.dispatchEvent(new Event('input', { bubbles: true }));
-      radio.dispatchEvent(new Event('change', { bubbles: true }));
-      await delay(250);
 
-      const checked = document.querySelector(`${S.visibility.openRadio}:checked, ${S.visibility.protectedRadio}:checked, ${S.visibility.privateRadio}:checked, input[name="basicSet"]:checked, input[name="visibility"]:checked`);
-      const checkedValue = checked?.value || null;
-      const expectedValue = visibility === 'public' ? '20' : visibility === 'protected' ? '15' : '0';
-      const publishBtnText = findElement(S.publish.confirmButton, null)?.textContent?.trim() || null;
-      const textMatches = visibility === 'private'
-        ? /비공개/.test(publishBtnText || '')
-        : visibility === 'protected'
-          ? /(보호|공개)/.test(publishBtnText || '')
-          : /공개/.test(publishBtnText || '');
+      console.log('[TistoryAuto] 공개 설정 완료:', visibility, {
+        source: resolved.source,
+        checkedValue: verification.checkedValue,
+        publishBtnText: verification.publishBtnText
+      });
 
-      console.log('[TistoryAuto] 공개 설정 완료:', visibility, 'checked=', checkedValue, 'button=', publishBtnText);
-      return { success: checkedValue === expectedValue && textMatches, checkedValue, expectedValue, publishBtnText };
+      return verification;
     } catch (error) {
       console.error('[TistoryAuto] 공개 설정 실패:', error);
       return { success: false, error: error.message };
@@ -957,11 +1072,11 @@
           return await insertImages(message.data.images);
 
         case 'PUBLISH':
-          return await publish();
+          return await publish(message.data?.visibility || 'public');
 
         // CAPTCHA 해결 후 발행만 재시도 (에디터 내용은 이미 입력됨)
         case 'RESUME_PUBLISH':
-          return await publish();
+          return await publish(message.data?.visibility || 'public');
 
         // CAPTCHA 표시 여부 확인
         case 'CHECK_CAPTCHA':

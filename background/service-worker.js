@@ -449,65 +449,437 @@ async function getTistoryTabCandidates(targetBlogName = null) {
   });
 }
 
+function installPageWorldPostInterceptor() {
+  if (window.__BLOG_AUTO_VISIBILITY_INTERCEPTOR_INSTALLED__) return;
+  window.__BLOG_AUTO_VISIBILITY_INTERCEPTOR_INSTALLED__ = true;
+
+  const pageState = window.__BLOG_AUTO_POST_INTERCEPTOR_STATE__ || (window.__BLOG_AUTO_POST_INTERCEPTOR_STATE__ = {
+    captchaPayload: {
+      recaptchaValue: null,
+      challengeCode: null,
+      source: null,
+      updatedAt: null
+    }
+  });
+
+  const MANAGE_POST_LOG_KEY = '__blog_auto_last_manage_post_diag';
+  const CAPTCHA_PAYLOAD_LOG_KEY = '__blog_auto_last_captcha_payload';
+  const CAPTCHA_KEY_RE = /(recaptchaValue|g-recaptcha-response|challengeCode)/i;
+
+  const now = () => new Date().toISOString();
+
+  const normalizeText = (value) => {
+    if (value == null) return null;
+    const text = typeof value === 'string' ? value : String(value);
+    const trimmed = text.trim();
+    return trimmed || null;
+  };
+
+  const normalizePayload = (payload) => {
+    if (!payload || typeof payload !== 'object') return null;
+
+    const recaptchaValue = normalizeText(
+      payload.recaptchaValue
+      || payload['g-recaptcha-response']
+      || payload.gRecaptchaResponse
+      || payload.captchaValue
+      || null
+    );
+    const challengeCode = normalizeText(
+      payload.challengeCode
+      || payload.challenge_code
+      || null
+    );
+
+    if (!recaptchaValue && !challengeCode) return null;
+    return { recaptchaValue, challengeCode };
+  };
+
+  const persistPayloadSummary = (payload) => {
+    try {
+      localStorage.setItem(CAPTCHA_PAYLOAD_LOG_KEY, JSON.stringify({
+        hasRecaptchaValue: !!payload?.recaptchaValue,
+        hasChallengeCode: !!payload?.challengeCode,
+        source: payload?.source || null,
+        updatedAt: payload?.updatedAt || now()
+      }));
+    } catch (_) {}
+  };
+
+  const rememberPayload = (payload, source) => {
+    const normalized = normalizePayload(payload);
+    if (!normalized) return pageState.captchaPayload;
+
+    const previous = pageState.captchaPayload || {};
+    const next = {
+      recaptchaValue: normalized.recaptchaValue || previous.recaptchaValue || null,
+      challengeCode: normalized.challengeCode || previous.challengeCode || null,
+      source,
+      updatedAt: now()
+    };
+
+    const changed = next.recaptchaValue !== previous.recaptchaValue
+      || next.challengeCode !== previous.challengeCode
+      || next.source !== previous.source;
+
+    pageState.captchaPayload = next;
+
+    if (changed) {
+      persistPayloadSummary(next);
+      console.log('[TistoryAuto:page] CAPTCHA payload 갱신:', {
+        source,
+        hasRecaptchaValue: !!next.recaptchaValue,
+        hasChallengeCode: !!next.challengeCode
+      });
+    }
+
+    return next;
+  };
+
+  const extractPayload = (value, context = {}) => {
+    if (value == null) return null;
+
+    if (typeof value === 'string') {
+      const text = value.trim();
+      if (!text) return null;
+
+      if ((text.startsWith('{') || text.startsWith('[')) && text.length < 50000) {
+        try {
+          return extractPayload(JSON.parse(text), context);
+        } catch (_) {}
+      }
+
+      if ((text.includes('recaptchaValue=') || text.includes('challengeCode=') || text.includes('g-recaptcha-response=')) && text.length < 20000) {
+        try {
+          const params = new URLSearchParams(text);
+          return normalizePayload(Object.fromEntries(params.entries()));
+        } catch (_) {}
+      }
+
+      if (/captcha|challenge/i.test(context.path || '') && text.length >= 16) {
+        return normalizePayload({ recaptchaValue: text });
+      }
+
+      return null;
+    }
+
+    if (typeof URLSearchParams !== 'undefined' && value instanceof URLSearchParams) {
+      return normalizePayload(Object.fromEntries(value.entries()));
+    }
+
+    if (typeof FormData !== 'undefined' && value instanceof FormData) {
+      const entries = {};
+      value.forEach((entryValue, entryKey) => {
+        if (!(entryKey in entries)) {
+          entries[entryKey] = entryValue;
+        }
+      });
+      return normalizePayload(entries);
+    }
+
+    if (typeof value !== 'object') return null;
+
+    const direct = normalizePayload(value);
+    if (direct) return direct;
+
+    const typeHint = normalizeText(
+      value.type
+      || value.event
+      || value.kind
+      || value.name
+      || value.status
+      || ''
+    );
+    if (typeHint && /captcha|challenge/i.test(typeHint)) {
+      const inferred = normalizePayload({
+        recaptchaValue: value.token || value.value || value.response || value.result || null,
+        challengeCode: value.challengeCode || value.challenge_code || null
+      });
+      if (inferred) return inferred;
+    }
+
+    if ((context.depth || 0) >= 4) return null;
+
+    for (const [key, nestedValue] of Object.entries(value)) {
+      const nested = extractPayload(nestedValue, {
+        depth: (context.depth || 0) + 1,
+        path: context.path ? `${context.path}.${key}` : key
+      });
+      if (nested) return nested;
+    }
+
+    return null;
+  };
+
+  const readFirstValue = (selectors) => {
+    for (const selector of selectors) {
+      const elements = document.querySelectorAll(selector);
+      for (const el of elements) {
+        const value = normalizeText('value' in el ? el.value : el.textContent);
+        if (value) return value;
+      }
+    }
+    return null;
+  };
+
+  const collectPayloadFromDom = () => normalizePayload({
+    recaptchaValue: readFirstValue([
+      'input[name="recaptchaValue"]',
+      'textarea[name="recaptchaValue"]',
+      'textarea[name="g-recaptcha-response"]',
+      'input[name="g-recaptcha-response"]',
+      'input[id*="recaptcha"][value]',
+      'textarea[id*="recaptcha"]',
+      'input[name*="captcha"][value]',
+      'textarea[name*="captcha"]'
+    ]),
+    challengeCode: readFirstValue([
+      'input[name="challengeCode"]',
+      'textarea[name="challengeCode"]',
+      'input[id*="challenge"][value]',
+      'textarea[id*="challenge"]'
+    ])
+  });
+
+  const collectPayloadFromDataset = () => normalizePayload({
+    recaptchaValue: document.documentElement.dataset.blogAutoRecaptchaValue
+      || document.documentElement.getAttribute('data-blog-auto-recaptcha-value')
+      || null,
+    challengeCode: document.documentElement.dataset.blogAutoChallengeCode
+      || document.documentElement.getAttribute('data-blog-auto-challenge-code')
+      || null
+  });
+
+  const collectPayloadFromCookies = () => {
+    if (!document.cookie) return null;
+
+    const values = {};
+    document.cookie.split(';').forEach((part) => {
+      const [rawKey, ...rawValue] = part.split('=');
+      const key = normalizeText(rawKey);
+      if (!key || !CAPTCHA_KEY_RE.test(key)) return;
+      values[key] = decodeURIComponent(rawValue.join('=') || '');
+    });
+
+    return normalizePayload(values);
+  };
+
+  const collectPayloadFromStorage = (storage, storageName) => {
+    if (!storage) return null;
+
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index);
+      if (!key || !/captcha|challenge/i.test(key)) continue;
+
+      try {
+        const value = storage.getItem(key);
+        const payload = extractPayload(value, { path: `${storageName}.${key}`, depth: 0 });
+        if (payload) return payload;
+      } catch (_) {}
+    }
+
+    return null;
+  };
+
+  const collectPayloadFromGlobals = () => {
+    const globalNames = ['__NEXT_DATA__', '__INITIAL_STATE__', '__PRELOADED_STATE__', 'TistoryBlog'];
+    for (const name of globalNames) {
+      try {
+        const payload = extractPayload(window[name], { path: name, depth: 0 });
+        if (payload) return payload;
+      } catch (_) {}
+    }
+    return null;
+  };
+
+  const refreshCaptchaPayload = (reason = 'refresh') => {
+    const candidates = [
+      { source: `${reason}:dataset`, payload: collectPayloadFromDataset() },
+      { source: `${reason}:dom`, payload: collectPayloadFromDom() },
+      { source: `${reason}:cookie`, payload: collectPayloadFromCookies() },
+      { source: `${reason}:sessionStorage`, payload: collectPayloadFromStorage(window.sessionStorage, 'sessionStorage') },
+      { source: `${reason}:localStorage`, payload: collectPayloadFromStorage(window.localStorage, 'localStorage') },
+      { source: `${reason}:globals`, payload: collectPayloadFromGlobals() }
+    ];
+
+    candidates.forEach(({ source, payload }) => {
+      if (payload) rememberPayload(payload, source);
+    });
+
+    return pageState.captchaPayload;
+  };
+
+  window.addEventListener('message', (event) => {
+    const payload = extractPayload(event.data, { path: `message:${event.origin || 'unknown'}`, depth: 0 });
+    if (payload) {
+      rememberPayload(payload, `message:${event.origin || 'unknown'}`);
+    }
+  }, true);
+
+  const originalSetItem = Storage.prototype.setItem;
+  Storage.prototype.setItem = function(key, value) {
+    const result = originalSetItem.apply(this, arguments);
+    if (key && /captcha|challenge/i.test(String(key))) {
+      const storageName = this === window.sessionStorage ? 'sessionStorage' : 'localStorage';
+      const payload = extractPayload(value, { path: `${storageName}.${key}`, depth: 0 });
+      if (payload) {
+        rememberPayload(payload, `${storageName}:${key}`);
+      }
+    }
+    return result;
+  };
+
+  const shouldRewrite = (url) => typeof url === 'string' && url.includes('/manage/post.json');
+
+  const getForcedVisibility = () => {
+    const raw = document.documentElement.dataset.blogAutoTargetVisibilityNum;
+    return raw == null || raw === '' ? null : Number(raw);
+  };
+
+  const persistRequestDiag = (diag) => {
+    try {
+      localStorage.setItem(MANAGE_POST_LOG_KEY, JSON.stringify(diag));
+    } catch (_) {}
+  };
+
+  const rewritePayload = (payload) => {
+    if (!payload || typeof payload !== 'object') return payload;
+
+    const nextPayload = Array.isArray(payload) ? [...payload] : { ...payload };
+    const forcedVisibility = getForcedVisibility();
+    const captchaPayload = refreshCaptchaPayload('manage_post');
+
+    let changed = false;
+
+    if (forcedVisibility != null && nextPayload.visibility !== forcedVisibility) {
+      nextPayload.visibility = forcedVisibility;
+      changed = true;
+    }
+
+    if (!normalizeText(nextPayload.recaptchaValue) && normalizeText(captchaPayload?.recaptchaValue)) {
+      nextPayload.recaptchaValue = captchaPayload.recaptchaValue;
+      changed = true;
+    }
+
+    if (!normalizeText(nextPayload.challengeCode) && normalizeText(captchaPayload?.challengeCode)) {
+      nextPayload.challengeCode = captchaPayload.challengeCode;
+      changed = true;
+    }
+
+    const diag = {
+      at: now(),
+      changed,
+      visibility: nextPayload.visibility ?? null,
+      hasRecaptchaValue: !!normalizeText(nextPayload.recaptchaValue),
+      hasChallengeCode: !!normalizeText(nextPayload.challengeCode),
+      captchaSource: captchaPayload?.source || null
+    };
+
+    persistRequestDiag(diag);
+
+    if (changed) {
+      console.log('[TistoryAuto:page] manage/post.json payload 보정:', diag);
+    } else if (!diag.hasRecaptchaValue) {
+      console.warn('[TistoryAuto:page] manage/post.json recaptchaValue 누락:', diag);
+    }
+
+    return nextPayload;
+  };
+
+  const rewriteBody = (body) => {
+    if (body == null) return body;
+
+    if (typeof body === 'string') {
+      try {
+        const parsed = JSON.parse(body);
+        return JSON.stringify(rewritePayload(parsed));
+      } catch (_) {
+        if ((body.includes('recaptchaValue=') || body.includes('challengeCode=') || body.includes('visibility=')) && body.length < 20000) {
+          try {
+            const params = new URLSearchParams(body);
+            return new URLSearchParams(Object.entries(rewritePayload(Object.fromEntries(params.entries())))).toString();
+          } catch (error) {
+            console.warn('[TistoryAuto:page] manage/post.json body parse 실패:', error);
+          }
+        }
+        return body;
+      }
+    }
+
+    if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+      const rewritten = rewritePayload(Object.fromEntries(body.entries()));
+      return new URLSearchParams(Object.entries(rewritten)).toString();
+    }
+
+    if (typeof FormData !== 'undefined' && body instanceof FormData) {
+      const rewritten = rewritePayload(Object.fromEntries(body.entries()));
+      const nextFormData = new FormData();
+      Object.entries(rewritten).forEach(([key, value]) => {
+        nextFormData.append(key, value == null ? '' : String(value));
+      });
+      return nextFormData;
+    }
+
+    if (typeof body === 'object') {
+      return rewritePayload(body);
+    }
+
+    return body;
+  };
+
+  const origOpen = XMLHttpRequest.prototype.open;
+  const origSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    this.__blogAutoMeta = { method, url };
+    return origOpen.call(this, method, url, ...rest);
+  };
+  XMLHttpRequest.prototype.send = function(body) {
+    const meta = this.__blogAutoMeta || {};
+    const nextBody = shouldRewrite(meta.url) ? rewriteBody(body) : body;
+    return origSend.call(this, nextBody);
+  };
+
+  if (typeof window.fetch === 'function') {
+    const origFetch = window.fetch.bind(window);
+    window.fetch = async function(input, init) {
+      const url = typeof input === 'string' ? input : input?.url || '';
+      if (!shouldRewrite(url)) {
+        return origFetch(input, init);
+      }
+
+      try {
+        if (init && Object.prototype.hasOwnProperty.call(init, 'body')) {
+          return origFetch(input, { ...init, body: rewriteBody(init.body) });
+        }
+
+        if (typeof Request !== 'undefined' && input instanceof Request) {
+          const method = (input.method || 'GET').toUpperCase();
+          if (!['GET', 'HEAD'].includes(method)) {
+            const originalBody = await input.clone().text();
+            const nextBody = rewriteBody(originalBody);
+            const rewrittenBody = typeof nextBody === 'string' ? nextBody : JSON.stringify(nextBody);
+            if (rewrittenBody !== originalBody) {
+              input = new Request(input, { body: rewrittenBody });
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('[TistoryAuto:page] fetch payload 보정 실패:', error);
+      }
+
+      return origFetch(input, init);
+    };
+  }
+
+  refreshCaptchaPayload('init');
+}
+
 async function ensurePageWorldVisibilityInterceptor(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      func: () => {
-        if (window.__BLOG_AUTO_VISIBILITY_INTERCEPTOR_INSTALLED__) return;
-        window.__BLOG_AUTO_VISIBILITY_INTERCEPTOR_INSTALLED__ = true;
-
-        const shouldRewrite = (url) => typeof url === 'string' && url.includes('/manage/post.json');
-        const getForcedVisibility = () => {
-          const raw = document.documentElement.dataset.blogAutoTargetVisibilityNum;
-          return raw == null || raw === '' ? null : Number(raw);
-        };
-        const logRewrite = (payload) => {
-          try {
-            localStorage.setItem('__blog_auto_forced_post_body', JSON.stringify(payload));
-          } catch (_) {}
-        };
-        const rewriteBody = (body) => {
-          const forcedVisibility = getForcedVisibility();
-          if (forcedVisibility == null) return body;
-          try {
-            if (typeof body === 'string') {
-              const parsed = JSON.parse(body);
-              parsed.visibility = forcedVisibility;
-              logRewrite(parsed);
-              console.log('[TistoryAuto:page] manage/post.json visibility 강제 적용:', forcedVisibility, parsed);
-              return JSON.stringify(parsed);
-            }
-          } catch (e) {
-            console.warn('[TistoryAuto:page] visibility rewrite 실패:', e);
-          }
-          return body;
-        };
-
-        const origOpen = XMLHttpRequest.prototype.open;
-        const origSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-          this.__blogAutoMeta = { method, url };
-          return origOpen.call(this, method, url, ...rest);
-        };
-        XMLHttpRequest.prototype.send = function(body) {
-          const meta = this.__blogAutoMeta || {};
-          const nextBody = shouldRewrite(meta.url) ? rewriteBody(body) : body;
-          return origSend.call(this, nextBody);
-        };
-
-        if (typeof window.fetch === 'function') {
-          const origFetch = window.fetch.bind(window);
-          window.fetch = function(input, init) {
-            const url = typeof input === 'string' ? input : input?.url || '';
-            if (shouldRewrite(url) && init && 'body' in init) {
-              init = { ...init, body: rewriteBody(init.body) };
-            }
-            return origFetch(input, init);
-          };
-        }
-      }
+      func: installPageWorldPostInterceptor
     });
     return true;
   } catch (error) {
@@ -959,9 +1331,14 @@ async function handleMessage(message, sender) {
       await saveQueueState();
 
       try {
-        const response = await chrome.tabs.sendMessage(tabId, { action: 'RESUME_PUBLISH' });
+        await ensurePageWorldVisibilityInterceptor(tabId);
+        const response = await chrome.tabs.sendMessage(tabId, {
+          action: 'RESUME_PUBLISH',
+          data: { visibility: item.data?.visibility || 'public' }
+        });
         if (response.success) {
           item.status = 'completed';
+          item.error = null;
           item.completedAt = new Date().toISOString();
           item.publishStatus = response.status || 'published';
           item.captchaTabId = null;
@@ -1048,7 +1425,11 @@ async function handleMessage(message, sender) {
 
       // 발행 재시도
       try {
-        const response = await chrome.tabs.sendMessage(preparation.tabId, { action: 'RESUME_PUBLISH' });
+        await ensurePageWorldVisibilityInterceptor(preparation.tabId);
+        const response = await chrome.tabs.sendMessage(preparation.tabId, {
+          action: 'RESUME_PUBLISH',
+          data: { visibility: message.data?.visibility || directPublishState?.visibility || 'public' }
+        });
         const responseWithPreparation = withPreparationDetails(response, preparation);
 
         if (responseWithPreparation.success) {

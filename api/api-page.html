@@ -205,15 +205,23 @@
                 <button class="btn btn-secondary" id="btn-direct-state">📍 DIRECT STATE</button>
                 <button class="btn btn-secondary" id="btn-captcha-context">🧩 CAPTCHA CONTEXT</button>
             </div>
+            <label>CAPTCHA Answer</label>
+            <input type="text" id="captcha-answer" placeholder="보안문자 답안">
+            <label>CAPTCHA Tab ID (선택)</label>
+            <input type="text" id="captcha-tab-id" placeholder="비우면 저장된 directPublishState tab 사용">
+            <div class="actions">
+                <button class="btn btn-secondary" id="btn-submit-captcha">✍️ SUBMIT_CAPTCHA</button>
+            </div>
             <div class="tip">
                 권장 순서: <strong>PREPARE_EDITOR → WRITE_POST</strong><br>
                 `captcha_required`가 오면 <strong>DIRECT STATE / CAPTCHA CONTEXT</strong>로 막힌 탭과 캡차 위치를 확인한 뒤,
-                같은 탭에서 해결하고 `RESUME_DIRECT_PUBLISH`를 호출하세요.
+                `SUBMIT_CAPTCHA`로 같은 탭에 답안을 넣고 확인 버튼을 누른 뒤, `captchaStillAppears: false`면 `RESUME_DIRECT_PUBLISH`를 호출하세요.
             </div>
             <div class="result" id="connect-result"></div>
             <div class="result" id="prepare-result"></div>
             <div class="result" id="direct-state-result"></div>
             <div class="result" id="captcha-context-result"></div>
+            <div class="result" id="captcha-submit-result"></div>
         </div>
 
         <!-- 단건 발행 -->
@@ -306,6 +314,22 @@
                 <span class="key">action</span>: <span class="str">"GET_CAPTCHA_CONTEXT"</span>
                 }, (response) => console.log(response));
 
+                <span class="key">// CAPTCHA 답안 제출 (saved blocked tab 우선)</span>
+                chrome.runtime.sendMessage(EXTENSION_ID, {
+                <span class="key">action</span>: <span class="str">"SUBMIT_CAPTCHA"</span>,
+                <span class="key">data</span>: {
+                <span class="key">answer</span>: <span class="str">"1234"</span>
+                }
+                }, (response) => {
+                console.log(response);
+                <span class="key">// captchaStillAppears가 false일 때만 재개 권장</span>
+                <span class="key">if</span> (!response.captchaStillAppears) {
+                chrome.runtime.sendMessage(EXTENSION_ID, {
+                <span class="key">action</span>: <span class="str">"RESUME_DIRECT_PUBLISH"</span>
+                }, (resume) => console.log(resume));
+                }
+                });
+
                 <span class="key">// 큐에 추가</span>
                 chrome.runtime.sendMessage(EXTENSION_ID, {
                 <span class="key">action</span>: <span class="str">"ADD_TO_QUEUE"</span>,
@@ -335,6 +359,18 @@
             return {
                 blogName: getRequestedBlogName()
             };
+        }
+
+        function getOptionalTabId(inputId) {
+            const raw = $(inputId).value.trim();
+            if (!raw) return null;
+
+            const tabId = Number(raw);
+            if (!Number.isInteger(tabId) || tabId <= 0) {
+                throw new Error('유효한 tabId를 입력하세요');
+            }
+
+            return tabId;
         }
 
         function showResult(elementId, data, isError = false) {
@@ -399,6 +435,27 @@
                 showResult('#captcha-context-result', result, !result.success);
             } catch (err) {
                 showResult('#captcha-context-result', err.message, true);
+            }
+        });
+
+        $('#btn-submit-captcha').addEventListener('click', async () => {
+            try {
+                const result = await sendToExtension('SUBMIT_CAPTCHA', {
+                    answer: $('#captcha-answer').value.trim(),
+                    tabId: getOptionalTabId('#captcha-tab-id'),
+                    waitMs: 1200
+                });
+                showResult('#captcha-submit-result', result, !result.success);
+
+                const directState = await sendToExtension('GET_DIRECT_PUBLISH_STATE', { includeCaptchaContext: true });
+                showResult('#direct-state-result', directState, !directState.success);
+
+                const context = await sendToExtension('GET_CAPTCHA_CONTEXT', {
+                    tabId: result?.tabId || getOptionalTabId('#captcha-tab-id')
+                });
+                showResult('#captcha-context-result', context, !context.success);
+            } catch (err) {
+                showResult('#captcha-submit-result', err.message, true);
             }
         });
 

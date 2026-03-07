@@ -237,19 +237,29 @@
 
   // 유틸: input/textarea 이벤트 시뮬레이션 (React/Vue 호환)
   function simulateInput(element, value) {
-    // textarea와 input 모두 지원
-    const proto = element.tagName === 'TEXTAREA'
-      ? window.HTMLTextAreaElement.prototype
-      : window.HTMLInputElement.prototype;
+    const nextValue = value == null ? '' : String(value);
 
-    const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-
-    if (nativeSetter) {
-      nativeSetter.call(element, value);
+    if (element.isContentEditable) {
+      element.focus?.();
+      element.textContent = nextValue;
     } else {
-      element.value = value;
+      const proto = element.tagName === 'TEXTAREA'
+        ? window.HTMLTextAreaElement.prototype
+        : window.HTMLInputElement.prototype;
+
+      const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (nativeSetter) {
+        nativeSetter.call(element, nextValue);
+      } else {
+        element.value = nextValue;
+      }
+
+      if (typeof element.setSelectionRange === 'function') {
+        element.setSelectionRange(nextValue.length, nextValue.length);
+      }
     }
 
+    element.dispatchEvent(new Event('beforeinput', { bubbles: true, cancelable: true }));
     element.dispatchEvent(new Event('input', { bubbles: true }));
     element.dispatchEvent(new Event('change', { bubbles: true }));
     element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
@@ -678,18 +688,43 @@
   /**
    * CAPTCHA/차단 상태 감지
    */
+  const CAPTCHA_SELECTOR_SPECS = [
+    { selector: '#dkaptcha', kind: 'captcha_root' },
+    { selector: '.dkaptcha', kind: 'captcha_root' },
+    { selector: '.captcha-wrap', kind: 'captcha_root' },
+    { selector: '[class*="captcha"]', kind: 'captcha_generic' },
+    { selector: '[id*="captcha"]', kind: 'captcha_generic' },
+    { selector: '.g-recaptcha', kind: 'captcha_root' },
+    { selector: '#recaptcha', kind: 'captcha_root' },
+    { selector: 'iframe[src*="dkaptcha"]', kind: 'captcha_iframe' },
+    { selector: 'iframe[src*="captcha"]', kind: 'captcha_iframe' },
+    { selector: '#captchaImg', kind: 'captcha_image' }
+  ];
+
+  const CAPTCHA_INPUT_SELECTOR_SPECS = [
+    { selector: 'input[type="text"]', kind: 'text_input' },
+    { selector: 'input:not([type])', kind: 'text_input' },
+    { selector: 'input[type="search"]', kind: 'search_input' },
+    { selector: 'input[type="tel"]', kind: 'tel_input' },
+    { selector: 'input[type="number"]', kind: 'number_input' },
+    { selector: 'textarea', kind: 'textarea' },
+    { selector: '[contenteditable="true"]', kind: 'contenteditable' }
+  ];
+
+  const CAPTCHA_BUTTON_SELECTOR_SPECS = [
+    { selector: 'button', kind: 'button' },
+    { selector: 'input[type="submit"]', kind: 'submit_input' },
+    { selector: 'input[type="button"]', kind: 'button_input' },
+    { selector: '[role="button"]', kind: 'role_button' }
+  ];
+
+  const CAPTCHA_INPUT_HINT_RE = /(captcha|dkaptcha|보안|인증|문자|코드|정답|answer|response|challenge)/i;
+  const CAPTCHA_BUTTON_HINT_RE = /(확인|인증|제출|전송|완료|ok|submit|confirm|verify)/i;
+  const PUBLISH_BUTTON_HINT_RE = /(발행|저장|공개\s*발행|비공개\s*발행|publish|save)/i;
+  const EDITOR_FIELD_HINT_RE = /(title|subject|제목|tag|태그|category|카테고리|search|검색)/i;
+
   function detectCaptcha() {
-    // DKAPTCHA, reCAPTCHA, 또는 기타 보안 요소 감지
-    const captchaSelectors = [
-      '#dkaptcha', '.dkaptcha', '[class*="captcha"]', '[id*="captcha"]',
-      '.g-recaptcha', '#recaptcha', 'iframe[src*="captcha"]',
-      '.captcha-wrap', '#captchaImg'
-    ];
-    for (const sel of captchaSelectors) {
-      const el = document.querySelector(sel);
-      if (el && el.offsetParent !== null) return true; // visible captcha
-    }
-    return false;
+    return collectVisibleMatches(CAPTCHA_SELECTOR_SPECS).length > 0;
   }
 
   function isVisibleElement(el) {
@@ -718,10 +753,65 @@
     };
   }
 
-  function summarizeElement(el, selector, kind = 'captcha_candidate') {
+  function buildDomPath(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return null;
+    if (el.id) return `#${el.id}`;
+
+    const parts = [];
+    let current = el;
+
+    while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 4 && current !== document.body) {
+      const tag = current.tagName.toLowerCase();
+      const classNames = Array.from(current.classList || []).slice(0, 2).join('.');
+      let part = classNames ? `${tag}.${classNames}` : tag;
+
+      if (current.parentElement) {
+        const sameTagSiblings = Array.from(current.parentElement.children)
+          .filter((sibling) => sibling.tagName === current.tagName);
+        if (sameTagSiblings.length > 1) {
+          part += `:nth-of-type(${sameTagSiblings.indexOf(current) + 1})`;
+        }
+      }
+
+      parts.unshift(part);
+      current = current.parentElement;
+    }
+
+    return parts.join(' > ') || null;
+  }
+
+  function collectVisibleMatches(specs) {
+    const matches = new Map();
+
+    specs.forEach((spec) => {
+      document.querySelectorAll(spec.selector).forEach((el) => {
+        if (!isVisibleElement(el)) return;
+        if (typeof spec.filter === 'function' && !spec.filter(el)) return;
+
+        let entry = matches.get(el);
+        if (!entry) {
+          entry = { element: el, matchedSelectors: [], kinds: [] };
+          matches.set(el, entry);
+        }
+
+        if (!entry.matchedSelectors.includes(spec.selector)) {
+          entry.matchedSelectors.push(spec.selector);
+        }
+
+        if (spec.kind && !entry.kinds.includes(spec.kind)) {
+          entry.kinds.push(spec.kind);
+        }
+      });
+    });
+
+    return Array.from(matches.values());
+  }
+
+  function summarizeElement(el, selector, kind = 'captcha_candidate', extra = {}) {
     return {
       kind,
       selector,
+      matchedSelectors: extra.matchedSelectors || (selector ? [selector] : []),
       tagName: el.tagName?.toLowerCase() || null,
       id: el.id || null,
       className: compactText(el.className || '', 120),
@@ -729,61 +819,356 @@
       ariaLabel: el.getAttribute?.('aria-label') || null,
       title: el.getAttribute?.('title') || null,
       name: el.getAttribute?.('name') || null,
+      type: el.getAttribute?.('type') || null,
+      placeholder: el.getAttribute?.('placeholder') || null,
+      valuePreview: el.matches?.('input, textarea') ? compactText(el.value || '', 80) : null,
+      disabled: !!el.disabled,
+      readOnly: !!el.readOnly,
       src: (el.tagName === 'IFRAME' || el.tagName === 'IMG') ? (el.getAttribute('src') || null) : null,
-      rect: serializeRect(el.getBoundingClientRect())
+      domPath: buildDomPath(el),
+      rect: serializeRect(el.getBoundingClientRect()),
+      ...extra
+    };
+  }
+
+  function rectsAreNear(rectA, rectB, maxGap = 220) {
+    if (!rectA || !rectB) return false;
+
+    const horizontalGap = Math.max(rectB.left - rectA.right, rectA.left - rectB.right, 0);
+    const verticalGap = Math.max(rectB.top - rectA.bottom, rectA.top - rectB.bottom, 0);
+    return horizontalGap <= maxGap && verticalGap <= maxGap;
+  }
+
+  function findBestRelation(candidate, targets, options = {}) {
+    const insideBonus = options.insideBonus ?? 16;
+    const nearbyBonus = options.nearbyBonus ?? 8;
+
+    if (!targets || targets.length === 0) {
+      return { score: 0, reason: null, target: null };
+    }
+
+    const candidateRect = candidate.getBoundingClientRect();
+
+    for (const target of targets) {
+      if (target === candidate || target.contains(candidate)) {
+        return { score: insideBonus, reason: 'inside_target', target };
+      }
+    }
+
+    const candidateForm = candidate.closest('form');
+    for (const target of targets) {
+      const targetForm = target.closest('form');
+      if (candidateForm && targetForm && candidateForm === targetForm) {
+        return { score: insideBonus - 4, reason: 'same_form', target };
+      }
+
+      if (rectsAreNear(candidateRect, target.getBoundingClientRect(), options.maxGap ?? 220)) {
+        return { score: nearbyBonus, reason: 'near_target', target };
+      }
+    }
+
+    return { score: 0, reason: null, target: null };
+  }
+
+  function getElementInputValue(element) {
+    if (!element) return '';
+    if (element.matches?.('input, textarea')) return element.value || '';
+    if (element.isContentEditable) return element.textContent || '';
+    return '';
+  }
+
+  function buildCaptchaRoots() {
+    return collectVisibleMatches(CAPTCHA_SELECTOR_SPECS).map((match) => ({
+      ...match,
+      summary: summarizeElement(match.element, match.matchedSelectors[0], match.kinds[0] || 'captcha_candidate', {
+        matchedSelectors: match.matchedSelectors
+      })
+    }));
+  }
+
+  function buildCaptchaAnswerInputs(captchaRoots = []) {
+    const rootElements = captchaRoots.map((match) => match.element);
+
+    return collectVisibleMatches(CAPTCHA_INPUT_SELECTOR_SPECS)
+      .map((match) => {
+        const el = match.element;
+        const type = (el.getAttribute('type') || '').toLowerCase();
+        if (/^(hidden|checkbox|radio|file|image|range|date|datetime-local|month|time|week|color)$/.test(type)) {
+          return null;
+        }
+
+        if (el.disabled || el.readOnly) {
+          return null;
+        }
+
+        const descriptor = normalizeText([
+          el.getAttribute('placeholder'),
+          el.getAttribute('aria-label'),
+          el.getAttribute('title'),
+          el.getAttribute('name'),
+          el.id,
+          el.className,
+          getAssociatedText(el)
+        ].filter(Boolean).join(' '));
+
+        const reasons = [];
+        let score = 0;
+
+        if (CAPTCHA_INPUT_HINT_RE.test(descriptor)) {
+          score += 12;
+          reasons.push('captcha_hint_text');
+        }
+
+        if (el.matches('textarea')) {
+          score += 4;
+          reasons.push('textarea');
+        } else if (!type || /^(text|search|tel|number|password)$/.test(type)) {
+          score += 3;
+          reasons.push(`type_${type || 'text'}`);
+        }
+
+        const relation = findBestRelation(el, rootElements, { insideBonus: 18, nearbyBonus: 9 });
+        if (relation.score > 0) {
+          score += relation.score;
+          reasons.push(relation.reason);
+        }
+
+        const maxLength = Number(el.getAttribute('maxlength')) || null;
+        if (maxLength && maxLength <= 12) {
+          score += 2;
+          reasons.push('short_code_length');
+        }
+
+        if (EDITOR_FIELD_HINT_RE.test(descriptor)) {
+          score -= 10;
+          reasons.push('editor_field_penalty');
+        }
+
+        if (score <= 0) return null;
+
+        return {
+          ...match,
+          score,
+          reasons,
+          summary: summarizeElement(el, match.matchedSelectors[0], 'captcha_answer_input', {
+            matchedSelectors: match.matchedSelectors,
+            score,
+            reasons,
+            valueLength: getElementInputValue(el).length,
+            associatedText: compactText(descriptor, 220)
+          })
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+  }
+
+  function buildCaptchaSubmitButtons(captchaRoots = [], answerInputs = []) {
+    const targetElements = [
+      ...captchaRoots.map((match) => match.element),
+      ...answerInputs.map((match) => match.element)
+    ];
+
+    return collectVisibleMatches(CAPTCHA_BUTTON_SELECTOR_SPECS)
+      .map((match) => {
+        const el = match.element;
+        const descriptor = normalizeText([
+          el.getAttribute('aria-label'),
+          el.getAttribute('title'),
+          el.getAttribute('value'),
+          getAssociatedText(el)
+        ].filter(Boolean).join(' '));
+
+        const reasons = [];
+        let score = 0;
+
+        if (CAPTCHA_BUTTON_HINT_RE.test(descriptor)) {
+          score += 12;
+          reasons.push('captcha_action_text');
+        }
+
+        if ((el.getAttribute('type') || '').toLowerCase() === 'submit') {
+          score += 4;
+          reasons.push('native_submit');
+        }
+
+        const relation = findBestRelation(el, targetElements, { insideBonus: 16, nearbyBonus: 8 });
+        if (relation.score > 0) {
+          score += relation.score;
+          reasons.push(relation.reason);
+        }
+
+        if (PUBLISH_BUTTON_HINT_RE.test(descriptor) && !CAPTCHA_BUTTON_HINT_RE.test(descriptor)) {
+          score -= 8;
+          reasons.push('publish_button_penalty');
+        }
+
+        if (el.disabled) {
+          score -= 20;
+          reasons.push('disabled_penalty');
+        }
+
+        if (score <= 0) return null;
+
+        return {
+          ...match,
+          score,
+          reasons,
+          summary: summarizeElement(el, match.matchedSelectors[0], 'captcha_submit_button', {
+            matchedSelectors: match.matchedSelectors,
+            score,
+            reasons,
+            associatedText: compactText(descriptor, 220)
+          })
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+  }
+
+  function collectCaptchaDiagnostics() {
+    const captchaRoots = buildCaptchaRoots();
+    const answerInputs = buildCaptchaAnswerInputs(captchaRoots);
+    const submitButtons = buildCaptchaSubmitButtons(captchaRoots, answerInputs);
+    return {
+      captchaRoots,
+      answerInputs,
+      submitButtons
     };
   }
 
   function getCaptchaContext() {
-    const selectorSpecs = [
-      { selector: '#dkaptcha', kind: 'captcha_root' },
-      { selector: '.dkaptcha', kind: 'captcha_root' },
-      { selector: '.captcha-wrap', kind: 'captcha_root' },
-      { selector: '[class*="captcha"]', kind: 'captcha_generic' },
-      { selector: '[id*="captcha"]', kind: 'captcha_generic' },
-      { selector: '.g-recaptcha', kind: 'captcha_root' },
-      { selector: '#recaptcha', kind: 'captcha_root' },
-      { selector: 'iframe[src*="dkaptcha"]', kind: 'captcha_iframe' },
-      { selector: 'iframe[src*="captcha"]', kind: 'captcha_iframe' },
-      { selector: '#captchaImg', kind: 'captcha_image' }
-    ];
-
-    const seen = new Set();
-    const candidates = [];
-
-    for (const spec of selectorSpecs) {
-      const elements = document.querySelectorAll(spec.selector);
-      elements.forEach((el) => {
-        if (!isVisibleElement(el)) return;
-        const key = `${spec.selector}::${el.tagName}::${el.id || ''}::${el.getAttribute('src') || ''}`;
-        if (seen.has(key)) return;
-        seen.add(key);
-        candidates.push(summarizeElement(el, spec.selector, spec.kind));
-      });
-    }
-
-    const publishLayer = document.querySelector('.publish-layer, #publish-layer, .layer-publish');
-    const confirmBtn = findElement(S.publish.confirmButton, null)
-      || Array.from(document.querySelectorAll('button')).find(b => /(발행|저장)/.test((b.textContent || '').trim()) && b.closest('.layer_foot, .wrap_btn, .ReactModal__Content'));
+    const diagnostics = collectCaptchaDiagnostics();
+    const publishLayer = getVisiblePublishLayer();
+    const confirmBtn = getConfirmButton();
     const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
 
     return {
       success: true,
       url: window.location.href,
       title: document.title,
-      captchaPresent: detectCaptcha(),
-      candidateCount: candidates.length,
-      candidates,
-      publishLayerPresent: !!(publishLayer && isVisibleElement(publishLayer)),
+      captchaPresent: diagnostics.captchaRoots.length > 0,
+      candidateCount: diagnostics.captchaRoots.length,
+      candidates: diagnostics.captchaRoots.map((match) => match.summary),
+      answerInputCandidateCount: diagnostics.answerInputs.length,
+      answerInputCandidates: diagnostics.answerInputs.map((match) => match.summary),
+      activeAnswerInput: diagnostics.answerInputs[0]?.summary || null,
+      submitButtonCandidateCount: diagnostics.submitButtons.length,
+      submitButtonCandidates: diagnostics.submitButtons.map((match) => match.summary),
+      activeSubmitButton: diagnostics.submitButtons[0]?.summary || null,
+      publishLayerPresent: !!publishLayer,
       publishLayerText: compactText(publishLayer?.textContent || '', 320),
+      publishLayerRect: serializeRect(publishLayer?.getBoundingClientRect?.()),
       confirmButtonText: compactText(confirmBtn?.textContent || '', 80),
+      confirmButton: confirmBtn ? summarizeElement(confirmBtn, S.publish.confirmButton, 'publish_confirm_button') : null,
       completeButtonText: compactText(completeBtn?.textContent || '', 80),
+      completeButton: completeBtn ? summarizeElement(completeBtn, S.publish.completeButton, 'publish_complete_button') : null,
       viewport: {
         innerWidth: window.innerWidth,
         innerHeight: window.innerHeight,
         scrollX: window.scrollX,
         scrollY: window.scrollY,
         devicePixelRatio: window.devicePixelRatio || 1
+      }
+    };
+  }
+
+  function simulateClick(element) {
+    if (!element) return false;
+
+    element.scrollIntoView?.({ block: 'center', inline: 'center' });
+    element.focus?.();
+
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach((type) => {
+      element.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+    });
+
+    if (typeof element.click === 'function') {
+      element.click();
+    } else {
+      element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    }
+
+    return true;
+  }
+
+  async function submitCaptchaAnswer(answer, options = {}) {
+    const normalizedAnswer = String(answer ?? '').trim();
+    if (!normalizedAnswer) {
+      return {
+        success: false,
+        status: 'captcha_answer_required',
+        error: 'CAPTCHA 답안을 입력하세요.'
+      };
+    }
+
+    const before = collectCaptchaDiagnostics();
+    const beforeContext = getCaptchaContext();
+    const selectedInput = before.answerInputs[0] || null;
+    const selectedButton = before.submitButtons[0] || null;
+
+    if (!selectedInput) {
+      return {
+        success: false,
+        status: 'captcha_input_not_found',
+        error: '보이는 CAPTCHA 입력창을 찾지 못했습니다.',
+        diagnostics: getCaptchaContext()
+      };
+    }
+
+    if (!selectedButton) {
+      return {
+        success: false,
+        status: 'captcha_submit_not_found',
+        error: '보이는 CAPTCHA 제출 버튼을 찾지 못했습니다.',
+        diagnostics: getCaptchaContext()
+      };
+    }
+
+    selectedInput.element.focus?.();
+    await delay(80);
+    simulateInput(selectedInput.element, normalizedAnswer);
+    await delay(120);
+
+    const appliedValue = getElementInputValue(selectedInput.element);
+    const inputApplied = appliedValue.trim() === normalizedAnswer;
+    if (!inputApplied) {
+      return {
+        success: false,
+        status: 'captcha_input_not_applied',
+        error: 'CAPTCHA 답안을 입력창에 적용하지 못했습니다.',
+        selectedInput: selectedInput.summary,
+        diagnostics: {
+          before: beforeContext,
+          afterInput: getCaptchaContext()
+        }
+      };
+    }
+
+    simulateClick(selectedButton.element);
+
+    const waitMs = Math.max(300, Number(options.waitMs) || 1200);
+    await delay(waitMs);
+
+    const afterContext = getCaptchaContext();
+
+    return {
+      success: true,
+      status: afterContext.captchaPresent ? 'captcha_still_present' : 'captcha_submitted',
+      url: window.location.href,
+      answerLength: normalizedAnswer.length,
+      inputApplied,
+      clicked: true,
+      selectedInput: selectedInput.summary,
+      selectedButton: selectedButton.summary,
+      buttonText: selectedButton.summary?.text || selectedButton.summary?.ariaLabel || selectedButton.summary?.title || null,
+      captchaPresentBefore: before.captchaRoots.length > 0,
+      captchaPresentAfterWait: !!afterContext.captchaPresent,
+      captchaStillAppears: !!afterContext.captchaPresent,
+      diagnostics: {
+        waitMs,
+        before: beforeContext,
+        after: afterContext
       }
     };
   }
@@ -1084,6 +1469,9 @@
 
         case 'GET_CAPTCHA_CONTEXT':
           return getCaptchaContext();
+
+        case 'SUBMIT_CAPTCHA':
+          return await submitCaptchaAnswer(message.data?.answer, message.data || {});
 
         case 'GET_PAGE_INFO':
           return getPageInfo();

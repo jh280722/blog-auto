@@ -250,6 +250,29 @@ async function getCaptchaContextForTab(tabId) {
   }
 }
 
+async function submitCaptchaForTab(tabId, answer, options = {}) {
+  if (!tabId) {
+    return { success: false, status: 'editor_not_ready', error: 'CAPTCHA 답안을 전달할 탭 ID가 없습니다.' };
+  }
+
+  if (!String(answer ?? '').trim()) {
+    return { success: false, status: 'captcha_answer_required', error: 'CAPTCHA 답안을 입력하세요.', tabId };
+  }
+
+  try {
+    const result = await chrome.tabs.sendMessage(tabId, {
+      action: 'SUBMIT_CAPTCHA',
+      data: {
+        answer,
+        waitMs: options.waitMs
+      }
+    });
+    return { ...result, tabId };
+  } catch (error) {
+    return { success: false, status: 'editor_not_ready', error: error.message, tabId };
+  }
+}
+
 async function sendTabMessageWithTimeout(tabId, message, timeoutMs = EDITOR_PREPARE_DEFAULTS.pingTimeoutMs) {
   let timerId;
 
@@ -1283,6 +1306,33 @@ async function handleMessage(message, sender) {
         tabId,
         captchaContext: captchaContextResult.captchaContext,
         directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
+      };
+    }
+
+    case 'SUBMIT_CAPTCHA': {
+      const explicitTabId = message.data?.tabId || null;
+      const savedState = explicitTabId ? null : await getLiveDirectPublishState();
+      const tabId = explicitTabId || savedState?.tabId || currentTabId;
+      const submitResult = await submitCaptchaForTab(tabId, message.data?.answer, { waitMs: message.data?.waitMs });
+
+      if (directPublishState?.tabId === tabId) {
+        const refreshedContext = await getCaptchaContextForTab(tabId);
+        await updateDirectPublishState({
+          url: refreshedContext.success ? (refreshedContext.captchaContext?.url || directPublishState?.url) : directPublishState?.url,
+          captchaContext: refreshedContext.success ? refreshedContext.captchaContext : refreshedContext,
+          lastCaptchaSubmitResult: {
+            success: submitResult.success,
+            status: submitResult.status || null,
+            captchaStillAppears: submitResult.captchaStillAppears ?? null,
+            answerLength: typeof submitResult.answerLength === 'number' ? submitResult.answerLength : null,
+            updatedAt: new Date().toISOString()
+          }
+        });
+      }
+
+      return {
+        ...submitResult,
+        directPublish: directPublishState?.tabId === tabId ? { ...directPublishState } : null
       };
     }
 

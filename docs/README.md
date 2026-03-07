@@ -2,10 +2,11 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.4.0**
+> 현재 운영 기준: **v1.5.0**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
-> - **CAPTCHA context inspection API (blocked tab / iframe rect / 버튼 텍스트 확인)**
+> - **CAPTCHA context inspection API (blocked tab / iframe rect / 입력창/버튼 후보 확인)**
+> - **CAPTCHA answer submit API (same blocked tab에 답안 입력 + 확인 버튼 클릭)**
 > - stale tab 회피 + live content script 확인
 > - 자동저장 복구 팝업 자동 dismiss
 > - **비공개 발행 visibility 강제 보정(MAIN world XHR/fetch interceptor)**
@@ -17,7 +18,8 @@
 - **대량 발행 큐**: JSON으로 여러 글을 한번에 등록, 순차 발행
 - **외부 API**: `externally_connectable`로 외부 도구에서 데이터 전송 가능
 - **직접 발행 상태 추적**: `captcha_required` 시 blocked tab / blog / visibility / diagnostics를 저장
-- **CAPTCHA context API**: 에이전트가 iframe/레이어/버튼 위치를 읽어 같은 탭에서 해결할 수 있도록 컨텍스트 제공
+- **CAPTCHA context API**: 에이전트가 iframe/레이어/입력창/버튼 위치를 읽어 같은 탭에서 해결할 수 있도록 컨텍스트 제공
+- **CAPTCHA submit API**: 에이전트가 blocked tab에 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음
 - **CAPTCHA 핸드오프**: DKAPTCHA 감지 시 자동 일시정지 → 같은 탭에서 해결 → 원클릭 재개
 
 ## 설치
@@ -59,7 +61,8 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 ```
 [발행] 클릭 → CAPTCHA 감지 → directPublishState 저장(tabId/blog/url/visibility)
 → GET_DIRECT_PUBLISH_STATE / GET_CAPTCHA_CONTEXT로 막힌 탭 확인
-→ 같은 에디터 탭에서 CAPTCHA 해결 → [재개] 버튼 또는 RESUME_DIRECT_PUBLISH 호출 → 발행 완료
+→ SUBMIT_CAPTCHA로 같은 탭에 답안 입력/확인 클릭
+→ captchaStillAppears=false 확인 → [재개] 버튼 또는 RESUME_DIRECT_PUBLISH 호출 → 발행 완료
 ```
 
 **큐 발행 시 흐름:**
@@ -110,7 +113,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 **운영 권장값**
 - 실제 발행: `visibility: "public"`
 - 테스트 발행: `visibility: "private"`
-- DKAPTCHA 발생 시: `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_CONTEXT`로 blocked tab을 확인하고, 같은 탭에서 해결 후 `RESUME_DIRECT_PUBLISH`
+- DKAPTCHA 발생 시: `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_CONTEXT`로 blocked tab을 확인하고, `SUBMIT_CAPTCHA`로 같은 탭에 답안을 넣은 뒤 `captchaStillAppears`를 확인하고 `RESUME_DIRECT_PUBLISH`
 - 브라우저 시작 직후/오래된 티스토리 탭 사용 시: 먼저 `PREPARE_EDITOR`
 - `editor_not_ready` 발생 시: `diagnostics` 확인 후 `PREPARE_EDITOR` 재호출
 
@@ -156,6 +159,21 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 chrome.runtime.sendMessage(EXTENSION_ID, {
   action: "GET_CAPTCHA_CONTEXT"
 }, (response) => console.log('captcha context', response));
+
+chrome.runtime.sendMessage(EXTENSION_ID, {
+  action: "SUBMIT_CAPTCHA",
+  data: {
+    answer: "1234"
+    // tabId: 321 // 선택: 기본값은 저장된 directPublishState tab
+  }
+}, (response) => {
+  console.log('captcha submit result', response);
+  if (!response.captchaStillAppears) {
+    chrome.runtime.sendMessage(EXTENSION_ID, {
+      action: "RESUME_DIRECT_PUBLISH"
+    }, (resume) => console.log('resume result', resume));
+  }
+});
 ```
 
 **운영 권장 순서**
@@ -163,8 +181,8 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 2. `success: true`, `status: "editor_ready"` 확인
 3. `WRITE_POST` 호출
 4. `captcha_required`면 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` 또는 `GET_CAPTCHA_CONTEXT`로 막힌 탭/캡차 위치 확인
-5. 같은 에디터 탭에서 CAPTCHA 해결
-6. `RESUME_DIRECT_PUBLISH` 호출
+5. `SUBMIT_CAPTCHA`로 같은 탭에 답안을 입력하고 확인 버튼 클릭
+6. `captchaStillAppears === false`면 `RESUME_DIRECT_PUBLISH` 호출
 7. `editor_not_ready`면 `diagnostics.attempts`를 보고 `PREPARE_EDITOR` 재호출
 
 ---
@@ -204,7 +222,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 
 ---
 
-## 발행 상태 코드 (v1.4.0)
+## 발행 상태 코드 (v1.5.0)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 
@@ -322,8 +340,19 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - `detectedAt` / `updatedAt`: 상태 기록 시각
 - `diagnostics`: 마지막 에디터 준비 로그
 - `captchaContext`: 화면 판독용 캡차 후보 요소 / iframe / 버튼 텍스트 / rect
+- `lastCaptchaSubmitResult`: 마지막 `SUBMIT_CAPTCHA` 시도 결과 요약
 
-이 상태 덕분에 외부 에이전트/크론은 새 탭을 다시 고르지 않고, **막힌 동일 탭**을 기준으로 캡차를 해결하고 `RESUME_DIRECT_PUBLISH`를 호출할 수 있습니다.
+이 상태 덕분에 외부 에이전트/크론은 새 탭을 다시 고르지 않고, **막힌 동일 탭**을 기준으로 캡차를 검사하고 `SUBMIT_CAPTCHA` 후 `RESUME_DIRECT_PUBLISH`를 호출할 수 있습니다.
+
+### CAPTCHA Context / Submit 응답 포인트
+
+- `GET_CAPTCHA_CONTEXT`는 `answerInputCandidates[]`, `submitButtonCandidates[]`, `activeAnswerInput`, `activeSubmitButton`, `rect`, `matchedSelectors`를 포함합니다.
+- `SUBMIT_CAPTCHA`는 `selectedInput`, `selectedButton`, `buttonText`, `captchaPresentAfterWait`, `captchaStillAppears`, `diagnostics.before/after`를 반환합니다.
+- `SUBMIT_CAPTCHA` 기본 대상 탭은 저장된 `directPublishState.tabId`이며, 필요하면 `data.tabId`로 override할 수 있습니다.
+- `SUBMIT_CAPTCHA.status`
+  - `captcha_submitted`: 답안 입력 + 클릭 수행 후 짧은 대기 뒤 visible CAPTCHA가 더 이상 감지되지 않음
+  - `captcha_still_present`: 답안 입력 + 클릭은 수행했지만 CAPTCHA가 계속 보임
+  - `captcha_answer_required` / `captcha_input_not_found` / `captcha_submit_not_found` / `captcha_input_not_applied`: 제출 전 실패 원인
 
 ## API 액션 목록
 
@@ -340,6 +369,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 | `PUBLISH` | 발행 실행 (처음부터) |
 | `GET_DIRECT_PUBLISH_STATE` | 저장된 direct publish CAPTCHA state 조회 (`includeCaptchaContext` 옵션 지원) |
 | `GET_CAPTCHA_CONTEXT` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)의 CAPTCHA context 조회 |
+| `SUBMIT_CAPTCHA` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)에 CAPTCHA 답안 입력 + 확인 버튼 클릭 |
 | `RESUME_DIRECT_PUBLISH` | CAPTCHA 해결 후 직접 발행 재개 (saved tab 우선) |
 | `RESUME_AFTER_CAPTCHA` | CAPTCHA 해결 후 큐 항목 재개 (`data.id` 필요) |
 | `RETRY_ITEM` | 큐 항목 처음부터 재시도 (`data.id` 필요) |
@@ -358,4 +388,4 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - **verification_failed 오탐**: Tistory가 발행 후 URL을 변경하지 않는 경우 발행이 성공했음에도 실패로 기록될 수 있습니다. 관리자 페이지(`/manage/posts`)에서 직접 확인하세요.
 - **CAPTCHA 중 탭 닫힘**: CAPTCHA 해결 전에 에디터 탭을 닫으면 내용이 사라집니다. Retry(재시도)로만 복구할 수 있습니다.
 - **셀렉터 변경**: 티스토리 에디터 업데이트 시 `content/selectors.js` 수정이 필요할 수 있습니다.
-- **외부 CAPTCHA 해결 서비스 없음**: 별도 solve API는 없습니다. 대신 `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_CONTEXT`로 에이전트가 같은 탭을 보고 직접 입력/재개하도록 돕습니다.
+- **외부 CAPTCHA solve 서비스 없음**: 자동 판독은 하지 않습니다. 대신 `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_CONTEXT` / `SUBMIT_CAPTCHA`로 에이전트가 같은 탭에서 답안을 넣고 재개할 수 있습니다.

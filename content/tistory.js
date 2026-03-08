@@ -753,6 +753,41 @@
     };
   }
 
+  function rectArea(rect) {
+    if (!rect) return 0;
+    return Math.max(0, Number(rect.width) || 0) * Math.max(0, Number(rect.height) || 0);
+  }
+
+  function buildViewportSnapshot() {
+    return {
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      devicePixelRatio: window.devicePixelRatio || 1
+    };
+  }
+
+  function clipRectToViewport(rect, viewport = buildViewportSnapshot()) {
+    if (!rect || !viewport?.innerWidth || !viewport?.innerHeight) return null;
+
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(viewport.innerWidth, rect.right);
+    const bottom = Math.min(viewport.innerHeight, rect.bottom);
+
+    if (right <= left || bottom <= top) return null;
+
+    return serializeRect({
+      left,
+      top,
+      right,
+      bottom,
+      width: right - left,
+      height: bottom - top
+    });
+  }
+
   function buildDomPath(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return null;
     if (el.id) return `#${el.id}`;
@@ -1026,14 +1061,206 @@
       .sort((a, b) => b.score - a.score);
   }
 
+  function buildCaptchaCaptureCandidates(captchaRoots = []) {
+    const viewport = buildViewportSnapshot();
+    const rootElements = captchaRoots.map((match) => match.element);
+    const visualMatches = new Map();
+
+    const addVisualCandidate = (el, originSelector = null, originKind = 'captcha_visual') => {
+      if (!el || !isVisibleElement(el)) return;
+
+      const existing = visualMatches.get(el);
+      if (existing) {
+        if (originSelector && !existing.matchedSelectors.includes(originSelector)) {
+          existing.matchedSelectors.push(originSelector);
+        }
+        if (originKind && !existing.kinds.includes(originKind)) {
+          existing.kinds.push(originKind);
+        }
+        return;
+      }
+
+      visualMatches.set(el, {
+        element: el,
+        matchedSelectors: originSelector ? [originSelector] : [],
+        kinds: originKind ? [originKind] : []
+      });
+    };
+
+    captchaRoots.forEach((root) => {
+      const visualChildren = [root.element];
+      root.element.querySelectorAll('img, canvas, svg, iframe').forEach((el) => {
+        visualChildren.push(el);
+      });
+
+      visualChildren.forEach((el) => {
+        const tagName = el.tagName?.toLowerCase();
+        if (!/^(img|canvas|svg|iframe)$/.test(tagName || '')) return;
+        addVisualCandidate(el, root.matchedSelectors[0] || null, root.kinds[0] || 'captcha_visual');
+      });
+    });
+
+    const visualCandidates = Array.from(visualMatches.values())
+      .map((match) => {
+        const el = match.element;
+        const rect = el.getBoundingClientRect();
+        const visibleRect = clipRectToViewport(rect, viewport);
+        if (!visibleRect) return null;
+
+        const tagName = el.tagName?.toLowerCase() || null;
+        const descriptor = normalizeText([
+          el.getAttribute?.('alt'),
+          el.getAttribute?.('aria-label'),
+          el.getAttribute?.('title'),
+          el.getAttribute?.('name'),
+          el.id,
+          el.className,
+          el.getAttribute?.('src'),
+          getAssociatedText(el)
+        ].filter(Boolean).join(' '));
+
+        const reasons = [];
+        let score = 0;
+
+        if (tagName === 'img') {
+          score += 28;
+          reasons.push('img');
+        } else if (tagName === 'canvas') {
+          score += 24;
+          reasons.push('canvas');
+        } else if (tagName === 'svg') {
+          score += 18;
+          reasons.push('svg');
+        } else if (tagName === 'iframe') {
+          score += 14;
+          reasons.push('iframe');
+        }
+
+        if (el.id === 'captchaImg') {
+          score += 20;
+          reasons.push('captcha_image_id');
+        }
+
+        if (CAPTCHA_INPUT_HINT_RE.test(descriptor)) {
+          score += 10;
+          reasons.push('captcha_hint_text');
+        }
+
+        const relation = findBestRelation(el, rootElements, { insideBonus: 18, nearbyBonus: 8 });
+        if (relation.score > 0) {
+          score += relation.score;
+          reasons.push(relation.reason);
+        }
+
+        const totalArea = rectArea(serializeRect(rect));
+        const visibleArea = rectArea(visibleRect);
+        if (visibleArea >= 2500 && visibleArea <= 200000) {
+          score += 4;
+          reasons.push('reasonable_area');
+        }
+
+        const visibleRatio = totalArea > 0 ? Math.min(1, visibleArea / totalArea) : 0;
+        if (visibleRatio >= 0.85) {
+          score += 3;
+          reasons.push('mostly_visible');
+        } else if (visibleRatio < 0.45) {
+          score -= 6;
+          reasons.push('partially_hidden_penalty');
+        }
+
+        if (score <= 0) return null;
+
+        return {
+          ...match,
+          score,
+          reasons,
+          summary: summarizeElement(el, match.matchedSelectors[0] || null, 'captcha_capture_candidate', {
+            matchedSelectors: match.matchedSelectors,
+            score,
+            reasons,
+            captureRole: 'visual_candidate',
+            visibleRect,
+            visibleRatio: Math.round(visibleRatio * 1000) / 1000,
+            imageTag: tagName,
+            naturalWidth: typeof el.naturalWidth === 'number' ? el.naturalWidth : null,
+            naturalHeight: typeof el.naturalHeight === 'number' ? el.naturalHeight : null,
+            currentSrc: tagName === 'img' ? (el.currentSrc || el.getAttribute('src') || null) : null,
+            area: totalArea,
+            visibleArea
+          })
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+
+    if (visualCandidates.length > 0) {
+      return visualCandidates;
+    }
+
+    return captchaRoots
+      .map((match) => {
+        const rect = match.element.getBoundingClientRect();
+        const visibleRect = clipRectToViewport(rect, viewport);
+        if (!visibleRect) return null;
+
+        const totalArea = rectArea(match.summary.rect);
+        const visibleArea = rectArea(visibleRect);
+        const visibleRatio = totalArea > 0 ? Math.min(1, visibleArea / totalArea) : 0;
+        const reasons = ['root_fallback'];
+        let score = 0;
+
+        if (match.kinds.includes('captcha_image')) {
+          score += 24;
+          reasons.push('image_selector');
+        } else if (match.kinds.includes('captcha_root')) {
+          score += 18;
+          reasons.push('captcha_root');
+        } else if (match.kinds.includes('captcha_iframe')) {
+          score += 15;
+          reasons.push('captcha_iframe');
+        } else {
+          score += 9;
+          reasons.push('generic_root');
+        }
+
+        if (visibleRatio >= 0.85) {
+          score += 3;
+          reasons.push('mostly_visible');
+        } else if (visibleRatio < 0.45) {
+          score -= 5;
+          reasons.push('partially_hidden_penalty');
+        }
+
+        return {
+          ...match,
+          score,
+          reasons,
+          summary: {
+            ...match.summary,
+            score,
+            reasons,
+            captureRole: 'root_fallback',
+            visibleRect,
+            visibleRatio: Math.round(visibleRatio * 1000) / 1000,
+            area: totalArea,
+            visibleArea
+          }
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+  }
+
   function collectCaptchaDiagnostics() {
     const captchaRoots = buildCaptchaRoots();
     const answerInputs = buildCaptchaAnswerInputs(captchaRoots);
     const submitButtons = buildCaptchaSubmitButtons(captchaRoots, answerInputs);
+    const captureCandidates = buildCaptchaCaptureCandidates(captchaRoots);
     return {
       captchaRoots,
       answerInputs,
-      submitButtons
+      submitButtons,
+      captureCandidates
     };
   }
 
@@ -1056,6 +1283,9 @@
       submitButtonCandidateCount: diagnostics.submitButtons.length,
       submitButtonCandidates: diagnostics.submitButtons.map((match) => match.summary),
       activeSubmitButton: diagnostics.submitButtons[0]?.summary || null,
+      captureCandidateCount: diagnostics.captureCandidates.length,
+      captureCandidates: diagnostics.captureCandidates.map((match) => match.summary),
+      activeCaptureCandidate: diagnostics.captureCandidates[0]?.summary || null,
       publishLayerPresent: !!publishLayer,
       publishLayerText: compactText(publishLayer?.textContent || '', 320),
       publishLayerRect: serializeRect(publishLayer?.getBoundingClientRect?.()),
@@ -1063,13 +1293,152 @@
       confirmButton: confirmBtn ? summarizeElement(confirmBtn, S.publish.confirmButton, 'publish_confirm_button') : null,
       completeButtonText: compactText(completeBtn?.textContent || '', 80),
       completeButton: completeBtn ? summarizeElement(completeBtn, S.publish.completeButton, 'publish_complete_button') : null,
-      viewport: {
-        innerWidth: window.innerWidth,
-        innerHeight: window.innerHeight,
-        scrollX: window.scrollX,
-        scrollY: window.scrollY,
-        devicePixelRatio: window.devicePixelRatio || 1
+      viewport: buildViewportSnapshot()
+    };
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error('blob_read_failed'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function findDirectCaptchaImageElement(captureMatch) {
+    if (!captureMatch?.element) return null;
+
+    if (captureMatch.element.matches?.('img, canvas')) {
+      return captureMatch.element;
+    }
+
+    return captureMatch.element.querySelector?.('img, canvas') || null;
+  }
+
+  async function extractCaptchaImageArtifact() {
+    const diagnostics = collectCaptchaDiagnostics();
+    const selectedCapture = diagnostics.captureCandidates[0] || null;
+
+    if (!selectedCapture) {
+      return {
+        success: false,
+        status: 'captcha_capture_target_not_found',
+        error: '보이는 CAPTCHA 캡처 대상을 찾지 못했습니다.',
+        diagnostics: getCaptchaContext()
+      };
+    }
+
+    const sourceElement = findDirectCaptchaImageElement(selectedCapture);
+    if (!sourceElement) {
+      return {
+        success: false,
+        status: 'captcha_image_artifact_unavailable',
+        error: '직접 추출 가능한 CAPTCHA 이미지 요소(img/canvas)를 찾지 못했습니다.',
+        selectedCandidate: selectedCapture.summary,
+        diagnostics: getCaptchaContext()
+      };
+    }
+
+    const tagName = sourceElement.tagName?.toLowerCase() || null;
+    try {
+      let dataUrl = null;
+      let mimeType = 'image/png';
+
+      if (tagName === 'canvas') {
+        dataUrl = sourceElement.toDataURL('image/png');
+      } else if (tagName === 'img') {
+        const currentSrc = sourceElement.currentSrc || sourceElement.src || sourceElement.getAttribute('src') || null;
+        if (!currentSrc) {
+          throw new Error('captcha_image_src_missing');
+        }
+
+        if (currentSrc.startsWith('data:')) {
+          dataUrl = currentSrc;
+          mimeType = currentSrc.slice(5, currentSrc.indexOf(';')) || mimeType;
+        } else {
+          try {
+            const response = await fetch(currentSrc, { credentials: 'include', cache: 'no-store' });
+            if (!response.ok) {
+              throw new Error(`captcha_image_fetch_${response.status}`);
+            }
+            const blob = await response.blob();
+            mimeType = blob.type || mimeType;
+            dataUrl = await blobToDataUrl(blob);
+          } catch (fetchError) {
+            const canvas = document.createElement('canvas');
+            canvas.width = sourceElement.naturalWidth || sourceElement.width || 1;
+            canvas.height = sourceElement.naturalHeight || sourceElement.height || 1;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+              throw fetchError;
+            }
+            ctx.drawImage(sourceElement, 0, 0);
+            dataUrl = canvas.toDataURL('image/png');
+            mimeType = 'image/png';
+          }
+        }
+      } else {
+        throw new Error(`unsupported_capture_tag:${tagName || 'unknown'}`);
       }
+
+      return {
+        success: true,
+        status: 'captcha_image_artifact_ready',
+        selectedCandidate: selectedCapture.summary,
+        artifact: {
+          kind: 'direct_image',
+          mimeType,
+          dataUrl,
+          width: tagName === 'canvas'
+            ? sourceElement.width || null
+            : (sourceElement.naturalWidth || sourceElement.width || null),
+          height: tagName === 'canvas'
+            ? sourceElement.height || null
+            : (sourceElement.naturalHeight || sourceElement.height || null),
+          sourceTagName: tagName,
+          sourceUrl: tagName === 'img'
+            ? (sourceElement.currentSrc || sourceElement.src || sourceElement.getAttribute('src') || null)
+            : null,
+          rect: selectedCapture.summary?.rect || null,
+          visibleRect: selectedCapture.summary?.visibleRect || null
+        },
+        captureContext: getCaptchaContext()
+      };
+    } catch (error) {
+      return {
+        success: false,
+        status: 'captcha_image_artifact_unavailable',
+        error: error.message,
+        selectedCandidate: selectedCapture.summary,
+        diagnostics: getCaptchaContext()
+      };
+    }
+  }
+
+  async function prepareCaptchaCapture() {
+    const diagnostics = collectCaptchaDiagnostics();
+    const selectedCapture = diagnostics.captureCandidates[0] || null;
+
+    if (!selectedCapture) {
+      return {
+        success: false,
+        status: 'captcha_capture_target_not_found',
+        error: '보이는 CAPTCHA 캡처 대상을 찾지 못했습니다.',
+        diagnostics: getCaptchaContext()
+      };
+    }
+
+    selectedCapture.element.scrollIntoView?.({ block: 'center', inline: 'center' });
+    selectedCapture.element.focus?.({ preventScroll: true });
+    await delay(120);
+
+    const captureContext = getCaptchaContext();
+    return {
+      success: true,
+      status: 'captcha_capture_ready',
+      selectedCandidate: captureContext.activeCaptureCandidate || selectedCapture.summary,
+      captureContext
     };
   }
 
@@ -1469,6 +1838,12 @@
 
         case 'GET_CAPTCHA_CONTEXT':
           return getCaptchaContext();
+
+        case 'PREPARE_CAPTCHA_CAPTURE':
+          return await prepareCaptchaCapture();
+
+        case 'GET_CAPTCHA_IMAGE_ARTIFACT':
+          return await extractCaptchaImageArtifact();
 
         case 'SUBMIT_CAPTCHA':
           return await submitCaptchaAnswer(message.data?.answer, message.data || {});

@@ -273,6 +273,324 @@ async function submitCaptchaForTab(tabId, answer, options = {}) {
   }
 }
 
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+
+  return btoa(binary);
+}
+
+async function blobToDataUrl(blob) {
+  const mimeType = blob.type || 'application/octet-stream';
+  const buffer = await blob.arrayBuffer();
+  return `data:${mimeType};base64,${arrayBufferToBase64(buffer)}`;
+}
+
+async function prepareCaptchaCaptureForTab(tabId) {
+  if (!tabId) {
+    return { success: false, status: 'editor_not_ready', error: 'CAPTCHA 캡처를 준비할 탭 ID가 없습니다.' };
+  }
+
+  try {
+    const result = await chrome.tabs.sendMessage(tabId, { action: 'PREPARE_CAPTCHA_CAPTURE' });
+    return { ...result, tabId };
+  } catch (error) {
+    return { success: false, status: 'editor_not_ready', error: error.message, tabId };
+  }
+}
+
+async function getCaptchaImageArtifactForTab(tabId) {
+  if (!tabId) {
+    return { success: false, status: 'editor_not_ready', error: 'CAPTCHA 이미지 아티팩트를 읽을 탭 ID가 없습니다.' };
+  }
+
+  try {
+    const result = await chrome.tabs.sendMessage(tabId, { action: 'GET_CAPTCHA_IMAGE_ARTIFACT' });
+    return { ...result, tabId };
+  } catch (error) {
+    return { success: false, status: 'editor_not_ready', error: error.message, tabId };
+  }
+}
+
+async function activateTabForCapture(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  const windowInfo = await chrome.windows.get(tab.windowId, { populate: true });
+  const previousActiveTabId = windowInfo.tabs?.find((candidate) => candidate.active)?.id || null;
+  const targetWasActive = previousActiveTabId === tabId;
+  let windowRestored = false;
+
+  if (windowInfo.state === 'minimized') {
+    await chrome.windows.update(tab.windowId, { state: 'normal' });
+    windowRestored = true;
+    await delay(120);
+  }
+
+  if (!targetWasActive) {
+    await chrome.tabs.update(tabId, { active: true });
+    await delay(180);
+  }
+
+  return {
+    windowId: tab.windowId,
+    previousActiveTabId,
+    targetWasActive,
+    windowRestored
+  };
+}
+
+async function restoreTabAfterCapture(tabId, activationState, options = {}) {
+  if (!options.restoreActiveTab) return;
+  if (!activationState?.previousActiveTabId) return;
+  if (activationState.previousActiveTabId === tabId) return;
+
+  try {
+    await chrome.tabs.update(activationState.previousActiveTabId, { active: true });
+  } catch (error) {
+    console.warn('[TistoryAuto BG] CAPTCHA 캡처 후 이전 탭 복원 실패:', error);
+  }
+}
+
+async function cropScreenshotDataUrl(sourceDataUrl, candidate, viewport, options = {}) {
+  if (!sourceDataUrl) {
+    throw new Error('captcha_screenshot_missing');
+  }
+
+  const baseRect = candidate?.visibleRect || candidate?.rect || null;
+  if (!baseRect) {
+    throw new Error('captcha_capture_rect_missing');
+  }
+
+  const viewportWidth = Number(viewport?.innerWidth) || 0;
+  const viewportHeight = Number(viewport?.innerHeight) || 0;
+  if (viewportWidth <= 0 || viewportHeight <= 0) {
+    throw new Error('captcha_viewport_missing');
+  }
+
+  const response = await fetch(sourceDataUrl);
+  const sourceBlob = await response.blob();
+  const bitmap = await createImageBitmap(sourceBlob);
+
+  try {
+    const sourceWidth = bitmap.width;
+    const sourceHeight = bitmap.height;
+    const scaleX = sourceWidth / viewportWidth;
+    const scaleY = sourceHeight / viewportHeight;
+    const paddingCssPx = Math.max(0, Number(options.paddingPx) || 8);
+
+    const leftCss = clamp(baseRect.left - paddingCssPx, 0, viewportWidth);
+    const topCss = clamp(baseRect.top - paddingCssPx, 0, viewportHeight);
+    const rightCss = clamp(baseRect.right + paddingCssPx, 0, viewportWidth);
+    const bottomCss = clamp(baseRect.bottom + paddingCssPx, 0, viewportHeight);
+
+    if (rightCss <= leftCss || bottomCss <= topCss) {
+      throw new Error('captcha_capture_rect_not_visible');
+    }
+
+    const cropX = clamp(Math.floor(leftCss * scaleX), 0, Math.max(0, sourceWidth - 1));
+    const cropY = clamp(Math.floor(topCss * scaleY), 0, Math.max(0, sourceHeight - 1));
+    const cropRight = clamp(Math.ceil(rightCss * scaleX), cropX + 1, sourceWidth);
+    const cropBottom = clamp(Math.ceil(bottomCss * scaleY), cropY + 1, sourceHeight);
+    const cropWidth = cropRight - cropX;
+    const cropHeight = cropBottom - cropY;
+
+    const canvas = new OffscreenCanvas(cropWidth, cropHeight);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('captcha_crop_canvas_unavailable');
+    }
+
+    ctx.drawImage(bitmap, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+    const cropBlob = await canvas.convertToBlob({ type: 'image/png' });
+    const cropDataUrl = await blobToDataUrl(cropBlob);
+
+    return {
+      mimeType: 'image/png',
+      dataUrl: cropDataUrl,
+      width: cropWidth,
+      height: cropHeight,
+      sourceImage: {
+        width: sourceWidth,
+        height: sourceHeight
+      },
+      crop: {
+        x: cropX,
+        y: cropY,
+        width: cropWidth,
+        height: cropHeight,
+        paddingCssPx,
+        cssRect: {
+          left: Math.round(leftCss * 100) / 100,
+          top: Math.round(topCss * 100) / 100,
+          width: Math.round((rightCss - leftCss) * 100) / 100,
+          height: Math.round((bottomCss - topCss) * 100) / 100,
+          right: Math.round(rightCss * 100) / 100,
+          bottom: Math.round(bottomCss * 100) / 100
+        },
+        scale: {
+          x: Math.round(scaleX * 1000) / 1000,
+          y: Math.round(scaleY * 1000) / 1000
+        }
+      },
+      sourceDataUrl: options.includeSourceImage ? sourceDataUrl : null
+    };
+  } finally {
+    bitmap.close();
+  }
+}
+
+async function captureCaptchaViewportCrop(tab, captureContext, options = {}) {
+  const candidate = captureContext?.activeCaptureCandidate || null;
+  if (!candidate) {
+    return {
+      success: false,
+      status: 'captcha_capture_target_not_found',
+      error: '보이는 CAPTCHA 캡처 대상이 없습니다.',
+      tabId: tab?.id || null
+    };
+  }
+
+  let activationState = null;
+  let screenshotDataUrl = null;
+
+  try {
+    activationState = await activateTabForCapture(tab.id);
+    screenshotDataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+  } catch (error) {
+    return {
+      success: false,
+      status: 'captcha_viewport_capture_failed',
+      error: error.message,
+      stage: 'capture_visible_tab',
+      tabId: tab?.id || null
+    };
+  } finally {
+    await restoreTabAfterCapture(tab.id, activationState, { restoreActiveTab: !options.keepTabActive });
+  }
+
+  try {
+    const crop = await cropScreenshotDataUrl(screenshotDataUrl, candidate, captureContext?.viewport, options);
+    return {
+      success: true,
+      status: 'captcha_viewport_crop_ready',
+      tabId: tab.id,
+      artifact: {
+        kind: 'viewport_crop',
+        mimeType: crop.mimeType,
+        dataUrl: crop.dataUrl,
+        width: crop.width,
+        height: crop.height,
+        rect: candidate.rect || null,
+        visibleRect: candidate.visibleRect || null,
+        sourceImage: crop.sourceImage,
+        crop: crop.crop,
+        sourceDataUrl: crop.sourceDataUrl
+      }
+    };
+  } catch (error) {
+    return {
+      success: false,
+      status: 'captcha_viewport_crop_failed',
+      error: error.message,
+      stage: 'crop_visible_tab',
+      tabId: tab.id
+    };
+  }
+}
+
+async function getCaptchaArtifactsForTab(tabId, options = {}) {
+  if (!tabId) {
+    return {
+      success: false,
+      status: 'editor_not_ready',
+      error: 'CAPTCHA 아티팩트를 읽을 탭 ID가 없습니다.'
+    };
+  }
+
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (error) {
+    return {
+      success: false,
+      status: 'editor_not_ready',
+      error: error.message,
+      tabId
+    };
+  }
+
+  const prepared = await prepareCaptchaCaptureForTab(tabId);
+  if (!prepared.success) {
+    return {
+      ...prepared,
+      tabId,
+      url: tab.url || null
+    };
+  }
+
+  const captureContext = prepared.captureContext || null;
+  const selectedCandidate = captureContext?.activeCaptureCandidate || prepared.selectedCandidate || null;
+  const directImageResult = await getCaptchaImageArtifactForTab(tabId);
+  const viewportCropResult = await captureCaptchaViewportCrop(tab, captureContext, options);
+  const artifacts = {};
+  const captureErrors = [];
+
+  if (directImageResult.success && directImageResult.artifact?.dataUrl) {
+    artifacts.directImage = directImageResult.artifact;
+  } else if (!directImageResult.success) {
+    captureErrors.push({
+      type: 'direct_image',
+      status: directImageResult.status || null,
+      error: directImageResult.error || 'direct_image_unavailable'
+    });
+  }
+
+  if (viewportCropResult.success && viewportCropResult.artifact?.dataUrl) {
+    artifacts.viewportCrop = viewportCropResult.artifact;
+  } else if (!viewportCropResult.success) {
+    captureErrors.push({
+      type: 'viewport_crop',
+      status: viewportCropResult.status || null,
+      error: viewportCropResult.error || 'viewport_crop_unavailable'
+    });
+  }
+
+  const preferredArtifactKey = artifacts.viewportCrop ? 'viewportCrop' : (artifacts.directImage ? 'directImage' : null);
+  if (!preferredArtifactKey) {
+    return {
+      success: false,
+      status: 'captcha_artifact_capture_failed',
+      error: captureErrors[0]?.error || 'CAPTCHA 이미지 아티팩트를 생성하지 못했습니다.',
+      tabId,
+      url: captureContext?.url || tab.url || null,
+      selectedCandidate,
+      captureContext,
+      captureErrors
+    };
+  }
+
+  return {
+    success: true,
+    status: 'captcha_artifacts_ready',
+    tabId,
+    url: captureContext?.url || tab.url || null,
+    selectedCandidate,
+    captureContext,
+    artifactPreference: preferredArtifactKey,
+    artifact: artifacts[preferredArtifactKey],
+    artifacts,
+    captureErrors
+  };
+}
+
 async function sendTabMessageWithTimeout(tabId, message, timeoutMs = EDITOR_PREPARE_DEFAULTS.pingTimeoutMs) {
   let timerId;
 
@@ -1305,6 +1623,32 @@ async function handleMessage(message, sender) {
         success: true,
         tabId,
         captchaContext: captchaContextResult.captchaContext,
+        directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
+      };
+    }
+
+    case 'GET_CAPTCHA_ARTIFACTS': {
+      const explicitTabId = message.data?.tabId || null;
+      const savedState = explicitTabId ? null : await getLiveDirectPublishState();
+      const tabId = explicitTabId || savedState?.tabId || currentTabId;
+      const artifactResult = await getCaptchaArtifactsForTab(tabId, message.data || {});
+
+      if (savedState?.tabId && savedState.tabId === tabId) {
+        await updateDirectPublishState({
+          url: artifactResult.captureContext?.url || savedState.url,
+          captchaContext: artifactResult.captureContext || savedState.captchaContext || null,
+          lastCheckedAt: new Date().toISOString(),
+          lastCaptchaArtifactCapture: {
+            success: artifactResult.success,
+            status: artifactResult.status || null,
+            artifactKind: artifactResult.artifact?.kind || null,
+            capturedAt: new Date().toISOString()
+          }
+        });
+      }
+
+      return {
+        ...artifactResult,
         directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
       };
     }

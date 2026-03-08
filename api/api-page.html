@@ -184,6 +184,29 @@
             font-size: 12px;
             line-height: 1.6;
         }
+
+        .artifact-preview {
+            display: none;
+            margin-top: 12px;
+            padding: 14px;
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border);
+        }
+
+        .artifact-preview-meta {
+            color: var(--text2);
+            font-size: 12px;
+            margin-bottom: 10px;
+            line-height: 1.5;
+        }
+
+        .artifact-preview img {
+            max-width: 100%;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            background: rgba(255, 255, 255, 0.02);
+        }
     </style>
 </head>
 
@@ -204,6 +227,7 @@
                 <button class="btn btn-secondary" id="btn-prepare-editor">🛠️ PREPARE_EDITOR</button>
                 <button class="btn btn-secondary" id="btn-direct-state">📍 DIRECT STATE</button>
                 <button class="btn btn-secondary" id="btn-captcha-context">🧩 CAPTCHA CONTEXT</button>
+                <button class="btn btn-secondary" id="btn-captcha-artifacts">📸 CAPTCHA ARTIFACTS</button>
             </div>
             <label>CAPTCHA Answer</label>
             <input type="text" id="captcha-answer" placeholder="보안문자 답안">
@@ -214,14 +238,19 @@
             </div>
             <div class="tip">
                 권장 순서: <strong>PREPARE_EDITOR → WRITE_POST</strong><br>
-                `captcha_required`가 오면 <strong>DIRECT STATE / CAPTCHA CONTEXT</strong>로 막힌 탭과 캡차 위치를 확인한 뒤,
-                `SUBMIT_CAPTCHA`로 같은 탭에 답안을 넣고 확인 버튼을 누른 뒤, `captchaStillAppears: false`면 `RESUME_DIRECT_PUBLISH`를 호출하세요.
+                `captcha_required`가 오면 <strong>DIRECT STATE / CAPTCHA ARTIFACTS</strong>로 막힌 탭과 캡차 이미지를 가져온 뒤,
+                OCR/비전으로 답안을 구하고 `SUBMIT_CAPTCHA`를 호출하세요. `captchaStillAppears: false`면 `RESUME_DIRECT_PUBLISH`를 호출하면 됩니다.
             </div>
             <div class="result" id="connect-result"></div>
             <div class="result" id="prepare-result"></div>
             <div class="result" id="direct-state-result"></div>
             <div class="result" id="captcha-context-result"></div>
+            <div class="result" id="captcha-artifacts-result"></div>
             <div class="result" id="captcha-submit-result"></div>
+            <div class="artifact-preview" id="captcha-artifact-preview">
+                <div class="artifact-preview-meta" id="captcha-artifact-meta"></div>
+                <img id="captcha-artifact-image" alt="CAPTCHA artifact preview">
+            </div>
         </div>
 
         <!-- 단건 발행 -->
@@ -314,6 +343,11 @@
                 <span class="key">action</span>: <span class="str">"GET_CAPTCHA_CONTEXT"</span>
                 }, (response) => console.log(response));
 
+                <span class="key">// CAPTCHA 이미지 아티팩트 조회 (saved blocked tab 우선)</span>
+                chrome.runtime.sendMessage(EXTENSION_ID, {
+                <span class="key">action</span>: <span class="str">"GET_CAPTCHA_ARTIFACTS"</span>
+                }, (response) => console.log(response.artifact));
+
                 <span class="key">// CAPTCHA 답안 제출 (saved blocked tab 우선)</span>
                 chrome.runtime.sendMessage(EXTENSION_ID, {
                 <span class="key">action</span>: <span class="str">"SUBMIT_CAPTCHA"</span>,
@@ -380,6 +414,36 @@
             el.textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
         }
 
+        function hideCaptchaArtifactPreview() {
+            $('#captcha-artifact-preview').style.display = 'none';
+            $('#captcha-artifact-meta').textContent = '';
+            $('#captcha-artifact-image').removeAttribute('src');
+        }
+
+        function showCaptchaArtifactPreview(result) {
+            const artifact = result?.artifact;
+            if (!artifact?.dataUrl) {
+                hideCaptchaArtifactPreview();
+                return;
+            }
+
+            const sourceLabel = artifact.kind === 'viewport_crop'
+                ? 'viewport_crop'
+                : (artifact.sourceTagName || 'direct_image');
+
+            const meta = [
+                `preference: ${result.artifactPreference || 'unknown'}`,
+                `kind: ${artifact.kind || 'unknown'}`,
+                `size: ${artifact.width || '?'}x${artifact.height || '?'}`,
+                `tabId: ${result.tabId || '?'}`,
+                `source: ${sourceLabel}`
+            ];
+
+            $('#captcha-artifact-meta').textContent = meta.join(' | ');
+            $('#captcha-artifact-image').src = artifact.dataUrl;
+            $('#captcha-artifact-preview').style.display = 'block';
+        }
+
         function sendToExtension(action, data) {
             return new Promise((resolve, reject) => {
                 const extId = getExtId();
@@ -438,6 +502,28 @@
             }
         });
 
+        $('#btn-captcha-artifacts').addEventListener('click', async () => {
+            try {
+                const result = await sendToExtension('GET_CAPTCHA_ARTIFACTS', {
+                    tabId: getOptionalTabId('#captcha-tab-id'),
+                    includeSourceImage: false
+                });
+                showResult('#captcha-artifacts-result', result, !result.success);
+                showCaptchaArtifactPreview(result);
+
+                if (result?.captureContext) {
+                    showResult('#captcha-context-result', {
+                        success: true,
+                        tabId: result.tabId,
+                        captchaContext: result.captureContext
+                    }, false);
+                }
+            } catch (err) {
+                hideCaptchaArtifactPreview();
+                showResult('#captcha-artifacts-result', err.message, true);
+            }
+        });
+
         $('#btn-submit-captcha').addEventListener('click', async () => {
             try {
                 const result = await sendToExtension('SUBMIT_CAPTCHA', {
@@ -483,6 +569,9 @@
                 if (result?.status === 'captcha_required') {
                     const directState = await sendToExtension('GET_DIRECT_PUBLISH_STATE', { includeCaptchaContext: true });
                     showResult('#direct-state-result', directState, !directState.success);
+                    const artifacts = await sendToExtension('GET_CAPTCHA_ARTIFACTS', { includeSourceImage: false });
+                    showResult('#captcha-artifacts-result', artifacts, !artifacts.success);
+                    showCaptchaArtifactPreview(artifacts);
                 }
             } catch (err) {
                 showResult('#publish-result', err.message, true);

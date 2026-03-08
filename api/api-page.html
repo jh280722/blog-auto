@@ -235,11 +235,13 @@
             <input type="text" id="captcha-tab-id" placeholder="비우면 저장된 directPublishState tab 사용">
             <div class="actions">
                 <button class="btn btn-secondary" id="btn-submit-captcha">✍️ SUBMIT_CAPTCHA</button>
+                <button class="btn btn-primary" id="btn-submit-captcha-resume">⚡ SUBMIT_CAPTCHA_AND_RESUME</button>
             </div>
             <div class="tip">
                 권장 순서: <strong>PREPARE_EDITOR → WRITE_POST</strong><br>
                 `captcha_required`가 오면 <strong>DIRECT STATE / CAPTCHA ARTIFACTS</strong>로 막힌 탭과 캡차 이미지를 가져온 뒤,
-                OCR/비전으로 답안을 구하고 `SUBMIT_CAPTCHA`를 호출하세요. `captchaStillAppears: false`면 `RESUME_DIRECT_PUBLISH`를 호출하면 됩니다.
+                OCR/비전으로 답안을 구하고 <strong>`SUBMIT_CAPTCHA_AND_RESUME`를 우선</strong> 호출하세요. 답안 입력과 같은 탭 재개를 한 번에 처리합니다.
+                구버전 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH`를 따로 사용하세요.
             </div>
             <div class="result" id="connect-result"></div>
             <div class="result" id="prepare-result"></div>
@@ -348,7 +350,17 @@
                 <span class="key">action</span>: <span class="str">"GET_CAPTCHA_ARTIFACTS"</span>
                 }, (response) => console.log(response.artifact));
 
-                <span class="key">// CAPTCHA 답안 제출 (saved blocked tab 우선)</span>
+                <span class="key">// CAPTCHA 답안 제출 + 같은 탭 재개 (권장)</span>
+                chrome.runtime.sendMessage(EXTENSION_ID, {
+                <span class="key">action</span>: <span class="str">"SUBMIT_CAPTCHA_AND_RESUME"</span>,
+                <span class="key">data</span>: {
+                <span class="key">answer</span>: <span class="str">"1234"</span>
+                }
+                }, (response) => {
+                console.log(response.submitResult, response.resumeResult || response);
+                });
+
+                <span class="key">// 구버전 호환: CAPTCHA 답안만 제출</span>
                 chrome.runtime.sendMessage(EXTENSION_ID, {
                 <span class="key">action</span>: <span class="str">"SUBMIT_CAPTCHA"</span>,
                 <span class="key">data</span>: {
@@ -356,7 +368,6 @@
                 }
                 }, (response) => {
                 console.log(response);
-                <span class="key">// captchaStillAppears가 false일 때만 재개 권장</span>
                 <span class="key">if</span> (!response.captchaStillAppears) {
                 chrome.runtime.sendMessage(EXTENSION_ID, {
                 <span class="key">action</span>: <span class="str">"RESUME_DIRECT_PUBLISH"</span>
@@ -524,22 +535,44 @@
             }
         });
 
+        async function refreshCaptchaDiagnostics(result, fallbackTabId = null) {
+            const directState = await sendToExtension('GET_DIRECT_PUBLISH_STATE', { includeCaptchaContext: true });
+            showResult('#direct-state-result', directState, !directState.success);
+
+            const context = await sendToExtension('GET_CAPTCHA_CONTEXT', {
+                tabId: result?.tabId || fallbackTabId
+            });
+            showResult('#captcha-context-result', context, !context.success);
+        }
+
         $('#btn-submit-captcha').addEventListener('click', async () => {
             try {
+                const fallbackTabId = getOptionalTabId('#captcha-tab-id');
                 const result = await sendToExtension('SUBMIT_CAPTCHA', {
                     answer: $('#captcha-answer').value.trim(),
-                    tabId: getOptionalTabId('#captcha-tab-id'),
+                    tabId: fallbackTabId,
                     waitMs: 1200
                 });
                 showResult('#captcha-submit-result', result, !result.success);
+                await refreshCaptchaDiagnostics(result, fallbackTabId);
+            } catch (err) {
+                showResult('#captcha-submit-result', err.message, true);
+            }
+        });
 
-                const directState = await sendToExtension('GET_DIRECT_PUBLISH_STATE', { includeCaptchaContext: true });
-                showResult('#direct-state-result', directState, !directState.success);
-
-                const context = await sendToExtension('GET_CAPTCHA_CONTEXT', {
-                    tabId: result?.tabId || getOptionalTabId('#captcha-tab-id')
+        $('#btn-submit-captcha-resume').addEventListener('click', async () => {
+            try {
+                const fallbackTabId = getOptionalTabId('#captcha-tab-id');
+                const result = await sendToExtension('SUBMIT_CAPTCHA_AND_RESUME', {
+                    answer: $('#captcha-answer').value.trim(),
+                    tabId: fallbackTabId,
+                    waitMs: 1200
                 });
-                showResult('#captcha-context-result', context, !context.success);
+                showResult('#captcha-submit-result', result, !result.success);
+                await refreshCaptchaDiagnostics(result, fallbackTabId);
+                if (result?.resumeResult) {
+                    showResult('#publish-result', result.resumeResult, !result.resumeResult.success);
+                }
             } catch (err) {
                 showResult('#captcha-submit-result', err.message, true);
             }

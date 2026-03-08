@@ -1461,8 +1461,13 @@
     return true;
   }
 
+  function normalizeCaptchaAnswer(answer) {
+    const trimmed = String(answer ?? '').trim();
+    return trimmed ? trimmed.replace(/\s+/g, '') : '';
+  }
+
   async function submitCaptchaAnswer(answer, options = {}) {
-    const normalizedAnswer = String(answer ?? '').trim();
+    const normalizedAnswer = normalizeCaptchaAnswer(answer);
     if (!normalizedAnswer) {
       return {
         success: false,
@@ -1500,7 +1505,7 @@
     await delay(120);
 
     const appliedValue = getElementInputValue(selectedInput.element);
-    const inputApplied = appliedValue.trim() === normalizedAnswer;
+    const inputApplied = normalizeCaptchaAnswer(appliedValue) === normalizedAnswer;
     if (!inputApplied) {
       return {
         success: false,

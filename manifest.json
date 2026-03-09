@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tistory Auto Publisher",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "description": "티스토리 블로그 자동 발행 확장 프로그램 - 심플 UI + 외부 API 지원",
   "permissions": [
     "activeTab",
@@ -10,7 +10,8 @@
     "tabs"
   ],
   "host_permissions": [
-    "*://*.tistory.com/*"
+    "*://*.tistory.com/*",
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background/service-worker.js",

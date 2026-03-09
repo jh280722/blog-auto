@@ -79,6 +79,20 @@ async function updateDirectPublishState(patch = {}) {
   return directPublishState;
 }
 
+function looksLikeDirectPublishCompletionUrl(url = '') {
+  if (!url) return false;
+
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname || '';
+    const path = parsed.pathname || '';
+    if (!host.endsWith('.tistory.com')) return false;
+    return path.startsWith('/manage/posts') || /^\/\d+$/.test(path);
+  } catch {
+    return false;
+  }
+}
+
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -626,12 +640,12 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
   try {
     const captchaCheck = await chrome.tabs.sendMessage(preparation.tabId, { action: 'CHECK_CAPTCHA' });
     if (captchaCheck?.captchaPresent) {
-      const captchaContextResult = await getCaptchaContextForTab(preparation.tabId);
+      const handoff = await captureCaptchaHandoffForTab(preparation.tabId);
       const nextState = liveState || buildDirectPublishState({
         response: { ...captchaCheck, status: 'captcha_required', tabId: preparation.tabId },
         preparation,
         requestData: mergedRequestData,
-        captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
+        captchaContext: handoff.captchaContext || null
       });
       await setDirectPublishState({
         ...nextState,
@@ -640,13 +654,14 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
         url: preparation.url || nextState.url,
         status: 'captcha_required',
         requestData: normalizeDirectPublishRequestData(mergedRequestData),
-        captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
+        captchaContext: handoff.captchaContext || null,
+        lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
       });
-      return attachDirectPublishState(withPreparationDetails({
+      return attachCaptchaHandoff(attachDirectPublishState(withPreparationDetails({
         success: false,
         error: 'CAPTCHA가 아직 표시되어 있습니다.',
         status: 'captcha_required'
-      }, preparation));
+      }, preparation)), handoff);
     }
   } catch (e) { /* 진행 */ }
 
@@ -698,28 +713,28 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
     }
 
     if (responseWithPreparation.status === 'captcha_required') {
-      const captchaContextResult = await getCaptchaContextForTab(preparation.tabId);
-      const directState = buildDirectPublishState({
-        response: responseWithPreparation,
-        preparation,
-        requestData: {
-          ...mergedRequestData,
-          blogName: mergedRequestData.blogName || directPublishState?.blogName || preparation.blogName,
-          visibility: mergedRequestData.visibility || directPublishState?.visibility || null
-        },
-        captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
-      });
+      const handoff = await captureCaptchaHandoffForTab(preparation.tabId);
       await setDirectPublishState({
-        ...directState,
+        ...buildDirectPublishState({
+          response: responseWithPreparation,
+          preparation,
+          requestData: {
+            ...mergedRequestData,
+            blogName: mergedRequestData.blogName || directPublishState?.blogName || preparation.blogName,
+            visibility: mergedRequestData.visibility || directPublishState?.visibility || null
+          },
+          captchaContext: handoff.captchaContext || responseWithPreparation.captchaContext || null
+        }),
         lastDraftRestore: {
           success: true,
           restored: !!draftRestore.restored,
           missing: [],
           checkedAt: new Date().toISOString(),
           snapshot: draftRestore.snapshot || null
-        }
+        },
+        lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
       });
-      return attachDirectPublishState(responseWithPreparation, directState);
+      return attachCaptchaHandoff(attachDirectPublishState(responseWithPreparation), handoff);
     }
 
     return attachDirectPublishState(responseWithPreparation);
@@ -1051,6 +1066,56 @@ async function getCaptchaArtifactsForTab(tabId, options = {}) {
     artifact: artifacts[preferredArtifactKey],
     artifacts,
     captureErrors
+  };
+}
+
+function summarizeCaptchaArtifactCapture(artifactResult = null) {
+  return {
+    success: !!artifactResult?.success,
+    status: artifactResult?.status || null,
+    artifactKind: artifactResult?.artifact?.kind || null,
+    artifactPreference: artifactResult?.artifactPreference || null,
+    captureErrorCount: Array.isArray(artifactResult?.captureErrors) ? artifactResult.captureErrors.length : 0,
+    capturedAt: new Date().toISOString()
+  };
+}
+
+async function captureCaptchaHandoffForTab(tabId, options = {}) {
+  if (!tabId) {
+    return {
+      tabId: null,
+      captchaContext: null,
+      captchaArtifacts: {
+        success: false,
+        status: 'editor_not_ready',
+        error: 'CAPTCHA handoff를 준비할 탭 ID가 없습니다.'
+      }
+    };
+  }
+
+  const captchaContextResult = await getCaptchaContextForTab(tabId);
+  const captchaArtifacts = await getCaptchaArtifactsForTab(tabId, {
+    includeSourceImage: false,
+    ...(options.artifactOptions || {})
+  });
+  const captchaContext = captchaContextResult.success
+    ? captchaContextResult.captchaContext
+    : (captchaArtifacts.captureContext || captchaContextResult);
+
+  return {
+    tabId,
+    captchaContext,
+    captchaArtifacts
+  };
+}
+
+function attachCaptchaHandoff(response, handoff = null) {
+  if (!handoff) return response;
+
+  return {
+    ...response,
+    captchaContext: response?.captchaContext || handoff.captchaContext || null,
+    captchaArtifacts: handoff.captchaArtifacts || null
   };
 }
 
@@ -2027,15 +2092,17 @@ async function handleMessage(message, sender) {
         const responseWithPreparation = normalizePublishResponse(withPreparationDetails(response, preparation));
 
         if (responseWithPreparation.status === 'captcha_required') {
-          const captchaContextResult = await getCaptchaContextForTab(preparation.tabId);
-          const directState = buildDirectPublishState({
-            response: responseWithPreparation,
-            preparation,
-            requestData: message.data || {},
-            captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
+          const handoff = await captureCaptchaHandoffForTab(preparation.tabId);
+          await setDirectPublishState({
+            ...buildDirectPublishState({
+              response: responseWithPreparation,
+              preparation,
+              requestData: message.data || {},
+              captchaContext: handoff.captchaContext || responseWithPreparation.captchaContext || null
+            }),
+            lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
           });
-          await setDirectPublishState(directState);
-          return attachDirectPublishState(responseWithPreparation, directState);
+          return attachCaptchaHandoff(attachDirectPublishState(responseWithPreparation), handoff);
         }
 
         if (responseWithPreparation.success) {
@@ -2182,12 +2249,7 @@ async function handleMessage(message, sender) {
           url: artifactResult.captureContext?.url || savedState.url,
           captchaContext: artifactResult.captureContext || savedState.captchaContext || null,
           lastCheckedAt: new Date().toISOString(),
-          lastCaptchaArtifactCapture: {
-            success: artifactResult.success,
-            status: artifactResult.status || null,
-            artifactKind: artifactResult.artifact?.kind || null,
-            capturedAt: new Date().toISOString()
-          }
+          lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(artifactResult)
         });
       }
 
@@ -2206,6 +2268,24 @@ async function handleMessage(message, sender) {
       const captchaStillAppears = refreshedContext?.success
         ? !!refreshedContext.captchaContext?.captchaPresent
         : !!submitResult.captchaStillAppears;
+
+      if (!submitResult.success || captchaStillAppears) {
+        const handoff = await captureCaptchaHandoffForTab(tabId);
+        if (directPublishState?.tabId === tabId) {
+          await updateDirectPublishState({
+            url: handoff.captchaContext?.url || directPublishState?.url || null,
+            captchaContext: handoff.captchaContext || directPublishState?.captchaContext || null,
+            lastCheckedAt: new Date().toISOString(),
+            lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
+          });
+        }
+
+        return attachCaptchaHandoff({
+          ...submitResult,
+          captchaStillAppears,
+          directPublish: directPublishState?.tabId === tabId ? { ...directPublishState } : null
+        }, handoff);
+      }
 
       return {
         ...submitResult,
@@ -2229,13 +2309,23 @@ async function handleMessage(message, sender) {
       };
 
       if (!submitResult.success || captchaStillAppears) {
-        return {
+        const handoff = await captureCaptchaHandoffForTab(tabId);
+        if (directPublishState?.tabId === tabId) {
+          await updateDirectPublishState({
+            url: handoff.captchaContext?.url || directPublishState?.url || null,
+            captchaContext: handoff.captchaContext || directPublishState?.captchaContext || null,
+            lastCheckedAt: new Date().toISOString(),
+            lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
+          });
+        }
+
+        return attachCaptchaHandoff({
           ...submitResult,
           resumed: false,
           submitResult,
           resumeResult: null,
           directPublish: directPublishState?.tabId === tabId ? { ...directPublishState } : null
-        };
+        }, handoff);
       }
 
       const resumeResult = await resumeDirectPublishFlow({
@@ -2400,6 +2490,20 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     .catch(err => sendResponse({ success: false, error: err.message }));
 
   return true; // 비동기 응답
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (directPublishState?.tabId !== tabId) return;
+  if (!['captcha_required', 'ready_to_resume', 'resuming'].includes(directPublishState?.status)) return;
+
+  const nextUrl = changeInfo.url || tab?.url || '';
+  if (!looksLikeDirectPublishCompletionUrl(nextUrl)) return;
+
+  clearDirectPublishState().then(() => {
+    console.log('[TistoryAuto BG] directPublishState 자동 정리:', nextUrl);
+  }).catch((error) => {
+    console.warn('[TistoryAuto BG] directPublishState 자동 정리 실패:', error);
+  });
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {

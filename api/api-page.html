@@ -239,8 +239,8 @@
             </div>
             <div class="tip">
                 권장 순서: <strong>PREPARE_EDITOR → WRITE_POST</strong><br>
-                `captcha_required`가 오면 <strong>DIRECT STATE / CAPTCHA ARTIFACTS</strong>로 막힌 탭과 캡차 이미지를 가져온 뒤,
-                OCR/비전으로 답안을 구하고 <strong>`SUBMIT_CAPTCHA_AND_RESUME`를 우선</strong> 호출하세요. 답안 입력과 같은 탭 재개를 한 번에 처리합니다.
+                `captcha_required`가 오면 먼저 응답의 <strong>`captchaArtifacts`</strong>를 확인하고, 필요하면 <strong>DIRECT STATE / CAPTCHA ARTIFACTS</strong>로 막힌 탭과 캡차 이미지를 다시 가져오세요.
+                OCR/비전으로 답안을 구하고 <strong>`SUBMIT_CAPTCHA_AND_RESUME`를 우선</strong> 호출하세요. iframe-only CAPTCHA라면 browser/CDP로 같은 탭에서 직접 풀고 <strong>`RESUME_DIRECT_PUBLISH`</strong>를 호출하면 됩니다.
                 구버전 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH`를 따로 사용하세요.
             </div>
             <div class="result" id="connect-result"></div>
@@ -432,7 +432,8 @@
         }
 
         function showCaptchaArtifactPreview(result) {
-            const artifact = result?.artifact;
+            const artifactResult = result?.captchaArtifacts || result;
+            const artifact = artifactResult?.artifact;
             if (!artifact?.dataUrl) {
                 hideCaptchaArtifactPreview();
                 return;
@@ -443,10 +444,10 @@
                 : (artifact.sourceTagName || 'direct_image');
 
             const meta = [
-                `preference: ${result.artifactPreference || 'unknown'}`,
+                `preference: ${artifactResult.artifactPreference || 'unknown'}`,
                 `kind: ${artifact.kind || 'unknown'}`,
                 `size: ${artifact.width || '?'}x${artifact.height || '?'}`,
-                `tabId: ${result.tabId || '?'}`,
+                `tabId: ${artifactResult.tabId || result?.tabId || '?'}`,
                 `source: ${sourceLabel}`
             ];
 
@@ -554,6 +555,7 @@
                     waitMs: 1200
                 });
                 showResult('#captcha-submit-result', result, !result.success);
+                showCaptchaArtifactPreview(result);
                 await refreshCaptchaDiagnostics(result, fallbackTabId);
             } catch (err) {
                 showResult('#captcha-submit-result', err.message, true);
@@ -569,6 +571,7 @@
                     waitMs: 1200
                 });
                 showResult('#captcha-submit-result', result, !result.success);
+                showCaptchaArtifactPreview(result);
                 await refreshCaptchaDiagnostics(result, fallbackTabId);
                 if (result?.resumeResult) {
                     showResult('#publish-result', result.resumeResult, !result.resumeResult.success);
@@ -602,7 +605,8 @@
                 if (result?.status === 'captcha_required') {
                     const directState = await sendToExtension('GET_DIRECT_PUBLISH_STATE', { includeCaptchaContext: true });
                     showResult('#direct-state-result', directState, !directState.success);
-                    const artifacts = await sendToExtension('GET_CAPTCHA_ARTIFACTS', { includeSourceImage: false });
+
+                    const artifacts = result?.captchaArtifacts || await sendToExtension('GET_CAPTCHA_ARTIFACTS', { includeSourceImage: false });
                     showResult('#captcha-artifacts-result', artifacts, !artifacts.success);
                     showCaptchaArtifactPreview(artifacts);
                 }

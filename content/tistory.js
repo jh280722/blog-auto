@@ -1079,8 +1079,20 @@
   const PUBLISH_BUTTON_HINT_RE = /(발행|저장|공개\s*발행|비공개\s*발행|publish|save)/i;
   const EDITOR_FIELD_HINT_RE = /(title|subject|제목|tag|태그|category|카테고리|search|검색)/i;
 
+  function hasStrongCaptchaInputEvidence(reasons = []) {
+    return reasons.includes('captcha_hint_text')
+      || reasons.includes('inside_target')
+      || reasons.includes('same_form');
+  }
+
+  function hasStrongCaptchaButtonEvidence(reasons = []) {
+    return reasons.includes('captcha_action_text')
+      || reasons.includes('inside_target')
+      || reasons.includes('same_form');
+  }
+
   function detectCaptcha() {
-    return collectVisibleMatches(CAPTCHA_SELECTOR_SPECS).length > 0;
+    return buildCaptchaRoots().length > 0;
   }
 
   function isVisibleElement(el) {
@@ -1268,13 +1280,131 @@
     return '';
   }
 
+  function getAncestorDescriptors(element, depth = 4) {
+    const parts = [];
+    let current = element?.parentElement || null;
+    let remaining = depth;
+
+    while (current && remaining > 0) {
+      parts.push([
+        current.tagName?.toLowerCase?.(),
+        current.id,
+        current.className,
+        current.getAttribute?.('role'),
+        current.getAttribute?.('aria-label'),
+        current.getAttribute?.('title')
+      ].filter(Boolean).join(' '));
+      current = current.parentElement;
+      remaining -= 1;
+    }
+
+    return normalizeText(parts.join(' '));
+  }
+
+  function buildHeuristicCaptchaIframeRoots() {
+    if (!window.location.pathname.includes('/manage/')) return [];
+
+    return Array.from(document.querySelectorAll('iframe'))
+      .map((iframe) => {
+        if (!isVisibleElement(iframe)) return null;
+
+        const rect = iframe.getBoundingClientRect();
+        const style = window.getComputedStyle(iframe);
+        const visibleRect = clipRectToViewport(rect);
+        if (!visibleRect) return null;
+
+        const ancestorDescriptor = getAncestorDescriptors(iframe, 4);
+        const descriptor = normalizeText([
+          iframe.id,
+          iframe.className,
+          iframe.getAttribute('name'),
+          iframe.getAttribute('title'),
+          iframe.getAttribute('src'),
+          iframe.getAttribute('aria-label'),
+          iframe.getAttribute('role'),
+          ancestorDescriptor
+        ].filter(Boolean).join(' '));
+
+        if (/(mce|tinymce|editor|toastui|codemirror|kakaomap|youtube|googlefinance)/i.test(descriptor)) {
+          return null;
+        }
+
+        let score = 0;
+        const reasons = [];
+        const centerX = rect.left + (rect.width / 2);
+        const centerY = rect.top + (rect.height / 2);
+        const centeredHorizontally = Math.abs(centerX - (window.innerWidth / 2)) <= (window.innerWidth * 0.28);
+        const centeredVertically = Math.abs(centerY - (window.innerHeight / 2)) <= (window.innerHeight * 0.32);
+        const zIndex = Number(style.zIndex || 0);
+        const area = rect.width * rect.height;
+
+        if (/(captcha|dkaptcha|kakao|challenge|verify|security|보안|인증)/i.test(descriptor)) {
+          score += 20;
+          reasons.push('captcha_descriptor');
+        }
+
+        if (centeredHorizontally && centeredVertically) {
+          score += 8;
+          reasons.push('centered_overlay');
+        }
+
+        if (rect.width >= 220 && rect.width <= Math.max(420, window.innerWidth * 0.95) && rect.height >= 90 && rect.height <= Math.max(420, window.innerHeight * 0.9)) {
+          score += 6;
+          reasons.push('captcha_like_size');
+        }
+
+        if (style.position === 'fixed' || style.position === 'absolute') {
+          score += 5;
+          reasons.push('overlay_position');
+        }
+
+        if (zIndex >= 1000) {
+          score += 4;
+          reasons.push('high_z_index');
+        }
+
+        if (area >= 25000 && area <= 350000) {
+          score += 3;
+          reasons.push('reasonable_area');
+        }
+
+        if (score < 18) return null;
+
+        return {
+          element: iframe,
+          matchedSelectors: ['iframe[heuristic-captcha]'],
+          kinds: ['captcha_iframe_heuristic'],
+          summary: summarizeElement(iframe, 'iframe[heuristic-captcha]', 'captcha_iframe_heuristic', {
+            matchedSelectors: ['iframe[heuristic-captcha]'],
+            score,
+            reasons,
+            associatedText: compactText(descriptor, 220),
+            visibleRect,
+            zIndex: Number.isFinite(zIndex) ? zIndex : null
+          })
+        };
+      })
+      .filter(Boolean);
+  }
+
   function buildCaptchaRoots() {
-    return collectVisibleMatches(CAPTCHA_SELECTOR_SPECS).map((match) => ({
+    const selectorRoots = collectVisibleMatches(CAPTCHA_SELECTOR_SPECS).map((match) => ({
       ...match,
       summary: summarizeElement(match.element, match.matchedSelectors[0], match.kinds[0] || 'captcha_candidate', {
         matchedSelectors: match.matchedSelectors
       })
     }));
+
+    const combined = [...selectorRoots];
+    const seen = new Set(selectorRoots.map((match) => match.element));
+
+    buildHeuristicCaptchaIframeRoots().forEach((match) => {
+      if (seen.has(match.element)) return;
+      seen.add(match.element);
+      combined.push(match);
+    });
+
+    return combined;
   }
 
   function buildCaptchaAnswerInputs(captchaRoots = []) {
@@ -1336,6 +1466,8 @@
         }
 
         if (score <= 0) return null;
+        if (!hasStrongCaptchaInputEvidence(reasons)) return null;
+        if (score < 10) return null;
 
         return {
           ...match,
@@ -1400,6 +1532,8 @@
         }
 
         if (score <= 0) return null;
+        if (!hasStrongCaptchaButtonEvidence(reasons)) return null;
+        if (score < 10) return null;
 
         return {
           ...match,
@@ -1625,6 +1759,7 @@
     const publishLayer = getVisiblePublishLayer();
     const confirmBtn = getConfirmButton();
     const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
+    const iframeCandidates = diagnostics.captchaRoots.filter((match) => match.element?.tagName?.toLowerCase?.() === 'iframe');
 
     return {
       success: true,
@@ -1633,6 +1768,10 @@
       captchaPresent: diagnostics.captchaRoots.length > 0,
       candidateCount: diagnostics.captchaRoots.length,
       candidates: diagnostics.captchaRoots.map((match) => match.summary),
+      iframeCaptchaPresent: iframeCandidates.length > 0,
+      iframeCaptchaCandidateCount: iframeCandidates.length,
+      iframeCaptchaCandidates: iframeCandidates.map((match) => match.summary),
+      preferredSolveMode: iframeCandidates.length > 0 ? 'browser_handoff' : 'extension_dom',
       answerInputCandidateCount: diagnostics.answerInputs.length,
       answerInputCandidates: diagnostics.answerInputs.map((match) => match.summary),
       activeAnswerInput: diagnostics.answerInputs[0]?.summary || null,
@@ -1836,12 +1975,20 @@
     const beforeContext = getCaptchaContext();
     const selectedInput = before.answerInputs[0] || null;
     const selectedButton = before.submitButtons[0] || null;
+    const iframeCaptchaPresent = before.captchaRoots.some((match) => match.element?.tagName?.toLowerCase?.() === 'iframe');
 
     if (!selectedInput) {
       return {
         success: false,
-        status: 'captcha_input_not_found',
-        error: '보이는 CAPTCHA 입력창을 찾지 못했습니다.',
+        status: iframeCaptchaPresent ? 'captcha_browser_handoff_required' : 'captcha_input_not_found',
+        error: iframeCaptchaPresent
+          ? '현재 CAPTCHA 입력창이 cross-origin iframe 안에 있어 확장 내부 DOM 입력 대신 browser/CDP handoff가 필요합니다. 같은 탭에서 풀이한 뒤 RESUME_DIRECT_PUBLISH를 호출하세요.'
+          : '보이는 CAPTCHA 입력창을 찾지 못했습니다.',
+        handoff: iframeCaptchaPresent ? {
+          reason: 'cross_origin_iframe',
+          recommendedAction: 'solve_in_browser_then_resume',
+          sameTabRequired: true
+        } : null,
         diagnostics: getCaptchaContext()
       };
     }
@@ -1849,8 +1996,15 @@
     if (!selectedButton) {
       return {
         success: false,
-        status: 'captcha_submit_not_found',
-        error: '보이는 CAPTCHA 제출 버튼을 찾지 못했습니다.',
+        status: iframeCaptchaPresent ? 'captcha_browser_handoff_required' : 'captcha_submit_not_found',
+        error: iframeCaptchaPresent
+          ? '현재 CAPTCHA 제출 버튼이 cross-origin iframe 안에 있어 확장 내부 DOM 제출 대신 browser/CDP handoff가 필요합니다. 같은 탭에서 풀이한 뒤 RESUME_DIRECT_PUBLISH를 호출하세요.'
+          : '보이는 CAPTCHA 제출 버튼을 찾지 못했습니다.',
+        handoff: iframeCaptchaPresent ? {
+          reason: 'cross_origin_iframe',
+          recommendedAction: 'solve_in_browser_then_resume',
+          sameTabRequired: true
+        } : null,
         diagnostics: getCaptchaContext()
       };
     }
@@ -1924,8 +2078,14 @@
     try {
       // 사전 체크: CAPTCHA가 이미 표시되어 있는지
       if (detectCaptcha()) {
-        console.warn('[TistoryAuto] CAPTCHA 감지됨 — 수동 처리 필요');
-        return { success: false, error: 'CAPTCHA가 감지되었습니다. 수동으로 처리해주세요.', status: 'captcha_required' };
+        const captchaContext = getCaptchaContext();
+        console.warn('[TistoryAuto] CAPTCHA 감지됨 — same-tab handoff 필요');
+        return {
+          success: false,
+          error: 'CAPTCHA가 감지되었습니다. 같은 탭에서 browser/CDP handoff로 풀이를 진행하세요.',
+          status: 'captcha_required',
+          captchaContext
+        };
       }
 
       const initialSnapshot = getEditorSnapshot();
@@ -1998,8 +2158,14 @@
 
         // CAPTCHA 체크 (완료 버튼 클릭 후 나타날 수 있음)
         if (detectCaptcha()) {
+          const captchaContext = getCaptchaContext();
           console.warn('[TistoryAuto] 발행 시도 후 CAPTCHA 감지됨');
-          return { success: false, error: '발행 중 CAPTCHA가 감지되었습니다.', status: 'captcha_required' };
+          return {
+            success: false,
+            error: '발행 중 CAPTCHA가 감지되었습니다.',
+            status: 'captcha_required',
+            captchaContext
+          };
         }
 
         publishLayer = document.querySelector('.publish-layer, #publish-layer, .layer-publish');
@@ -2033,7 +2199,12 @@
 
         // CAPTCHA 체크 (최종 발행 후)
         if (detectCaptcha()) {
-          return { success: false, error: '최종 발행 후 CAPTCHA가 감지되었습니다.', status: 'captcha_required' };
+          return {
+            success: false,
+            error: '최종 발행 후 CAPTCHA가 감지되었습니다.',
+            status: 'captcha_required',
+            captchaContext: getCaptchaContext()
+          };
         }
 
         // "저장중" 스피너 대기
@@ -2056,6 +2227,17 @@
         }
 
         const requestDiag = await waitForNextManagePostDiag(managePostSeqBefore, 12000);
+        const lateCaptchaContext = getCaptchaContext();
+        if (!requestDiag && lateCaptchaContext?.captchaPresent) {
+          return {
+            success: false,
+            error: '최종 발행 검증 중 CAPTCHA가 감지되었습니다.',
+            status: 'captcha_required',
+            url: urlAfter,
+            captchaContext: lateCaptchaContext
+          };
+        }
+
         const persistenceCheck = verifyPublishRequestPersistence(expectedSnapshot, requestDiag);
         if (!persistenceCheck.confirmed) {
           return {
@@ -2089,10 +2271,26 @@
       }
 
       if (detectCaptcha()) {
-        return { success: false, error: 'CAPTCHA 감지됨', status: 'captcha_required' };
+        return {
+          success: false,
+          error: 'CAPTCHA 감지됨',
+          status: 'captcha_required',
+          captchaContext: getCaptchaContext()
+        };
       }
 
       const requestDiag = await waitForNextManagePostDiag(managePostSeqBefore, 12000);
+      const lateCaptchaContext = getCaptchaContext();
+      if (!requestDiag && lateCaptchaContext?.captchaPresent) {
+        return {
+          success: false,
+          error: '발행 검증 중 CAPTCHA가 감지되었습니다.',
+          status: 'captcha_required',
+          url: window.location.href,
+          captchaContext: lateCaptchaContext
+        };
+      }
+
       const persistenceCheck = verifyPublishRequestPersistence(expectedSnapshot, requestDiag);
       if (!persistenceCheck.confirmed) {
         return {

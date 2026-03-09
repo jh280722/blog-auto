@@ -9,6 +9,9 @@
 
   const S = window.__TISTORY_SELECTORS || SELECTORS;
   const IMG = window.__IMAGE_HANDLER || ImageHandler;
+  const MANAGE_POST_DIAG_KEY = '__blog_auto_last_manage_post_diag';
+  const MANAGE_POST_DIAG_ATTR = 'data-blog-auto-last-manage-post-diag';
+  const MANAGE_POST_SEQ_ATTR = 'data-blog-auto-last-manage-post-seq';
 
   function visibilityToNumber(visibility = 'public') {
     return visibility === 'private' ? 0 : visibility === 'protected' ? 15 : 20;
@@ -65,6 +68,292 @@
 
   function normalizeText(value) {
     return String(value ?? '').replace(/\s+/g, ' ').trim();
+  }
+
+  function safeJsonParse(value) {
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getLastManagePostDiag() {
+    const attrValue = document.documentElement.getAttribute(MANAGE_POST_DIAG_ATTR);
+    const attrDiag = safeJsonParse(attrValue);
+    if (attrDiag) return attrDiag;
+
+    try {
+      return safeJsonParse(localStorage.getItem(MANAGE_POST_DIAG_KEY));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getLastManagePostSeq() {
+    const diag = getLastManagePostDiag();
+    if (Number.isFinite(Number(diag?.sequence))) {
+      return Number(diag.sequence);
+    }
+
+    const attrSeq = Number(document.documentElement.getAttribute(MANAGE_POST_SEQ_ATTR));
+    return Number.isFinite(attrSeq) ? attrSeq : 0;
+  }
+
+  function clearLastManagePostDiag() {
+    document.documentElement.removeAttribute(MANAGE_POST_DIAG_ATTR);
+    document.documentElement.removeAttribute(MANAGE_POST_SEQ_ATTR);
+
+    try {
+      localStorage.removeItem(MANAGE_POST_DIAG_KEY);
+    } catch (_) {}
+  }
+
+  async function waitForNextManagePostDiag(previousSeq = 0, timeout = 15000) {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeout) {
+      const diag = getLastManagePostDiag();
+      const sequence = Number(diag?.sequence || 0);
+      if (diag && sequence > previousSeq) {
+        return diag;
+      }
+      await delay(250);
+    }
+
+    return null;
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function summarizeHtmlContent(html = '') {
+    const rawHtml = String(html ?? '');
+    const parserDoc = document.implementation.createHTMLDocument('tistory-auto');
+    const container = parserDoc.createElement('div');
+    container.innerHTML = rawHtml;
+
+    const images = Array.from(container.querySelectorAll('img'));
+    const text = normalizeText(container.textContent || '');
+
+    return {
+      htmlLength: rawHtml.trim().length,
+      textLength: text.length,
+      imageCount: images.length,
+      dataImageCount: images.filter((img) => /^data:image\//i.test(img.getAttribute('src') || '')).length,
+      blobImageCount: images.filter((img) => /^blob:/i.test(img.getAttribute('src') || '')).length,
+      remoteImageCount: images.filter((img) => /^https?:\/\//i.test(img.getAttribute('src') || '')).length,
+      hasMeaningfulContent: text.length > 0 || images.length > 0
+    };
+  }
+
+  function getMinimumAcceptedTextLength(textLength) {
+    const length = Number(textLength) || 0;
+    if (length <= 0) return 0;
+    if (length <= 20) return 1;
+    if (length <= 80) return Math.max(8, Math.floor(length * 0.6));
+    return Math.max(24, Math.floor(length * 0.7));
+  }
+
+  function getEditorTextareaElement(editor = getTinyMCEEditor()) {
+    const element = editor?.getElement?.();
+    if (element && element.tagName === 'TEXTAREA') return element;
+    return document.querySelector('textarea[name="content"], textarea[id*="editor"], textarea[style*="display: none"]');
+  }
+
+  function getEditorTextareaValue(editor = getTinyMCEEditor()) {
+    const textarea = getEditorTextareaElement(editor);
+    return textarea && 'value' in textarea ? String(textarea.value || '') : '';
+  }
+
+  function getEditorHtml(editor = getTinyMCEEditor()) {
+    if (editor) {
+      try {
+        return editor.getContent({ format: 'html' }) || '';
+      } catch (_) {}
+    }
+
+    const editorDoc = getEditorDocument();
+    const body = editorDoc ? getEditorBody(editorDoc) : null;
+    return body?.innerHTML || '';
+  }
+
+  function getEditorSnapshot() {
+    const editor = getTinyMCEEditor();
+    const html = getEditorHtml(editor);
+    const summary = summarizeHtmlContent(html);
+    const textareaValue = getEditorTextareaValue(editor);
+    const textareaSummary = summarizeHtmlContent(textareaValue);
+    const textareaSynced = !editor || !summary.hasMeaningfulContent || (
+      textareaSummary.htmlLength > 0
+      && (summary.textLength === 0 || textareaSummary.textLength >= getMinimumAcceptedTextLength(summary.textLength))
+      && textareaSummary.imageCount >= summary.imageCount
+    );
+
+    return {
+      ...summary,
+      hasTinyMce: !!editor,
+      textareaHtmlLength: textareaSummary.htmlLength,
+      textareaTextLength: textareaSummary.textLength,
+      textareaImageCount: textareaSummary.imageCount,
+      textareaSynced
+    };
+  }
+
+  function compareContentSummaries(expected = {}, actual = {}) {
+    const issues = [];
+
+    if (expected.hasMeaningfulContent && !actual.hasMeaningfulContent) {
+      issues.push('editor_content_missing');
+    }
+
+    if ((expected.textLength || 0) > 0) {
+      const minTextLength = getMinimumAcceptedTextLength(expected.textLength);
+      if ((actual.textLength || 0) < minTextLength) {
+        issues.push('text_length_too_small');
+      }
+    }
+
+    if ((expected.imageCount || 0) > 0 && (actual.imageCount || 0) < expected.imageCount) {
+      issues.push('image_count_too_small');
+    }
+
+    return issues;
+  }
+
+  function summarizeSnapshotForLog(snapshot) {
+    return {
+      textLength: snapshot?.textLength || 0,
+      imageCount: snapshot?.imageCount || 0,
+      dataImageCount: snapshot?.dataImageCount || 0,
+      blobImageCount: snapshot?.blobImageCount || 0,
+      textareaTextLength: snapshot?.textareaTextLength || 0,
+      textareaImageCount: snapshot?.textareaImageCount || 0,
+      textareaSynced: !!snapshot?.textareaSynced
+    };
+  }
+
+  function formatPersistenceIssues(issues = []) {
+    const messages = {
+      editor_content_missing: '에디터 본문이 비어 있습니다.',
+      text_length_too_small: '에디터 본문 길이가 기대치보다 너무 짧습니다.',
+      image_count_too_small: '에디터 이미지 개수가 기대치보다 적습니다.',
+      editor_textarea_not_synced: 'TinyMCE 내부 textarea 동기화가 확인되지 않았습니다.',
+      publish_request_missing: '발행 요청(payload)을 확인하지 못했습니다.',
+      publish_request_empty: '발행 payload가 비어 있습니다.',
+      publish_request_text_too_small: '발행 payload 본문이 기대치보다 너무 짧습니다.',
+      publish_request_images_missing: '발행 payload에서 이미지가 누락되었습니다.',
+      publish_request_transient_images: '발행 payload에 data/blob 이미지가 남아 있습니다.'
+    };
+
+    return issues.map((issue) => messages[issue] || issue).join(' ');
+  }
+
+  async function syncEditorState(reason = 'sync') {
+    const editor = getTinyMCEEditor();
+    if (editor) {
+      try { editor.save(); } catch (_) {}
+      try { editor.fire('input'); } catch (_) {}
+      try { editor.fire('change'); } catch (_) {}
+    }
+
+    const editorDoc = getEditorDocument();
+    const body = editorDoc ? getEditorBody(editorDoc) : null;
+    if (body) {
+      body.dispatchEvent(new Event('input', { bubbles: true }));
+      body.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    await delay(250);
+    const snapshot = getEditorSnapshot();
+    console.log('[TistoryAuto] 에디터 동기화:', reason, summarizeSnapshotForLog(snapshot));
+    return snapshot;
+  }
+
+  async function waitForEditorCondition(predicate, options = {}) {
+    const timeout = options.timeout ?? 10000;
+    const interval = options.interval ?? 300;
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeout) {
+      const snapshot = getEditorSnapshot();
+      if (predicate(snapshot)) {
+        return snapshot;
+      }
+      await delay(interval);
+    }
+
+    return null;
+  }
+
+  async function ensureEditorStatePersistence(expectedSummary = null, options = {}) {
+    const snapshot = await syncEditorState(options.reason || 'sync');
+    const issues = expectedSummary ? compareContentSummaries(expectedSummary, snapshot) : [];
+
+    if (snapshot.hasMeaningfulContent && !snapshot.textareaSynced) {
+      issues.push('editor_textarea_not_synced');
+    }
+
+    const success = issues.length === 0;
+    return {
+      success,
+      snapshot,
+      issues,
+      status: issues.includes('editor_textarea_not_synced')
+        ? 'content_not_synced'
+        : (issues.includes('editor_content_missing') ? 'content_empty' : 'verification_failed'),
+      error: success ? null : formatPersistenceIssues(issues)
+    };
+  }
+
+  function verifyPublishRequestPersistence(expectedSnapshot, requestDiag) {
+    const issues = [];
+
+    if (!requestDiag) {
+      issues.push('publish_request_missing');
+      return {
+        confirmed: false,
+        status: 'persistence_unverified',
+        issues,
+        error: formatPersistenceIssues(issues),
+        requestDiag: null
+      };
+    }
+
+    const requestHasContent = (requestDiag.textLength || 0) > 0 || (requestDiag.imageCount || 0) > 0;
+    if (!requestHasContent) {
+      issues.push('publish_request_empty');
+    }
+
+    if ((expectedSnapshot?.textLength || 0) > 0) {
+      const minTextLength = getMinimumAcceptedTextLength(expectedSnapshot.textLength);
+      if ((requestDiag.textLength || 0) < minTextLength) {
+        issues.push('publish_request_text_too_small');
+      }
+    }
+
+    if ((expectedSnapshot?.imageCount || 0) > 0 && (requestDiag.imageCount || 0) < expectedSnapshot.imageCount) {
+      issues.push('publish_request_images_missing');
+    }
+
+    if ((requestDiag.dataImageCount || 0) > 0 || (requestDiag.blobImageCount || 0) > 0) {
+      issues.push('publish_request_transient_images');
+    }
+
+    return {
+      confirmed: issues.length === 0,
+      status: issues.length === 0 ? 'confirmed' : 'persistence_unverified',
+      issues,
+      error: issues.length === 0 ? null : formatPersistenceIssues(issues),
+      requestDiag
+    };
   }
 
   function matchesVisibilityText(text, visibility = 'public') {
@@ -358,6 +647,8 @@
         return { success: false, error: '본문 내용이 비어있습니다.', status: 'content_empty' };
       }
 
+      const expectedSummary = summarizeHtmlContent(htmlContent);
+
       await delay(500);
 
       let contentSet = false;
@@ -367,6 +658,8 @@
       if (editor) {
         try {
           editor.setContent(htmlContent);
+          editor.setDirty?.(true);
+          editor.nodeChanged?.();
           editor.save();
           editor.fire('change');
           contentSet = true;
@@ -399,24 +692,17 @@
         console.log('[TistoryAuto] DOM fallback으로 본문 입력 완료');
       }
 
-      // 검증: 본문이 실제로 들어갔는지 확인
-      await delay(300);
-      const verifyEditor = getTinyMCEEditor();
-      if (verifyEditor) {
-        const currentContent = verifyEditor.getContent();
-        if (!currentContent || currentContent.trim().length === 0) {
-          return { success: false, error: '본문이 에디터에 반영되지 않음', status: 'verification_failed' };
-        }
-      } else {
-        const editorDoc = getEditorDocument();
-        const body = editorDoc ? getEditorBody(editorDoc) : null;
-        const bodyText = body ? body.textContent.trim() : '';
-        if (body && bodyText.length === 0) {
-          return { success: false, error: '본문이 에디터에 반영되지 않음', status: 'verification_failed' };
-        }
+      const persistenceResult = await ensureEditorStatePersistence(expectedSummary, { reason: 'set_content' });
+      if (!persistenceResult.success) {
+        return {
+          success: false,
+          error: persistenceResult.error || '본문이 에디터에 안정적으로 반영되지 않았습니다.',
+          status: persistenceResult.status,
+          snapshot: summarizeSnapshotForLog(persistenceResult.snapshot)
+        };
       }
 
-      return { success: true };
+      return { success: true, snapshot: summarizeSnapshotForLog(persistenceResult.snapshot) };
     } catch (error) {
       console.error('[TistoryAuto] 본문 입력 실패:', error);
       return { success: false, error: error.message };
@@ -567,8 +853,22 @@
    * 방법 1: 숨겨진 file input에 파일 주입
    * 방법 2: 첨부 → 사진 클릭하여 file input 트리거
    */
+  function buildInlineImageHtml(image = {}) {
+    const src = escapeHtml(image.url || image.src || '');
+    const alt = escapeHtml(image.alt || '');
+    return [
+      '<figure data-ke-type="image" data-ke-mobilestyle="widthContent">',
+      `<img src="${src}" alt="${alt}" style="max-width: 100%;" />`,
+      alt ? `<figcaption>${alt}</figcaption>` : '',
+      '</figure>',
+      '<p>&nbsp;</p>'
+    ].join('');
+  }
+
   async function uploadImageViaTistory(imageBlob, filename = 'image.png') {
     try {
+      const beforeSnapshot = getEditorSnapshot();
+
       // 첨부 버튼 클릭
       const attachBtn = findElement(S.image.attachButton, null);
       if (attachBtn) {
@@ -598,11 +898,36 @@
       fileInput.dispatchEvent(new Event('input', { bubbles: true }));
 
       console.log('[TistoryAuto] 티스토리 업로더로 이미지 업로드 트리거:', filename);
-      await delay(2000); // 업로드 완료 대기
-      return true;
+      const insertedSnapshot = await waitForEditorCondition(
+        (snapshot) => snapshot.imageCount > beforeSnapshot.imageCount,
+        { timeout: 15000, interval: 400 }
+      );
+
+      if (!insertedSnapshot) {
+        return {
+          success: false,
+          error: `이미지 업로드 후 에디터 반영을 확인하지 못했습니다: ${filename}`,
+          status: 'image_upload_unverified'
+        };
+      }
+
+      const persistenceResult = await ensureEditorStatePersistence(insertedSnapshot, { reason: 'upload_image' });
+      if (!persistenceResult.success) {
+        return {
+          success: false,
+          error: persistenceResult.error || `이미지 업로드 직후 동기화가 불안정합니다: ${filename}`,
+          status: persistenceResult.status,
+          snapshot: summarizeSnapshotForLog(persistenceResult.snapshot)
+        };
+      }
+
+      return {
+        success: true,
+        snapshot: summarizeSnapshotForLog(persistenceResult.snapshot)
+      };
     } catch (error) {
       console.error('[TistoryAuto] 티스토리 업로더 실패:', error);
-      return false;
+      return { success: false, error: error.message, status: 'image_upload_failed' };
     }
   }
 
@@ -615,7 +940,7 @@
     try {
       if (!images || images.length === 0) return { success: true };
 
-      const editorDoc = getEditorDocument();
+      const initialSnapshot = getEditorSnapshot();
       let uploadCount = 0;
       let inlineCount = 0;
 
@@ -624,61 +949,92 @@
         if (image.base64) {
           const blob = IMG.base64ToBlob(image.base64);
           const filename = image.alt || `image_${Date.now()}.png`;
-          const success = await uploadImageViaTistory(blob, filename);
-          if (success) {
-            uploadCount++;
-          } else if (editorDoc) {
-            // 업로드 실패 시 에디터에 직접 삽입
-            IMG.insertImageToEditor(editorDoc, {
-              src: image.base64,
-              alt: image.alt || ''
-            });
-            inlineCount++;
+          const uploadResult = await uploadImageViaTistory(blob, filename);
+          if (!uploadResult.success) {
+            return uploadResult;
           }
+
+          uploadCount++;
         }
         // URL만 있으면 → 에디터에 <img> 태그로 직접 삽입
         else if (image.url || image.src) {
-          const imgSrc = image.url || image.src;
+          const beforeSnapshot = getEditorSnapshot();
+          const inlineHtml = buildInlineImageHtml(image);
+          const editor = getTinyMCEEditor();
 
-          if (editorDoc) {
-            const body = getEditorBody(editorDoc);
-            if (body) {
-              // figure + img 구조 (티스토리 네이티브 스타일)
-              const figure = editorDoc.createElement('figure');
-              figure.setAttribute('data-ke-type', 'image');
-              figure.setAttribute('data-ke-mobilestyle', 'widthContent');
-
-              const img = editorDoc.createElement('img');
-              img.src = imgSrc;
-              img.alt = image.alt || '';
-              img.style.maxWidth = '100%';
-
-              figure.appendChild(img);
-
-              // 이미지 설명용 figcaption
-              if (image.alt) {
-                const caption = editorDoc.createElement('figcaption');
-                caption.textContent = image.alt;
-                figure.appendChild(caption);
-              }
-
-              body.appendChild(figure);
-
-              // 이미지 뒤에 빈 줄 추가
-              const p = editorDoc.createElement('p');
-              p.innerHTML = '&nbsp;';
-              body.appendChild(p);
-
-              inlineCount++;
+          if (editor) {
+            editor.insertContent(inlineHtml);
+            editor.setDirty?.(true);
+            editor.nodeChanged?.();
+            editor.save();
+            editor.fire('change');
+          } else {
+            const editorDoc = getEditorDocument();
+            const body = editorDoc ? getEditorBody(editorDoc) : null;
+            if (!body) {
+              return { success: false, error: '이미지 삽입용 에디터를 찾을 수 없음', status: 'editor_not_ready' };
             }
+
+            const temp = editorDoc.createElement('div');
+            temp.innerHTML = inlineHtml;
+            while (temp.firstChild) {
+              body.appendChild(temp.firstChild);
+            }
+            body.dispatchEvent(new Event('input', { bubbles: true }));
+            body.dispatchEvent(new Event('change', { bubbles: true }));
           }
+
+          const insertedSnapshot = await waitForEditorCondition(
+            (snapshot) => snapshot.imageCount > beforeSnapshot.imageCount,
+            { timeout: 5000, interval: 250 }
+          );
+
+          if (!insertedSnapshot) {
+            return {
+              success: false,
+              error: `외부 이미지 삽입 후 에디터 반영을 확인하지 못했습니다: ${image.url || image.src}`,
+              status: 'verification_failed'
+            };
+          }
+
+          const persistenceResult = await ensureEditorStatePersistence(insertedSnapshot, { reason: 'insert_inline_image' });
+          if (!persistenceResult.success) {
+            return {
+              success: false,
+              error: persistenceResult.error || '이미지 삽입 후 동기화에 실패했습니다.',
+              status: persistenceResult.status,
+              snapshot: summarizeSnapshotForLog(persistenceResult.snapshot)
+            };
+          }
+
+          inlineCount++;
         }
 
         await delay(500);
       }
 
+      const finalExpectedSnapshot = {
+        ...initialSnapshot,
+        imageCount: initialSnapshot.imageCount + uploadCount + inlineCount,
+        hasMeaningfulContent: initialSnapshot.hasMeaningfulContent || uploadCount + inlineCount > 0
+      };
+      const finalPersistence = await ensureEditorStatePersistence(finalExpectedSnapshot, { reason: 'insert_images_final' });
+      if (!finalPersistence.success) {
+        return {
+          success: false,
+          error: finalPersistence.error || '이미지 삽입 후 최종 동기화에 실패했습니다.',
+          status: finalPersistence.status,
+          snapshot: summarizeSnapshotForLog(finalPersistence.snapshot)
+        };
+      }
+
       console.log(`[TistoryAuto] 이미지 삽입 완료: 업로드 ${uploadCount}개, 인라인 ${inlineCount}개`);
-      return { success: true, uploaded: uploadCount, inline: inlineCount };
+      return {
+        success: true,
+        uploaded: uploadCount,
+        inline: inlineCount,
+        snapshot: summarizeSnapshotForLog(finalPersistence.snapshot)
+      };
     } catch (error) {
       console.error('[TistoryAuto] 이미지 삽입 실패:', error);
       return { success: false, error: error.message };
@@ -1572,6 +1928,42 @@
         return { success: false, error: 'CAPTCHA가 감지되었습니다. 수동으로 처리해주세요.', status: 'captcha_required' };
       }
 
+      const initialSnapshot = getEditorSnapshot();
+      if (!initialSnapshot.hasMeaningfulContent) {
+        return {
+          success: false,
+          error: '발행 직전 에디터 본문이 비어 있어 발행을 중단합니다.',
+          status: 'content_empty',
+          persistenceCheck: {
+            confirmed: false,
+            status: 'content_empty',
+            issues: ['editor_content_missing'],
+            error: formatPersistenceIssues(['editor_content_missing']),
+            snapshot: summarizeSnapshotForLog(initialSnapshot)
+          }
+        };
+      }
+
+      const prePublishPersistence = await ensureEditorStatePersistence(initialSnapshot, { reason: 'pre_publish' });
+      if (!prePublishPersistence.success) {
+        return {
+          success: false,
+          error: prePublishPersistence.error || '발행 직전 에디터 동기화 검증에 실패했습니다.',
+          status: prePublishPersistence.status,
+          persistenceCheck: {
+            confirmed: false,
+            status: prePublishPersistence.status,
+            issues: prePublishPersistence.issues,
+            error: prePublishPersistence.error,
+            snapshot: summarizeSnapshotForLog(prePublishPersistence.snapshot)
+          }
+        };
+      }
+
+      const expectedSnapshot = prePublishPersistence.snapshot;
+      clearLastManagePostDiag();
+      const managePostSeqBefore = getLastManagePostSeq();
+
       // 최종 발행 직전에 MAIN world interceptor를 주입해 실제 페이지 XHR/fetch payload도 교정한다.
       try {
         await chrome.runtime.sendMessage({ action: 'INJECT_MAIN_WORLD_VISIBILITY_HELPER' });
@@ -1663,9 +2055,21 @@
           return { success: false, error: `발행 오류: ${errorEl.textContent.trim()}`, status: 'publish_error' };
         }
 
+        const requestDiag = await waitForNextManagePostDiag(managePostSeqBefore, 12000);
+        const persistenceCheck = verifyPublishRequestPersistence(expectedSnapshot, requestDiag);
+        if (!persistenceCheck.confirmed) {
+          return {
+            success: false,
+            error: persistenceCheck.error || '발행 payload 검증에 실패했습니다.',
+            status: persistenceCheck.status,
+            url: urlAfter,
+            persistenceCheck
+          };
+        }
+
         if (urlChanged || hasSuccessIndicator) {
           console.log('[TistoryAuto] 발행 완료! URL:', urlAfter);
-          return { success: true, status: 'published', url: urlAfter };
+          return { success: true, status: 'published', url: urlAfter, persistenceCheck };
         }
 
         // URL 변경 없이 여전히 newpost 페이지라면 의심
@@ -1674,7 +2078,7 @@
           return { success: false, error: '발행 후에도 글쓰기 페이지에서 이동하지 않음', status: 'verification_failed' };
         }
 
-        return { success: true, status: 'published' };
+        return { success: true, status: 'published', persistenceCheck };
       }
 
       // 발행 레이어 없이 바로 발행 시도된 경우 — 검증 수행
@@ -1688,8 +2092,20 @@
         return { success: false, error: 'CAPTCHA 감지됨', status: 'captcha_required' };
       }
 
+      const requestDiag = await waitForNextManagePostDiag(managePostSeqBefore, 12000);
+      const persistenceCheck = verifyPublishRequestPersistence(expectedSnapshot, requestDiag);
+      if (!persistenceCheck.confirmed) {
+        return {
+          success: false,
+          error: persistenceCheck.error || '발행 payload 검증에 실패했습니다.',
+          status: persistenceCheck.status,
+          url: window.location.href,
+          persistenceCheck
+        };
+      }
+
       console.log('[TistoryAuto] 완료 버튼으로 발행됨 (레이어 없음)');
-      return { success: true, status: 'published' };
+      return { success: true, status: 'published', persistenceCheck };
     } catch (error) {
       console.error('[TistoryAuto] 발행 실패:', error);
       return { success: false, error: error.message };
@@ -1744,18 +2160,25 @@
     // 7. 발행 (autoPublish가 true인 경우)
     if (postData.autoPublish) {
       // 발행 전 에디터 내용 최종 확인 — publish() 호출 이전에 수행
-      if (results.content?.success) {
-        const editor = getTinyMCEEditor();
-        if (editor) {
-          const finalContent = editor.getContent();
-          if (!finalContent || finalContent.trim().length === 0) {
-            return {
-              success: false,
-              status: 'content_empty',
-              results,
-              message: '발행 직전 에디터 본문이 비어있어 발행을 중단합니다.'
-            };
-          }
+      if (results.content?.success || results.images?.success) {
+        const preflightSnapshot = getEditorSnapshot();
+        if (!preflightSnapshot.hasMeaningfulContent) {
+          return {
+            success: false,
+            status: 'content_empty',
+            results,
+            message: '발행 직전 에디터 본문이 비어있어 발행을 중단합니다.'
+          };
+        }
+
+        const preflightPersistence = await ensureEditorStatePersistence(preflightSnapshot, { reason: 'write_post_preflight' });
+        if (!preflightPersistence.success) {
+          return {
+            success: false,
+            status: preflightPersistence.status,
+            results,
+            message: preflightPersistence.error || '발행 직전 에디터 동기화 검증에 실패했습니다.'
+          };
         }
       }
 
@@ -1775,6 +2198,78 @@
       status,
       results,
       message: allSuccess ? '글 작성이 완료되었습니다.' : '일부 단계에서 오류가 발생했습니다.'
+    };
+  }
+
+  function getCurrentTagsSnapshot() {
+    const tags = new Set();
+    const container = document.querySelector(S.tag.container);
+
+    const candidates = container
+      ? container.querySelectorAll('.tag-item, .tag, .token, .chip, li, span, a')
+      : [];
+
+    candidates.forEach(node => {
+      const text = node.textContent?.trim();
+      if (!text) return;
+      if (text.length > 40) return;
+      if (/^(태그|추가|입력)$/i.test(text)) return;
+      tags.add(text.replace(/^#/, ''));
+    });
+
+    const tagInput = findElement(S.tag.input, S.tag.fallback);
+    const inlineValue = tagInput?.value?.trim();
+    if (inlineValue && !tags.size) {
+      inlineValue.split(',').map(tag => tag.trim()).filter(Boolean).forEach(tag => tags.add(tag.replace(/^#/, '')));
+    }
+
+    return [...tags];
+  }
+
+  function getDraftSnapshot() {
+    const titleEl = findElement(S.title.input, S.title.fallback);
+    const title = titleEl?.value?.trim() || titleEl?.textContent?.trim() || '';
+    const editor = getTinyMCEEditor();
+    let contentHtml = '';
+    let contentText = '';
+
+    if (editor) {
+      try {
+        contentHtml = editor.getContent({ format: 'html' }) || '';
+      } catch (error) {
+        console.warn('[TistoryAuto] draft snapshot HTML 읽기 실패:', error);
+      }
+
+      try {
+        contentText = editor.getContent({ format: 'text' }) || '';
+      } catch (error) {
+        console.warn('[TistoryAuto] draft snapshot text 읽기 실패:', error);
+      }
+    }
+
+    if (!contentHtml || !contentText) {
+      const editorDoc = getEditorDocument();
+      const body = editorDoc ? getEditorBody(editorDoc) : null;
+      if (body) {
+        contentHtml = contentHtml || body.innerHTML || '';
+        contentText = contentText || body.textContent || '';
+      }
+    }
+
+    const normalizedText = contentText.replace(/\s+/g, ' ').trim();
+    const categoryBtn = findElement(S.category.button, null);
+
+    return {
+      success: true,
+      url: window.location.href,
+      title,
+      currentCategory: categoryBtn?.textContent?.trim() || '',
+      tags: getCurrentTagsSnapshot(),
+      contentHtmlLength: contentHtml.trim().length,
+      contentTextLength: normalizedText.length,
+      contentPreview: normalizedText.slice(0, 160),
+      imageCount: (contentHtml.match(/<img\b/gi) || []).length,
+      editorReady: !!getEditorDocument()
     };
   }
 
@@ -1855,6 +2350,9 @@
 
         case 'GET_PAGE_INFO':
           return getPageInfo();
+
+        case 'GET_DRAFT_SNAPSHOT':
+          return getDraftSnapshot();
 
         case 'PING':
           return { success: true, message: 'Content script is alive' };

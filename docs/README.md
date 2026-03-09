@@ -19,11 +19,12 @@
 - **이미지 삽입**: 로컬 파일, 드래그앤드롭, URL 모두 지원
 - **대량 발행 큐**: JSON으로 여러 글을 한번에 등록, 순차 발행
 - **외부 API**: `externally_connectable`로 외부 도구에서 데이터 전송 가능
-- **직접 발행 상태 추적**: `captcha_required` 시 blocked tab / blog / visibility / diagnostics를 저장
+- **직접 발행 상태 추적**: `captcha_required` 시 blocked tab / blog / visibility / diagnostics / requestData를 저장
 - **CAPTCHA context API**: 에이전트가 iframe/레이어/입력창/버튼 위치를 읽어 같은 탭에서 해결할 수 있도록 컨텍스트 제공
 - **CAPTCHA artifact API**: 에이전트가 같은 blocked tab에서 보이는 CAPTCHA 이미지를 직접 받아 OCR/비전 입력으로 넘길 수 있음
 - **CAPTCHA submit API**: 에이전트가 blocked tab에 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음
 - **CAPTCHA submit+resume API**: `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭 답안 제출과 직접 발행 재개를 한 번에 처리
+- **재개 전 draft self-heal**: CAPTCHA 후 재개 전에 제목/본문/카테고리/이미지/태그 스냅샷을 확인하고, 비어 있으면 같은 탭에서 자동 복구 후 발행
 - **CAPTCHA 핸드오프**: DKAPTCHA 감지 시 자동 일시정지 → 같은 탭에서 해결 → 원클릭 재개
 
 ## 설치
@@ -194,8 +195,9 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 4. `captcha_required`면 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` 또는 `GET_CAPTCHA_ARTIFACTS`로 막힌 탭/캡차 이미지를 확보
 5. `response.artifact.dataUrl`를 OCR/비전 입력으로 사용해 답안을 구함
 6. `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭에 답안을 제출하고 즉시 재개
-7. 응답이 `captcha_still_present`면 새 답안으로 같은 액션 재시도
-8. `editor_not_ready`면 `diagnostics.attempts`를 보고 `PREPARE_EDITOR` 재호출
+7. 재개 단계는 저장된 `requestData`를 기준으로 draft snapshot을 검사하고, 제목/본문/이미지가 비어 있으면 먼저 복구합니다. 복구가 충분하지 않으면 `draft_restore_failed`로 fail-closed 합니다.
+8. 응답이 `captcha_still_present`면 새 답안으로 같은 액션 재시도
+9. `editor_not_ready`면 `diagnostics.attempts`를 보고 `PREPARE_EDITOR` 재호출
 
 ---
 
@@ -248,6 +250,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 | `editor_not_ready` | 에디터 탭 확보/복구 실패 | `diagnostics` 확인 후 `PREPARE_EDITOR` 재호출 |
 | `item_not_found` | 재개할 큐 항목 없음 | 큐 확인 |
 | `content_empty` | 본문 비어있거나 에디터 미반영 | 본문 확인 후 재시도 |
+| `draft_restore_failed` | CAPTCHA 재개 직전 draft 복구가 충분하지 않음 | blank post 방지를 위해 재발행 중단 — `draftRestore`/snapshot 확인 |
 | `verification_failed` | 발행 후 URL 미변경 — 실제 저장 여부 불확실 | 관리자 페이지 직접 확인 |
 | `save_timeout` | 저장중 상태 15초 이상 지속 | 네트워크 확인 후 재시도 |
 | `publish_error` | 티스토리 에러 메시지 표시 | 에러 내용 확인 |
@@ -349,13 +352,15 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - `blogName`: 재개에 사용할 블로그명
 - `url`: 막힌 탭 URL
 - `visibility`: 마지막 발행 가시성 값
+- `requestData`: 재개 시 재주입할 제목/본문/카테고리/태그/이미지 payload
 - `detectedAt` / `updatedAt`: 상태 기록 시각
 - `diagnostics`: 마지막 에디터 준비 로그
 - `captchaContext`: 화면 판독용 캡차 후보 요소 / iframe / 버튼 텍스트 / rect
 - `lastCaptchaSubmitResult`: 마지막 `SUBMIT_CAPTCHA` 시도 결과 요약
 - `lastCaptchaArtifactCapture`: 마지막 `GET_CAPTCHA_ARTIFACTS` 시도 결과 요약
+- `lastDraftRestore`: 마지막 draft snapshot 점검/복구 결과 요약
 
-이 상태 덕분에 외부 에이전트/크론은 새 탭을 다시 고르지 않고, **막힌 동일 탭**을 기준으로 캡차 이미지를 가져오고 `SUBMIT_CAPTCHA_AND_RESUME`를 바로 호출할 수 있습니다.
+이 상태 덕분에 외부 에이전트/크론은 새 탭을 다시 고르지 않고, **막힌 동일 탭**을 기준으로 캡차 이미지를 가져오고 `SUBMIT_CAPTCHA_AND_RESUME`를 바로 호출할 수 있습니다. 또한 재개 직전 draft가 비었는지 검사하고 필요하면 같은 탭에서 자동 복구합니다.
 
 ### CAPTCHA Context / Submit 응답 포인트
 
@@ -365,7 +370,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - `SUBMIT_CAPTCHA`는 `selectedInput`, `selectedButton`, `buttonText`, `captchaPresentAfterWait`, `captchaStillAppears`, `diagnostics.before/after`, `answerNormalization`을 반환합니다.
 - `SUBMIT_CAPTCHA` 기본 대상 탭은 저장된 `directPublishState.tabId`이며, 필요하면 `data.tabId`로 override할 수 있습니다.
 - `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`는 답안을 `trim`하고 내부 공백을 제거해 OCR 공백 노이즈를 줄입니다.
-- `SUBMIT_CAPTCHA_AND_RESUME`는 `submitResult` + `resumeResult`를 함께 반환하고, CAPTCHA가 사라졌으면 top-level `success` / `status` / `url`이 재개 결과를 반영합니다.
+- `SUBMIT_CAPTCHA_AND_RESUME`는 `submitResult` + `resumeResult`를 함께 반환하고, CAPTCHA가 사라졌으면 top-level `success` / `status` / `url`이 재개 결과를 반영합니다. `resumeResult.draftRestore`로 재개 전 self-heal 결과를 확인할 수 있습니다.
 - `SUBMIT_CAPTCHA.status`
   - `captcha_submitted`: 답안 입력 + 클릭 수행 후 짧은 대기 뒤 visible CAPTCHA가 더 이상 감지되지 않음
   - `captcha_still_present`: 답안 입력 + 클릭은 수행했지만 CAPTCHA가 계속 보임
@@ -398,6 +403,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 | `REMOVE_FROM_QUEUE` | 큐 항목 삭제 |
 | `CLEAR_QUEUE` | 큐 초기화 |
 | `GET_PAGE_INFO` | 페이지 정보 조회 |
+| `GET_DRAFT_SNAPSHOT` | 현재 탭의 제목/본문/카테고리/태그/이미지 스냅샷 조회 |
 | `CHECK_CAPTCHA` | CAPTCHA 표시 여부 확인 |
 
 ---
@@ -405,7 +411,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 ## 알려진 한계 및 잔여 리스크
 
 - **verification_failed 오탐**: Tistory가 발행 후 URL을 변경하지 않는 경우 발행이 성공했음에도 실패로 기록될 수 있습니다. 관리자 페이지(`/manage/posts`)에서 직접 확인하세요.
-- **CAPTCHA 중 탭 닫힘**: CAPTCHA 해결 전에 에디터 탭을 닫으면 내용이 사라집니다. Retry(재시도)로만 복구할 수 있습니다.
+- **CAPTCHA 중 탭 닫힘**: 같은 탭이 살아 있으면 재개 전에 draft self-heal을 시도하지만, 탭을 닫아버리면 저장되지 않은 내용은 복구 불가합니다.
 - **셀렉터 변경**: 티스토리 에디터 업데이트 시 `content/selectors.js` 수정이 필요할 수 있습니다.
-- **자동 판독은 외부 책임**: 확장 프로그램은 `GET_CAPTCHA_ARTIFACTS`로 이미지 아티팩트를 제공하지만, 실제 OCR/비전 판독은 외부 에이전트/서비스가 수행해야 합니다.
+- **자동 판독은 외부 책임**: 확장 프로그램은 `GET_CAPTCHA_ARTIFACTS`로 이미지 아티팩트를 제공하고 same-tab 재개까지 맡지만, 실제 OCR/비전 판독은 외부 에이전트/서비스가 수행해야 합니다.
 - **viewport crop는 Chrome capture 권한 상태에 영향받을 수 있음**: 이 경우에도 Tistory DKAPTCHA가 실제 이미지 요소면 `artifacts.directImage`가 남을 수 있습니다.

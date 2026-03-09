@@ -144,6 +144,242 @@ function withPreparationDetails(response, preparation) {
   return next;
 }
 
+function getPersistenceCheck(response) {
+  return response?.persistenceCheck
+    || response?.results?.publish?.persistenceCheck
+    || null;
+}
+
+function normalizePublishResponse(response) {
+  if (!response || typeof response !== 'object') return response;
+
+  const persistenceCheck = getPersistenceCheck(response);
+  if (response.success && response.status === 'published' && persistenceCheck?.confirmed === false) {
+    return {
+      ...response,
+      success: false,
+      status: persistenceCheck.status || 'persistence_unverified',
+      error: persistenceCheck.error || '발행 persistence 검증에 실패했습니다.'
+    };
+  }
+
+  return response;
+}
+
+function cloneJsonValue(value) {
+  if (value == null) return value;
+
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (error) {
+    console.warn('[TistoryAuto BG] JSON clone 실패:', error);
+    return null;
+  }
+}
+
+function normalizeDirectPublishRequestData(requestData = {}) {
+  const cloned = cloneJsonValue(requestData) || {};
+
+  if (!Array.isArray(cloned.tags)) {
+    cloned.tags = [];
+  }
+
+  if (!Array.isArray(cloned.images)) {
+    cloned.images = [];
+  }
+
+  return cloned;
+}
+
+function stripHtmlTags(value = '') {
+  return String(value || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildExpectedDraftShape(requestData = {}) {
+  const normalized = normalizeDirectPublishRequestData(requestData);
+  const tags = normalized.tags
+    .map(tag => String(tag || '').trim())
+    .filter(Boolean);
+  const images = normalized.images.filter(Boolean);
+
+  return {
+    ...normalized,
+    title: String(normalized.title || '').trim(),
+    content: String(normalized.content || ''),
+    category: normalized.category ? String(normalized.category).trim() : '',
+    tags,
+    images,
+    contentTextLength: stripHtmlTags(normalized.content || '').length
+  };
+}
+
+function buildDraftRestorePlan(snapshot = {}, requestData = {}) {
+  const expected = buildExpectedDraftShape(requestData);
+  const tagsLower = new Set((snapshot.tags || []).map(tag => String(tag || '').trim().toLowerCase()).filter(Boolean));
+  const missing = [];
+  const steps = [];
+
+  if (expected.title && (!snapshot.title || snapshot.title !== expected.title)) {
+    missing.push('title');
+    steps.push('SET_TITLE');
+  }
+
+  if (expected.category && (!snapshot.currentCategory || snapshot.currentCategory !== expected.category)) {
+    missing.push('category');
+    steps.push('SET_CATEGORY');
+  }
+
+  if (expected.content) {
+    const snapshotHtmlLength = Number(snapshot.contentHtmlLength) || 0;
+    const snapshotTextLength = Number(snapshot.contentTextLength) || 0;
+    const expectedHtmlLength = expected.content.trim().length;
+    const expectedTextLength = expected.contentTextLength;
+    const htmlTooShort = expectedHtmlLength > 0 && snapshotHtmlLength < Math.min(80, expectedHtmlLength);
+    const textTooShort = expectedTextLength > 0 && snapshotTextLength < Math.min(40, expectedTextLength);
+
+    if (htmlTooShort || textTooShort) {
+      missing.push('content');
+      steps.push('SET_CONTENT');
+    }
+  }
+
+  if (expected.images.length > 0 && (Number(snapshot.imageCount) || 0) < expected.images.length) {
+    missing.push('images');
+    steps.push('INSERT_IMAGES');
+  }
+
+  if (expected.tags.length > 0 && (!snapshot.tags?.length || expected.tags.some(tag => !tagsLower.has(tag.toLowerCase())))) {
+    missing.push('tags');
+    steps.push('SET_TAGS');
+  }
+
+  return {
+    expected,
+    missing,
+    steps: [...new Set(steps)],
+    needsRestore: missing.length > 0
+  };
+}
+
+async function sendEditorMessage(tabId, action, data = {}) {
+  await ensurePageWorldVisibilityInterceptor(tabId);
+  return await chrome.tabs.sendMessage(tabId, { action, data });
+}
+
+async function getDraftSnapshotForTab(tabId) {
+  if (!tabId) {
+    return { success: false, status: 'editor_not_ready', error: 'draft snapshot을 읽을 탭 ID가 없습니다.' };
+  }
+
+  try {
+    const response = await sendEditorMessage(tabId, 'GET_DRAFT_SNAPSHOT');
+    return { ...response, tabId };
+  } catch (error) {
+    return { success: false, status: 'editor_not_ready', error: error.message, tabId };
+  }
+}
+
+async function restoreDraftIfNeeded(tabId, requestData = {}) {
+  const plan = buildExpectedDraftShape(requestData);
+  const hasAnyDraftPayload = !!(plan.title || plan.content || plan.category || plan.tags.length || plan.images.length);
+  if (!hasAnyDraftPayload) {
+    return {
+      success: true,
+      skipped: true,
+      reason: 'no_request_data'
+    };
+  }
+
+  const beforeSnapshot = await getDraftSnapshotForTab(tabId);
+  if (!beforeSnapshot.success) {
+    return {
+      ...beforeSnapshot,
+      status: beforeSnapshot.status || 'editor_not_ready'
+    };
+  }
+
+  const restorePlan = buildDraftRestorePlan(beforeSnapshot.snapshot, plan);
+  if (!restorePlan.needsRestore) {
+    return {
+      success: true,
+      restored: false,
+      snapshot: beforeSnapshot.snapshot,
+      missing: []
+    };
+  }
+
+  const stepResults = {};
+
+  for (const step of restorePlan.steps) {
+    switch (step) {
+      case 'SET_TITLE':
+        stepResults.title = await sendEditorMessage(tabId, 'SET_TITLE', { title: restorePlan.expected.title });
+        break;
+      case 'SET_CATEGORY':
+        stepResults.category = await sendEditorMessage(tabId, 'SET_CATEGORY', { category: restorePlan.expected.category });
+        break;
+      case 'SET_CONTENT':
+        stepResults.content = await sendEditorMessage(tabId, 'SET_CONTENT', { content: restorePlan.expected.content });
+        break;
+      case 'INSERT_IMAGES':
+        stepResults.images = await sendEditorMessage(tabId, 'INSERT_IMAGES', { images: restorePlan.expected.images });
+        break;
+      case 'SET_TAGS':
+        stepResults.tags = await sendEditorMessage(tabId, 'SET_TAGS', { tags: restorePlan.expected.tags });
+        break;
+      default:
+        break;
+    }
+
+    const latestResult = Object.values(stepResults).slice(-1)[0];
+    if (latestResult && !latestResult.success) {
+      return {
+        success: false,
+        status: latestResult.status || 'draft_restore_failed',
+        error: latestResult.error || `${step} 실패`,
+        stepResults,
+        missing: restorePlan.missing,
+        snapshot: beforeSnapshot.snapshot
+      };
+    }
+  }
+
+  const afterSnapshot = await getDraftSnapshotForTab(tabId);
+  if (!afterSnapshot.success) {
+    return {
+      ...afterSnapshot,
+      status: afterSnapshot.status || 'editor_not_ready',
+      stepResults
+    };
+  }
+
+  const afterPlan = buildDraftRestorePlan(afterSnapshot.snapshot, plan);
+  if (afterPlan.needsRestore) {
+    return {
+      success: false,
+      status: 'draft_restore_failed',
+      error: `발행 재개 전 초안 복구가 충분하지 않습니다: ${afterPlan.missing.join(', ')}`,
+      stepResults,
+      missing: afterPlan.missing,
+      snapshot: afterSnapshot.snapshot
+    };
+  }
+
+  return {
+    success: true,
+    restored: true,
+    stepResults,
+    snapshot: afterSnapshot.snapshot,
+    missing: []
+  };
+}
+
 function buildDirectPublishState({ response, preparation, requestData = {}, captchaContext = null }) {
   return {
     tabId: response?.tabId ?? preparation?.tabId ?? null,
@@ -154,7 +390,8 @@ function buildDirectPublishState({ response, preparation, requestData = {}, capt
     detectedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     diagnostics: preparation?.diagnostics || null,
-    captchaContext: captchaContext || null
+    captchaContext: captchaContext || null,
+    requestData: normalizeDirectPublishRequestData(requestData)
   };
 }
 
@@ -365,12 +602,22 @@ async function buildPreparationFromPreferredTab(tabId, requestData = {}) {
 }
 
 async function resumeDirectPublishFlow(requestData = {}, options = {}) {
-  let preparation = await buildPreparationFromPreferredTab(options.preferredTabId || null, requestData);
+  const liveState = await getLiveDirectPublishState();
+  const mergedRequestData = {
+    ...(liveState?.requestData || {}),
+    ...(directPublishState?.requestData || {}),
+    ...normalizeDirectPublishRequestData(requestData)
+  };
+
+  mergedRequestData.blogName = mergedRequestData.blogName || liveState?.blogName || directPublishState?.blogName || null;
+  mergedRequestData.visibility = mergedRequestData.visibility || liveState?.visibility || directPublishState?.visibility || null;
+
+  let preparation = await buildPreparationFromPreferredTab(options.preferredTabId || null, mergedRequestData);
   if (!preparation) {
-    preparation = await buildPreparationFromDirectPublishState({ blogName: requestData.blogName || null });
+    preparation = await buildPreparationFromDirectPublishState({ blogName: mergedRequestData.blogName || null });
   }
   if (!preparation) {
-    preparation = await prepareEditorTab({ blogName: requestData.blogName || directPublishState?.blogName || null });
+    preparation = await prepareEditorTab({ blogName: mergedRequestData.blogName || directPublishState?.blogName || null });
   }
   if (!preparation.success) {
     return attachDirectPublishState(preparation);
@@ -380,19 +627,19 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
     const captchaCheck = await chrome.tabs.sendMessage(preparation.tabId, { action: 'CHECK_CAPTCHA' });
     if (captchaCheck?.captchaPresent) {
       const captchaContextResult = await getCaptchaContextForTab(preparation.tabId);
-      const liveState = await getLiveDirectPublishState();
       const nextState = liveState || buildDirectPublishState({
         response: { ...captchaCheck, status: 'captcha_required', tabId: preparation.tabId },
         preparation,
-        requestData,
+        requestData: mergedRequestData,
         captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
       });
       await setDirectPublishState({
         ...nextState,
         tabId: preparation.tabId,
-        blogName: requestData.blogName || nextState.blogName || preparation.blogName,
+        blogName: mergedRequestData.blogName || nextState.blogName || preparation.blogName,
         url: preparation.url || nextState.url,
         status: 'captcha_required',
+        requestData: normalizeDirectPublishRequestData(mergedRequestData),
         captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
       });
       return attachDirectPublishState(withPreparationDetails({
@@ -403,13 +650,47 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
     }
   } catch (e) { /* 진행 */ }
 
-  try {
-    await ensurePageWorldVisibilityInterceptor(preparation.tabId);
-    const response = await chrome.tabs.sendMessage(preparation.tabId, {
-      action: 'RESUME_PUBLISH',
-      data: { visibility: requestData.visibility || directPublishState?.visibility || 'public' }
+  const draftRestore = await restoreDraftIfNeeded(preparation.tabId, mergedRequestData);
+  if (!draftRestore.success) {
+    await updateDirectPublishState({
+      tabId: preparation.tabId,
+      url: preparation.url,
+      requestData: normalizeDirectPublishRequestData(mergedRequestData),
+      lastDraftRestore: {
+        success: false,
+        status: draftRestore.status || 'draft_restore_failed',
+        error: draftRestore.error || null,
+        missing: draftRestore.missing || [],
+        checkedAt: new Date().toISOString()
+      }
     });
-    const responseWithPreparation = withPreparationDetails(response, preparation);
+
+    return attachDirectPublishState(withPreparationDetails({
+      success: false,
+      status: draftRestore.status || 'draft_restore_failed',
+      error: draftRestore.error || '발행 재개 전 초안 복구에 실패했습니다.',
+      draftRestore
+    }, preparation));
+  }
+
+  await updateDirectPublishState({
+    tabId: preparation.tabId,
+    url: preparation.url,
+    requestData: normalizeDirectPublishRequestData(mergedRequestData),
+    lastDraftRestore: {
+      success: true,
+      restored: !!draftRestore.restored,
+      missing: [],
+      checkedAt: new Date().toISOString(),
+      snapshot: draftRestore.snapshot || null
+    }
+  });
+
+  try {
+    const response = await sendEditorMessage(preparation.tabId, 'RESUME_PUBLISH', {
+      visibility: mergedRequestData.visibility || directPublishState?.visibility || 'public'
+    });
+    const responseWithPreparation = normalizePublishResponse(withPreparationDetails(response, preparation));
 
     if (responseWithPreparation.success) {
       await clearDirectPublishState();
@@ -422,13 +703,22 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
         response: responseWithPreparation,
         preparation,
         requestData: {
-          ...requestData,
-          blogName: requestData.blogName || directPublishState?.blogName || preparation.blogName,
-          visibility: requestData.visibility || directPublishState?.visibility || null
+          ...mergedRequestData,
+          blogName: mergedRequestData.blogName || directPublishState?.blogName || preparation.blogName,
+          visibility: mergedRequestData.visibility || directPublishState?.visibility || null
         },
         captchaContext: captchaContextResult.success ? captchaContextResult.captchaContext : captchaContextResult
       });
-      await setDirectPublishState(directState);
+      await setDirectPublishState({
+        ...directState,
+        lastDraftRestore: {
+          success: true,
+          restored: !!draftRestore.restored,
+          missing: [],
+          checkedAt: new Date().toISOString(),
+          snapshot: draftRestore.snapshot || null
+        }
+      });
       return attachDirectPublishState(responseWithPreparation, directState);
     }
 
@@ -890,7 +1180,7 @@ async function processNextInQueue() {
         action: 'WRITE_POST',
         data: { ...item.data, autoPublish: true }
       });
-      const responseWithPreparation = withPreparationDetails(response, preparation);
+      const responseWithPreparation = normalizePublishResponse(withPreparationDetails(response, preparation));
 
       if (responseWithPreparation.success) {
         item.status = 'completed';
@@ -973,10 +1263,14 @@ function installPageWorldPostInterceptor() {
       challengeCode: null,
       source: null,
       updatedAt: null
-    }
+    },
+    managePostSequence: 0,
+    lastManagePostDiag: null
   });
 
   const MANAGE_POST_LOG_KEY = '__blog_auto_last_manage_post_diag';
+  const MANAGE_POST_DIAG_ATTR = 'data-blog-auto-last-manage-post-diag';
+  const MANAGE_POST_SEQ_ATTR = 'data-blog-auto-last-manage-post-seq';
   const CAPTCHA_PAYLOAD_LOG_KEY = '__blog_auto_last_captcha_payload';
   const CAPTCHA_KEY_RE = /(recaptchaValue|g-recaptcha-response|challengeCode)/i;
 
@@ -987,6 +1281,93 @@ function installPageWorldPostInterceptor() {
     const text = typeof value === 'string' ? value : String(value);
     const trimmed = text.trim();
     return trimmed || null;
+  };
+
+  const stripHtml = (value = '') => String(value || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const readStringByKey = (value, matcher, depth = 0) => {
+    if (value == null || depth > 4) return null;
+
+    if (typeof value === 'string') return null;
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const nested = readStringByKey(item, matcher, depth + 1);
+        if (nested) return nested;
+      }
+      return null;
+    }
+
+    if (typeof value !== 'object') return null;
+
+    for (const [key, nestedValue] of Object.entries(value)) {
+      if (!key) continue;
+      if (matcher.test(key) && typeof nestedValue === 'string' && normalizeText(nestedValue)) {
+        return nestedValue;
+      }
+    }
+
+    for (const nestedValue of Object.values(value)) {
+      const nested = readStringByKey(nestedValue, matcher, depth + 1);
+      if (nested) return nested;
+    }
+
+    return null;
+  };
+
+  const extractManagePostHtml = (payload) => {
+    return readStringByKey(payload, /^(content|html|body|post|editorContent)$/i)
+      || readStringByKey(payload, /(content|html|body)/i)
+      || '';
+  };
+
+  const extractManagePostTitle = (payload) => {
+    return readStringByKey(payload, /^(title|subject)$/i)
+      || readStringByKey(payload, /(title|subject)/i)
+      || null;
+  };
+
+  const countMatches = (value, pattern) => (String(value || '').match(pattern) || []).length;
+
+  const persistRequestDiag = (diag) => {
+    pageState.lastManagePostDiag = diag;
+
+    try {
+      const serialized = JSON.stringify(diag);
+      localStorage.setItem(MANAGE_POST_LOG_KEY, serialized);
+      document.documentElement.setAttribute(MANAGE_POST_DIAG_ATTR, serialized);
+      document.documentElement.setAttribute(MANAGE_POST_SEQ_ATTR, String(diag.sequence || 0));
+    } catch (_) {}
+  };
+
+  const buildManagePostDiag = (payload, meta = {}) => {
+    const html = extractManagePostHtml(payload);
+    const text = stripHtml(html);
+    const sequence = (pageState.managePostSequence || 0) + 1;
+    pageState.managePostSequence = sequence;
+
+    return {
+      at: now(),
+      sequence,
+      url: meta.url || null,
+      method: meta.method || null,
+      changed: !!meta.changed,
+      visibility: payload?.visibility ?? null,
+      title: extractManagePostTitle(payload),
+      htmlLength: String(html || '').trim().length,
+      textLength: text.length,
+      imageCount: countMatches(html, /<img\b/gi),
+      dataImageCount: countMatches(html, /<img\b[^>]*src=["']data:image\//gi),
+      blobImageCount: countMatches(html, /<img\b[^>]*src=["']blob:/gi),
+      hasRecaptchaValue: !!normalizeText(payload?.recaptchaValue),
+      hasChallengeCode: !!normalizeText(payload?.challengeCode)
+    };
   };
 
   const normalizePayload = (payload) => {
@@ -1250,12 +1631,6 @@ function installPageWorldPostInterceptor() {
     return raw == null || raw === '' ? null : Number(raw);
   };
 
-  const persistRequestDiag = (diag) => {
-    try {
-      localStorage.setItem(MANAGE_POST_LOG_KEY, JSON.stringify(diag));
-    } catch (_) {}
-  };
-
   const rewritePayload = (payload) => {
     if (!payload || typeof payload !== 'object') return payload;
 
@@ -1281,11 +1656,7 @@ function installPageWorldPostInterceptor() {
     }
 
     const diag = {
-      at: now(),
-      changed,
-      visibility: nextPayload.visibility ?? null,
-      hasRecaptchaValue: !!normalizeText(nextPayload.recaptchaValue),
-      hasChallengeCode: !!normalizeText(nextPayload.challengeCode),
+      ...buildManagePostDiag(nextPayload, { changed }),
       captchaSource: captchaPayload?.source || null
     };
 
@@ -1653,7 +2024,7 @@ async function handleMessage(message, sender) {
       try {
         await ensurePageWorldVisibilityInterceptor(preparation.tabId);
         const response = await chrome.tabs.sendMessage(preparation.tabId, message);
-        const responseWithPreparation = withPreparationDetails(response, preparation);
+        const responseWithPreparation = normalizePublishResponse(withPreparationDetails(response, preparation));
 
         if (responseWithPreparation.status === 'captcha_required') {
           const captchaContextResult = await getCaptchaContextForTab(preparation.tabId);
@@ -1701,7 +2072,7 @@ async function handleMessage(message, sender) {
       try {
         await ensurePageWorldVisibilityInterceptor(preparation.tabId);
         const response = await chrome.tabs.sendMessage(preparation.tabId, message);
-        return withPreparationDetails(response, preparation);
+        return normalizePublishResponse(withPreparationDetails(response, preparation));
       } catch (err) {
         return makePreparationResponse({
           success: false,
@@ -1923,41 +2294,50 @@ async function handleMessage(message, sender) {
         }
       } catch (e) { /* 확인 실패 시 발행 시도 진행 */ }
 
-      // 발행 재시도 (에디터 내용은 이미 입력되어 있음 — RESUME_PUBLISH만 호출)
+      // 발행 재시도 전 초안 상태를 다시 점검/복구
       item.status = 'processing';
       await saveQueueState();
 
       try {
-        await ensurePageWorldVisibilityInterceptor(tabId);
-        const response = await chrome.tabs.sendMessage(tabId, {
-          action: 'RESUME_PUBLISH',
-          data: { visibility: item.data?.visibility || 'public' }
+        const draftRestore = await restoreDraftIfNeeded(tabId, item.data || {});
+        if (!draftRestore.success) {
+          item.status = 'failed';
+          item.error = draftRestore.error || '발행 재개 전 초안 복구 실패';
+          item.publishStatus = draftRestore.status || 'draft_restore_failed';
+          await saveQueueState();
+          isProcessing = false;
+          return draftRestore;
+        }
+
+        const response = await sendEditorMessage(tabId, 'RESUME_PUBLISH', {
+          visibility: item.data?.visibility || 'public'
         });
-        if (response.success) {
+        const normalizedResponse = normalizePublishResponse(response);
+        if (normalizedResponse.success) {
           item.status = 'completed';
           item.error = null;
           item.completedAt = new Date().toISOString();
-          item.publishStatus = response.status || 'published';
+          item.publishStatus = normalizedResponse.status || 'published';
           item.captchaTabId = null;
           await saveQueueState();
           isProcessing = false;
           // 다음 대기 항목 처리
           processNextInQueue();
-          return { success: true, status: 'published', url: response.url };
-        } else if (response.status === 'captcha_required') {
+          return { success: true, status: 'published', url: normalizedResponse.url };
+        } else if (normalizedResponse.status === 'captcha_required') {
           item.status = 'captcha_paused';
           item.error = 'CAPTCHA 재발생 — 다시 해결 후 Resume 클릭';
           item.captchaTabId = tabId;
           await saveQueueState();
           isProcessing = false;
-          return response;
+          return normalizedResponse;
         } else {
           item.status = 'failed';
-          item.error = response.error || '재개 후 발행 실패';
-          item.publishStatus = response.status;
+          item.error = normalizedResponse.error || '재개 후 발행 실패';
+          item.publishStatus = normalizedResponse.status;
           await saveQueueState();
           isProcessing = false;
-          return response;
+          return normalizedResponse;
         }
       } catch (e) {
         item.status = 'failed';

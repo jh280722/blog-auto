@@ -18,7 +18,10 @@ const EDITOR_PREPARE_DEFAULTS = {
   pingTimeoutMs: 1500,
   pingRetries: 5,
   pingIntervalMs: 800,
-  postLoadDelayMs: 700
+  postLoadDelayMs: 700,
+  editorProbeWaitMs: 1600,
+  editorProbeIntervalMs: 250,
+  editorProbeSettleDelayMs: 150
 };
 
 const DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS = {
@@ -1337,6 +1340,23 @@ async function sendTabMessageWithTimeout(tabId, message, timeoutMs = EDITOR_PREP
   }
 }
 
+async function probeContentScriptLiveness(tabId, timeoutMs = Math.min(EDITOR_PREPARE_DEFAULTS.pingTimeoutMs, 800)) {
+  try {
+    const response = await sendTabMessageWithTimeout(tabId, { action: 'PING' }, timeoutMs);
+    return {
+      success: !!response?.success,
+      response: response || null,
+      error: response?.success ? null : (response?.error || 'ping_failed')
+    };
+  } catch (error) {
+    return {
+      success: false,
+      response: null,
+      error: error?.message || 'ping_failed'
+    };
+  }
+}
+
 async function waitForTabLoadComplete(tabId, timeoutMs = EDITOR_PREPARE_DEFAULTS.loadTimeoutMs) {
   try {
     const existingTab = await chrome.tabs.get(tabId);
@@ -1386,22 +1406,71 @@ async function probeTabReady(tabId, diagnostics, step, options = {}) {
   const retries = options.pingRetries || EDITOR_PREPARE_DEFAULTS.pingRetries;
   const timeoutMs = options.pingTimeoutMs || EDITOR_PREPARE_DEFAULTS.pingTimeoutMs;
   const intervalMs = options.pingIntervalMs || EDITOR_PREPARE_DEFAULTS.pingIntervalMs;
+  const editorProbeWaitMs = options.editorProbeWaitMs || EDITOR_PREPARE_DEFAULTS.editorProbeWaitMs;
+  const editorProbeIntervalMs = options.editorProbeIntervalMs || EDITOR_PREPARE_DEFAULTS.editorProbeIntervalMs;
+  const editorProbeSettleDelayMs = options.editorProbeSettleDelayMs || EDITOR_PREPARE_DEFAULTS.editorProbeSettleDelayMs;
 
-  let lastError = 'ping_failed';
+  let lastError = 'editor_probe_failed';
+  let lastReason = null;
+  let lastDiagnostics = null;
 
   for (let attempt = 1; attempt <= retries; attempt += 1) {
     try {
-      const pingResult = await sendTabMessageWithTimeout(tabId, { action: 'PING' }, timeoutMs);
-      if (pingResult?.success) {
-        diagnostics.attempts.push({ step, tabId, attempt, outcome: 'ready' });
-        return { success: true, attempts: attempt };
+      const probeResult = await sendTabMessageWithTimeout(tabId, {
+        action: 'PROBE_EDITOR_READY',
+        data: {
+          timeoutMs: editorProbeWaitMs,
+          intervalMs: editorProbeIntervalMs,
+          settleDelayMs: editorProbeSettleDelayMs
+        }
+      }, timeoutMs + editorProbeWaitMs + 250);
+
+      if (probeResult?.success) {
+        diagnostics.attempts.push({
+          step,
+          tabId,
+          attempt,
+          outcome: 'ready',
+          waitedMs: probeResult.waitedMs ?? null,
+          pollCount: probeResult.pollCount ?? null,
+          editorProbe: probeResult.diagnostics || null
+        });
+        return { success: true, attempts: attempt, diagnostics: probeResult.diagnostics || null };
       }
 
-      lastError = pingResult?.error || 'unexpected_ping_response';
-      diagnostics.attempts.push({ step, tabId, attempt, outcome: 'not_ready', error: lastError });
+      lastError = probeResult?.error || 'editor_not_ready';
+      lastReason = probeResult?.reason || null;
+      lastDiagnostics = probeResult?.diagnostics || null;
+      const liveness = await probeContentScriptLiveness(tabId, timeoutMs);
+      diagnostics.attempts.push({
+        step,
+        tabId,
+        attempt,
+        outcome: 'not_ready',
+        error: lastError,
+        reason: lastReason,
+        waitedMs: probeResult?.waitedMs ?? null,
+        pollCount: probeResult?.pollCount ?? null,
+        contentScriptAlive: liveness.success,
+        pingError: liveness.error,
+        editorProbe: lastDiagnostics || liveness.response?.editorProbe || null
+      });
     } catch (error) {
-      lastError = error?.message || 'ping_failed';
-      diagnostics.attempts.push({ step, tabId, attempt, outcome: 'not_ready', error: lastError });
+      lastError = error?.message || 'editor_probe_failed';
+      const liveness = await probeContentScriptLiveness(tabId, timeoutMs);
+      lastReason = liveness.response?.editorProbe?.reason || null;
+      lastDiagnostics = liveness.response?.editorProbe || null;
+      diagnostics.attempts.push({
+        step,
+        tabId,
+        attempt,
+        outcome: 'not_ready',
+        error: lastError,
+        reason: lastReason,
+        contentScriptAlive: liveness.success,
+        pingError: liveness.error,
+        editorProbe: lastDiagnostics
+      });
     }
 
     if (attempt < retries) {
@@ -1409,7 +1478,12 @@ async function probeTabReady(tabId, diagnostics, step, options = {}) {
     }
   }
 
-  return { success: false, error: lastError };
+  return {
+    success: false,
+    error: lastError,
+    reason: lastReason,
+    diagnostics: lastDiagnostics
+  };
 }
 
 /**
@@ -2259,7 +2333,7 @@ async function prepareEditorTab(options = {}) {
   return makePreparationResponse({
     success: false,
     status: 'editor_not_ready',
-    error: '콘텐츠 스크립트가 준비된 티스토리 글쓰기 탭을 확보하지 못했습니다. diagnostics를 확인하세요.',
+    error: '실제 에디터 본문이 준비된 티스토리 글쓰기 탭을 확보하지 못했습니다. diagnostics를 확인하세요.',
     tab: freshTabResult.tab || lastFailure?.tab || null,
     blogName,
     diagnostics

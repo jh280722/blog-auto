@@ -637,6 +637,187 @@
     return null;
   }
 
+  function deriveEditorNotReadyReason(probe) {
+    if (!probe.isEditorPage) return 'not_editor_page';
+    if (probe.captchaPresent) return 'captcha_present';
+    if (probe.publishLayerPresent) return 'publish_layer_open';
+    if (!probe.titleInputPresent) return 'title_input_missing';
+    if (!probe.editorDocumentPresent) {
+      if (probe.editorIframePresent && !probe.editorIframeAccessible) return 'editor_iframe_inaccessible';
+      if (probe.editorIframePresent) return 'editor_iframe_loading';
+      if (probe.fallbackEditablePresent) return 'fallback_editor_not_ready';
+      return probe.documentReadyState !== 'complete' ? 'document_loading' : 'editor_document_missing';
+    }
+    if (!probe.editorBodyPresent) return 'editor_body_missing';
+    if (!probe.editorBodyContentEditable) return 'editor_body_not_editable';
+    if (probe.tinyMceActiveEditorPresent && !probe.tinyMceInitialized) return 'tinymce_not_initialized';
+    if (probe.tinyMceActiveEditorPresent && !probe.tinyMceBodyPresent) return 'tinymce_body_missing';
+    if (probe.documentReadyState !== 'complete') return 'document_loading';
+    return null;
+  }
+
+  function formatEditorNotReadyMessage(reason, probe) {
+    const messages = {
+      not_editor_page: '현재 탭이 티스토리 글쓰기 페이지가 아닙니다.',
+      captcha_present: '현재 탭에 CAPTCHA가 떠 있어 새 쓰기를 시작할 수 없습니다.',
+      publish_layer_open: '발행 레이어가 열린 상태라 새 쓰기를 시작할 수 없습니다.',
+      title_input_missing: '제목 입력란이 아직 준비되지 않았습니다.',
+      editor_iframe_inaccessible: '에디터 iframe에 접근할 수 없습니다.',
+      editor_iframe_loading: '에디터 iframe이 아직 로드되지 않았습니다.',
+      fallback_editor_not_ready: 'fallback contenteditable 에디터가 아직 준비되지 않았습니다.',
+      document_loading: '페이지 문서가 아직 완전히 로드되지 않았습니다.',
+      editor_document_missing: '에디터 document를 아직 찾지 못했습니다.',
+      editor_body_missing: '에디터 본문 영역을 아직 찾지 못했습니다.',
+      editor_body_not_editable: '에디터 본문이 아직 편집 가능한 상태가 아닙니다.',
+      tinymce_not_initialized: 'TinyMCE가 아직 초기화되지 않았습니다.',
+      tinymce_body_missing: 'TinyMCE body가 아직 연결되지 않았습니다.'
+    };
+
+    const base = messages[reason] || '실제 에디터가 아직 준비되지 않았습니다.';
+    const pageUrl = probe?.url ? ` (${probe.url})` : '';
+    return `${base}${pageUrl}`;
+  }
+
+  function getEditorReadinessProbe() {
+    const titleEl = findElement(S.title.input, S.title.fallback);
+    const editorIframe = document.querySelector(S.editor.iframe);
+    let editorIframeAccessible = false;
+    let editorIframeReadyState = null;
+    let editorIframeBody = null;
+
+    if (editorIframe) {
+      try {
+        const iframeDoc = editorIframe.contentDocument || editorIframe.contentWindow?.document || null;
+        editorIframeAccessible = !!iframeDoc;
+        editorIframeReadyState = iframeDoc?.readyState || null;
+        editorIframeBody = iframeDoc ? getEditorBody(iframeDoc) : null;
+      } catch (error) {
+        editorIframeAccessible = false;
+        editorIframeReadyState = error?.name || 'iframe_access_failed';
+      }
+    }
+
+    const editorDoc = getEditorDocument();
+    const editorBody = editorDoc ? getEditorBody(editorDoc) : null;
+    const fallbackEditable = document.querySelector(S.editor.fallback);
+    const tinyEditor = getTinyMCEEditor();
+    let tinyMceInitialized = false;
+    let tinyMceBody = null;
+
+    if (tinyEditor) {
+      try {
+        tinyMceInitialized = tinyEditor.initialized !== false;
+      } catch (_) {
+        tinyMceInitialized = true;
+      }
+
+      try {
+        tinyMceBody = typeof tinyEditor.getBody === 'function' ? tinyEditor.getBody() : null;
+      } catch (_) {
+        tinyMceBody = null;
+      }
+    }
+
+    const editorBodyContentEditable = !!(editorBody && (
+      editorBody.isContentEditable
+      || editorBody.getAttribute('contenteditable') === 'true'
+      || editorBody.id === 'tinymce'
+      || editorBody.classList?.contains('mce-content-body')
+    ));
+
+    const probe = {
+      url: window.location.href,
+      title: document.title,
+      documentReadyState: document.readyState,
+      isNewPost: window.location.pathname.includes(S.page.newPost),
+      isEditPost: window.location.pathname.includes(S.page.editPost),
+      isEditorPage: window.location.pathname.includes(S.page.newPost) || window.location.pathname.includes(S.page.editPost),
+      titleInputPresent: !!titleEl,
+      editorIframePresent: !!editorIframe,
+      editorIframeAccessible,
+      editorIframeReadyState,
+      editorIframeBodyPresent: !!editorIframeBody,
+      editorDocumentPresent: !!editorDoc,
+      editorDocumentReadyState: editorDoc?.readyState || null,
+      editorBodyPresent: !!editorBody,
+      editorBodyTagName: editorBody?.tagName?.toLowerCase() || null,
+      editorBodyId: editorBody?.id || null,
+      editorBodyContentEditable,
+      fallbackEditablePresent: !!fallbackEditable,
+      fallbackEditableVisible: !!(fallbackEditable && isVisibleElement(fallbackEditable)),
+      tinyMcePresent: !!window.tinymce,
+      tinyMceEditorCount: Array.isArray(window.tinymce?.editors) ? window.tinymce.editors.length : 0,
+      tinyMceActiveEditorPresent: !!tinyEditor,
+      tinyMceInitialized,
+      tinyMceBodyPresent: !!tinyMceBody,
+      tinyMceBodyEditable: !!(tinyMceBody && (
+        tinyMceBody.isContentEditable
+        || tinyMceBody.getAttribute('contenteditable') === 'true'
+      )),
+      publishLayerPresent: !!getVisiblePublishLayer(),
+      confirmButtonPresent: !!getConfirmButton(),
+      captchaPresent: detectCaptcha()
+    };
+
+    probe.ready = !!(
+      probe.isEditorPage
+      && probe.titleInputPresent
+      && probe.editorDocumentPresent
+      && probe.editorBodyPresent
+      && probe.editorBodyContentEditable
+      && (!probe.tinyMceActiveEditorPresent || (probe.tinyMceInitialized && probe.tinyMceBodyPresent))
+      && !probe.publishLayerPresent
+      && !probe.captchaPresent
+    );
+    probe.reason = probe.ready ? null : deriveEditorNotReadyReason(probe);
+    probe.reasonMessage = probe.ready ? null : formatEditorNotReadyMessage(probe.reason, probe);
+
+    return probe;
+  }
+
+  async function waitForEditorReady(options = {}) {
+    const timeoutMs = Math.max(0, Number(options.timeoutMs) || 0);
+    const intervalMs = Math.max(100, Number(options.intervalMs) || 250);
+    const settleDelayMs = Math.max(0, Number(options.settleDelayMs) || 0);
+    const startedAt = Date.now();
+    let pollCount = 0;
+    let probe = getEditorReadinessProbe();
+    pollCount += 1;
+
+    while (!probe.ready && Date.now() - startedAt < timeoutMs) {
+      await delay(intervalMs);
+      probe = getEditorReadinessProbe();
+      pollCount += 1;
+    }
+
+    if (probe.ready && settleDelayMs > 0) {
+      await delay(settleDelayMs);
+      probe = getEditorReadinessProbe();
+      pollCount += 1;
+    }
+
+    const waitedMs = Date.now() - startedAt;
+    if (probe.ready) {
+      return {
+        success: true,
+        status: 'editor_ready',
+        waitedMs,
+        pollCount,
+        diagnostics: probe
+      };
+    }
+
+    return {
+      success: false,
+      status: 'editor_not_ready',
+      error: probe.reasonMessage || formatEditorNotReadyMessage(probe.reason, probe),
+      reason: probe.reason,
+      waitedMs,
+      pollCount,
+      diagnostics: probe
+    };
+  }
+
   /**
    * 본문 입력 (HTML) — TinyMCE API 우선, DOM fallback
    * TinyMCE setContent + save를 사용하여 내부 textarea 동기화 보장
@@ -2315,6 +2496,27 @@
    */
   async function writePost(postData) {
     const results = {};
+    const writePreflight = await waitForEditorReady({
+      timeoutMs: 4000,
+      intervalMs: 250,
+      settleDelayMs: 150
+    });
+
+    if (!writePreflight.success) {
+      return {
+        success: false,
+        status: writePreflight.status,
+        error: writePreflight.error,
+        results,
+        preflight: {
+          reason: writePreflight.reason,
+          waitedMs: writePreflight.waitedMs,
+          pollCount: writePreflight.pollCount,
+          diagnostics: writePreflight.diagnostics
+        },
+        message: '실제 에디터가 준비되지 않아 제목 입력 전에 쓰기를 중단했습니다.'
+      };
+    }
 
     // 1. 제목
     if (postData.title) {
@@ -2428,6 +2630,7 @@
     const titleEl = findElement(S.title.input, S.title.fallback);
     const title = titleEl?.value?.trim() || titleEl?.textContent?.trim() || '';
     const editor = getTinyMCEEditor();
+    const editorProbe = getEditorReadinessProbe();
     let contentHtml = '';
     let contentText = '';
 
@@ -2467,7 +2670,8 @@
       contentTextLength: normalizedText.length,
       contentPreview: normalizedText.slice(0, 160),
       imageCount: (contentHtml.match(/<img\b/gi) || []).length,
-      editorReady: !!getEditorDocument()
+      editorReady: editorProbe.ready,
+      editorProbe
     };
   }
 
@@ -2476,6 +2680,7 @@
    */
   function getPageInfo() {
     const categoryBtn = findElement(S.category.button, null);
+    const editorProbe = getEditorReadinessProbe();
 
     // 카테고리 버튼 클릭해서 목록 가져오기
     const categories = [];
@@ -2492,7 +2697,8 @@
       isEditPost: window.location.pathname.includes(S.page.editPost),
       currentCategory: categoryBtn?.textContent?.trim() || '',
       availableCategories: categories,
-      editorReady: !!getEditorDocument()
+      editorReady: editorProbe.ready,
+      editorProbe
     };
   }
 
@@ -2552,8 +2758,19 @@
         case 'GET_DRAFT_SNAPSHOT':
           return getDraftSnapshot();
 
+        case 'PROBE_EDITOR_READY':
+          return await waitForEditorReady(message.data || {});
+
         case 'PING':
-          return { success: true, message: 'Content script is alive' };
+          {
+            const editorProbe = getEditorReadinessProbe();
+            return {
+              success: true,
+              message: 'Content script is alive',
+              editorReady: editorProbe.ready,
+              editorProbe
+            };
+          }
 
         default:
           return { success: false, error: `알 수 없는 액션: ${message.action}` };

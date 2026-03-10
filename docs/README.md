@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.7.3**
+> 현재 운영 기준: **v1.7.4**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -14,7 +14,8 @@
 > - **CAPTCHA answer submit API (same blocked tab에 답안 입력 + 확인 버튼 클릭)**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`로 same-tab CAPTCHA 제출 + 즉시 발행 재개 일원화**
 > - **`RESUME_DIRECT_PUBLISH(waitForCaptcha)`로 browser/CDP same-tab 풀이 완료까지 대기 후 즉시 재개**
-> - stale tab 회피 + live content script 확인
+> - **stale tab 회피 + 실제 editor body readiness gate**
+> - **`WRITE_POST` 시작 전 final preflight로 title-only draft fail-closed**
 > - 자동저장 복구 팝업 자동 dismiss
 > - **비공개 발행 visibility 강제 보정(MAIN world XHR/fetch interceptor)**
 
@@ -31,6 +32,8 @@
 - **CAPTCHA submit API**: 에이전트가 blocked tab에 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음
 - **CAPTCHA submit+resume API**: `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭 답안 제출과 직접 발행 재개를 한 번에 처리
 - **browser handoff wait-resume**: `RESUME_DIRECT_PUBLISH`가 same-tab browser/CDP 풀이가 끝날 때까지 내부 polling 후 즉시 발행 재개 가능
+- **실제 에디터 준비 probe**: `PREPARE_EDITOR`가 content script alive만 보지 않고 TinyMCE body / contenteditable / publish layer / CAPTCHA 상태까지 확인
+- **fail-closed 쓰기 preflight**: `WRITE_POST`는 title/category 쓰기 전에 실제 editor body를 다시 확인하고, 미준비면 `editor_not_ready` + `preflight`로 즉시 중단
 - **재개 전 draft self-heal**: CAPTCHA 후 재개 전에 제목/본문/카테고리/이미지/태그 스냅샷을 확인하고, 비어 있으면 같은 탭에서 자동 복구 후 발행
 - **CAPTCHA 핸드오프**: DKAPTCHA 감지 시 자동 일시정지 → 같은 탭에서 해결 → 원클릭 재개
 
@@ -135,7 +138,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 - `captcha_browser_handoff_required` 또는 `preferredSolveMode: "browser_handoff"`면 cross-origin iframe이므로 같은 탭에서 browser/CDP로 직접 풀이하고 **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`** 로 자동 재개 대기를 거는 것이 권장
 - 구버전/디버그 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH` 분리 호출
 - 브라우저 시작 직후/오래된 티스토리 탭 사용 시: 먼저 `PREPARE_EDITOR`
-- `editor_not_ready` 발생 시: `diagnostics` 확인 후 `PREPARE_EDITOR` 재호출
+- `editor_not_ready` 발생 시: `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight`를 보고 `PREPARE_EDITOR` 재호출
 
 ```javascript
 const EXTENSION_ID = "your-extension-id";
@@ -172,7 +175,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
     }, (state) => console.log('blocked tab state', state));
   }
   if (response.status === 'editor_not_ready') {
-    console.log(response.diagnostics);
+    console.log(response.preflight || response.diagnostics);
   }
   console.log(response);
 });
@@ -222,7 +225,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 7. `preferredSolveMode === "browser_handoff"` 또는 `captcha_browser_handoff_required`면 same-tab browser/CDP 풀이와 함께 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`를 호출해 CAPTCHA 해제 직후 자동 재개
 8. 재개 단계는 저장된 `requestData`를 기준으로 draft snapshot을 검사하고, 제목/본문/이미지가 비어 있으면 먼저 복구합니다. 복구가 충분하지 않으면 `draft_restore_failed`로 fail-closed 합니다.
 9. 응답이 `captcha_still_present`면 새 답안/새 artifact로 같은 액션 재시도
-10. `editor_not_ready`면 `diagnostics.attempts`를 보고 `PREPARE_EDITOR` 재호출
+10. `editor_not_ready`면 `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight.reason`을 보고 `PREPARE_EDITOR` 재호출
 
 ---
 
@@ -261,20 +264,20 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 
 ---
 
-## 발행 상태 코드 (v1.7.3)
+## 발행 상태 코드 (v1.7.4)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 
 | 상태 | 설명 | 다음 액션 |
 |------|------|-----------|
-| `editor_ready` | `PREPARE_EDITOR`가 사용 가능한 에디터 탭 확보 완료 | `WRITE_POST` 호출 |
+| `editor_ready` | `PREPARE_EDITOR`가 실제 TinyMCE/editor body까지 준비된 탭 확보 완료 | `WRITE_POST` 호출 |
 | `blog_not_configured` | 자동으로 열 블로그명을 알 수 없음 | 설정 저장 또는 `data.blogName` 전달 |
 | `published` | 발행 성공 | — |
 | `captcha_required` | CAPTCHA 감지됨 (직접 발행) | 응답의 `captchaArtifacts` 우선 확인 → DOM형이면 `SUBMIT_CAPTCHA_AND_RESUME`, iframe형이면 browser/CDP 풀이와 함께 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })` |
 | `captcha_browser_handoff_required` | cross-origin iframe CAPTCHA라 확장 내부 DOM 제출 불가 | 같은 탭에서 browser/CDP로 풀이하고 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`로 자동 재개 대기 |
 | `captcha_wait_timeout` | `RESUME_DIRECT_PUBLISH(waitForCaptcha)` 대기 시간이 초과됨 | 같은 탭 solve 진행 상태 확인 후 재시도 또는 `waitTimeoutMs` 증가 |
 | `captcha_paused` | 큐 항목 CAPTCHA 일시정지 | 해결 후 `RESUME_AFTER_CAPTCHA` |
-| `editor_not_ready` | 에디터 탭 확보/복구 실패 | `diagnostics` 확인 후 `PREPARE_EDITOR` 재호출 |
+| `editor_not_ready` | 실제 editor body 준비/복구 실패 또는 `WRITE_POST` preflight 실패 | `diagnostics`/`preflight` 확인 후 `PREPARE_EDITOR` 재호출 |
 | `item_not_found` | 재개할 큐 항목 없음 | 큐 확인 |
 | `content_empty` | 본문 비어있거나 에디터 미반영 | 본문 확인 후 재시도 |
 | `draft_restore_failed` | CAPTCHA 재개 직전 draft 복구가 충분하지 않음 | blank post 방지를 위해 재발행 중단 — `draftRestore`/snapshot 확인 |
@@ -334,10 +337,23 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 {
   success: false,
   status: "editor_not_ready",
-  error: "콘텐츠 스크립트가 준비된 티스토리 글쓰기 탭을 확보하지 못했습니다. diagnostics를 확인하세요.",
+  error: "실제 에디터 본문이 준비된 티스토리 글쓰기 탭을 확보하지 못했습니다. diagnostics를 확인하세요.",
   diagnostics: {
     attempts: [
-      { step: "probe_existing", outcome: "not_ready", error: "ping_timeout" },
+      {
+        step: "probe_existing",
+        outcome: "not_ready",
+        error: "에디터 본문 영역을 아직 찾지 못했습니다. (https://your-blog.tistory.com/manage/newpost)",
+        reason: "editor_body_missing",
+        contentScriptAlive: true,
+        editorProbe: {
+          titleInputPresent: true,
+          editorIframePresent: true,
+          editorBodyPresent: false,
+          captchaPresent: false,
+          publishLayerPresent: false
+        }
+      },
       { step: "navigate_candidate", toUrl: "https://your-blog.tistory.com/manage/newpost" },
       { step: "open_fresh_tab", toUrl: "https://your-blog.tistory.com/manage/newpost" }
     ]
@@ -357,16 +373,25 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - `currentTabId`: 준비 시작 시점의 추적 탭
 - `candidateCount`: 검사한 `/manage/*` 탭 수
 - `attempts[]`: 준비 단계 로그
+- `attempts[].contentScriptAlive`: probe 실패 시 content script liveness
+- `attempts[].reason`: 마지막 editor readiness 실패 reason
+- `attempts[].editorProbe`: 마지막 실제 editor probe 요약 (title / iframe / body / TinyMCE / CAPTCHA / publish layer)
 
 자주 보게 될 `attempts[].step` 값:
 
 - `inspect_candidate`: 후보 탭 점검 시작
-- `probe_existing`: 현재 탭에 `PING` 재시도
+- `probe_existing`: 현재 탭에 실제 editor readiness probe 재시도
 - `reload_candidate` / `navigate_candidate`: stale 탭을 `/manage/newpost`로 복구
 - `probe_after_navigation`: 복구 후 재프로브
 - `open_fresh_tab`: 새 글쓰기 탭 오픈
 - `probe_fresh_tab`: 새 탭 준비 확인
 - `skip_candidate`: 다른 블로그 탭이라 건너뜀
+
+`WRITE_POST`가 제목 입력 전에 막히면 top-level `preflight`가 같이 옵니다.
+
+- `preflight.reason`: fail-closed 원인 (`editor_body_missing`, `tinymce_body_missing`, `captcha_present` 등)
+- `preflight.waitedMs` / `pollCount`: 쓰기 직전 대기 시간
+- `preflight.diagnostics`: 마지막 실제 editor probe 상세
 
 ---
 
@@ -445,5 +470,5 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - **CAPTCHA 중 탭 닫힘**: 같은 탭이 살아 있으면 재개 전에 draft self-heal을 시도하지만, 탭을 닫아버리면 저장되지 않은 내용은 복구 불가합니다.
 - **셀렉터 변경**: 티스토리 에디터 업데이트 시 `content/selectors.js` 수정이 필요할 수 있습니다.
 - **자동 판독은 외부 책임**: 확장 프로그램은 `GET_CAPTCHA_ARTIFACTS`/`captchaArtifacts`로 이미지 아티팩트를 제공하고 same-tab 재개까지 맡지만, 실제 OCR/비전 판독은 외부 에이전트/서비스가 수행해야 합니다.
-- **cross-origin iframe 입력은 browser/CDP handoff가 필요할 수 있음**: v1.7.3은 이를 `captcha_browser_handoff_required`와 `preferredSolveMode: "browser_handoff"`로 명확히 surface 하며, `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`로 solve 완료 직후 재개까지 이어질 수 있지만 실제 iframe 내부 입력은 외부 에이전트가 같은 탭에서 수행해야 합니다.
+- **cross-origin iframe 입력은 browser/CDP handoff가 필요할 수 있음**: v1.7.4도 이를 `captcha_browser_handoff_required`와 `preferredSolveMode: "browser_handoff"`로 명확히 surface 하며, `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`로 solve 완료 직후 재개까지 이어질 수 있지만 실제 iframe 내부 입력은 외부 에이전트가 같은 탭에서 수행해야 합니다.
 - **viewport crop는 Chrome capture 권한 상태에 영향받을 수 있음**: 이 경우에도 Tistory DKAPTCHA가 실제 이미지 요소면 `artifacts.directImage`가 남을 수 있습니다.

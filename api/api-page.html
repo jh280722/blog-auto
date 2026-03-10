@@ -239,6 +239,8 @@
             </div>
             <div class="tip">
                 권장 순서: <strong>PREPARE_EDITOR → WRITE_POST</strong><br>
+                `PREPARE_EDITOR`는 이제 content script alive만 보지 않고 <strong>실제 editor body/TinyMCE/contenteditable</strong>까지 확인합니다.
+                `editor_not_ready`가 오면 <strong>`diagnostics.attempts[].editorProbe`</strong>와 <strong>`contentScriptAlive`</strong>, 그리고 `WRITE_POST` 실패 시 <strong>`preflight.reason`</strong>을 먼저 확인하세요.<br>
                 `captcha_required`가 오면 먼저 응답의 <strong>`captchaArtifacts`</strong>를 확인하고, 필요하면 <strong>DIRECT STATE / CAPTCHA ARTIFACTS</strong>로 막힌 탭과 캡차 이미지를 다시 가져오세요.
                 OCR/비전으로 답안을 구하고 <strong>`SUBMIT_CAPTCHA_AND_RESUME`를 우선</strong> 호출하세요. iframe-only CAPTCHA라면 browser/CDP로 같은 탭에서 직접 풀고 <strong>`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`</strong>로 자동 재개 대기를 거는 것이 권장됩니다.
                 구버전 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH`를 따로 사용하세요.
@@ -317,7 +319,7 @@
             <div class="code-block">
                 <span class="key">const</span> EXTENSION_ID = <span class="str">"YOUR_EXTENSION_ID"</span>;
 
-                <span class="key">// 1) 에디터 준비</span>
+                <span class="key">// 1) 에디터 준비 (실제 editor body 준비까지 확인)</span>
                 chrome.runtime.sendMessage(EXTENSION_ID, {
                 <span class="key">action</span>: <span class="str">"PREPARE_EDITOR"</span>,
                 <span class="key">data</span>: { <span class="key">blogName</span>: <span class="str">"your-blog-name"</span> }
@@ -345,6 +347,10 @@
                 <span class="key">action</span>: <span class="str">"GET_DIRECT_PUBLISH_STATE"</span>,
                 <span class="key">data</span>: { <span class="key">includeCaptchaContext</span>: <span class="str">true</span> }
                 }, (state) => console.log(state));
+                }
+                <span class="key">// editor_not_ready면 diagnostics/preflight로 실패 원인 확인</span>
+                <span class="key">if</span> (response.status === <span class="str">"editor_not_ready"</span>) {
+                console.log(response.preflight || response.diagnostics);
                 }
                 });
 

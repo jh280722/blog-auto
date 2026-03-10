@@ -21,6 +21,12 @@ const EDITOR_PREPARE_DEFAULTS = {
   postLoadDelayMs: 700
 };
 
+const DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS = {
+  timeoutMs: 120000,
+  pollIntervalMs: 1000,
+  postClearDelayMs: 1200
+};
+
 /**
  * 큐 상태를 스토리지에 저장
  */
@@ -417,6 +423,14 @@ function attachDirectPublishState(response, state = directPublishState) {
   };
 }
 
+function attachCaptchaWait(response, captchaWait = null) {
+  if (!captchaWait) return response;
+  return {
+    ...response,
+    captchaWait
+  };
+}
+
 async function getLiveDirectPublishState(options = {}) {
   if (!directPublishState) return null;
 
@@ -547,6 +561,128 @@ async function submitCaptchaForTab(tabId, answer, options = {}) {
   }
 }
 
+function normalizeDirectPublishCaptchaWaitOptions(options = {}) {
+  const waitRequested = options.waitForCaptcha === true
+    || options.waitForCaptchaResolution === true
+    || Number(options.waitTimeoutMs) > 0
+    || Number(options.captchaWaitTimeoutMs) > 0;
+
+  return {
+    enabled: waitRequested,
+    timeoutMs: clamp(
+      Number(options.waitTimeoutMs) || Number(options.captchaWaitTimeoutMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.timeoutMs,
+      1000,
+      300000
+    ),
+    pollIntervalMs: clamp(
+      Number(options.pollIntervalMs) || Number(options.captchaPollIntervalMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.pollIntervalMs,
+      250,
+      5000
+    ),
+    postClearDelayMs: Math.max(
+      0,
+      Number(options.postClearDelayMs) || Number(options.captchaPostClearDelayMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.postClearDelayMs
+    )
+  };
+}
+
+function summarizeCaptchaWaitResult(waitResult = null, options = {}) {
+  if (!waitResult) return null;
+
+  return {
+    enabled: !!options.enabled,
+    success: !!waitResult.success,
+    status: waitResult.status || null,
+    waitedMs: Number.isFinite(waitResult.waitedMs) ? waitResult.waitedMs : null,
+    attempts: Number.isFinite(waitResult.attempts) ? waitResult.attempts : null,
+    pollIntervalMs: Number.isFinite(waitResult.pollIntervalMs) ? waitResult.pollIntervalMs : null,
+    postClearDelayMs: Number.isFinite(waitResult.postClearDelayMs) ? waitResult.postClearDelayMs : null,
+    captchaStillPresent: typeof waitResult.captchaStillPresent === 'boolean' ? waitResult.captchaStillPresent : null,
+    completedAt: new Date().toISOString()
+  };
+}
+
+async function waitForCaptchaResolutionOnTab(tabId, options = {}) {
+  if (!tabId) {
+    return {
+      success: false,
+      status: 'editor_not_ready',
+      error: 'CAPTCHA 해결 대기 대상 탭 ID가 없습니다.',
+      tabId,
+      waitedMs: 0,
+      attempts: 0,
+      pollIntervalMs: options.pollIntervalMs || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.pollIntervalMs,
+      postClearDelayMs: options.postClearDelayMs || 0
+    };
+  }
+
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.timeoutMs);
+  const pollIntervalMs = Math.max(250, Number(options.pollIntervalMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.pollIntervalMs);
+  const postClearDelayMs = Math.max(0, Number(options.postClearDelayMs) || 0);
+  const startedAt = Date.now();
+  let attempts = 0;
+  let lastCheck = null;
+
+  while ((Date.now() - startedAt) <= timeoutMs) {
+    attempts += 1;
+
+    try {
+      lastCheck = await chrome.tabs.sendMessage(tabId, { action: 'CHECK_CAPTCHA' });
+    } catch (error) {
+      return {
+        success: false,
+        status: 'editor_not_ready',
+        error: error.message,
+        tabId,
+        waitedMs: Date.now() - startedAt,
+        attempts,
+        pollIntervalMs,
+        postClearDelayMs,
+        lastCheck: null
+      };
+    }
+
+    if (!lastCheck?.captchaPresent) {
+      if (postClearDelayMs > 0) {
+        await delay(postClearDelayMs);
+      }
+
+      return {
+        success: true,
+        status: 'captcha_cleared',
+        tabId,
+        waitedMs: Date.now() - startedAt,
+        attempts,
+        pollIntervalMs,
+        postClearDelayMs,
+        lastCheck,
+        captchaStillPresent: false
+      };
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    const remainingMs = timeoutMs - elapsedMs;
+    if (remainingMs <= 0) {
+      break;
+    }
+
+    await delay(Math.min(pollIntervalMs, remainingMs));
+  }
+
+  return {
+    success: false,
+    status: 'captcha_wait_timeout',
+    error: 'CAPTCHA가 아직 표시되어 있습니다. 같은 탭에서 browser/CDP handoff를 완료한 뒤 다시 시도하거나 waitTimeoutMs를 늘리세요.',
+    tabId,
+    waitedMs: Date.now() - startedAt,
+    attempts,
+    pollIntervalMs,
+    postClearDelayMs,
+    lastCheck,
+    captchaStillPresent: !!lastCheck?.captchaPresent
+  };
+}
+
 async function refreshDirectPublishCaptchaState(tabId, submitResult) {
   if (!tabId) {
     return null;
@@ -617,6 +753,7 @@ async function buildPreparationFromPreferredTab(tabId, requestData = {}) {
 
 async function resumeDirectPublishFlow(requestData = {}, options = {}) {
   const liveState = await getLiveDirectPublishState();
+  const waitOptions = normalizeDirectPublishCaptchaWaitOptions(options);
   const mergedRequestData = {
     ...(liveState?.requestData || {}),
     ...(directPublishState?.requestData || {}),
@@ -634,15 +771,49 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
     preparation = await prepareEditorTab({ blogName: mergedRequestData.blogName || directPublishState?.blogName || null });
   }
   if (!preparation.success) {
-    return attachDirectPublishState(preparation);
+    return attachCaptchaWait(attachDirectPublishState(preparation));
   }
 
-  try {
-    const captchaCheck = await chrome.tabs.sendMessage(preparation.tabId, { action: 'CHECK_CAPTCHA' });
-    if (captchaCheck?.captchaPresent) {
+  let captchaWait = null;
+
+  if (waitOptions.enabled) {
+    if (directPublishState?.tabId === preparation.tabId) {
+      await updateDirectPublishState({
+        status: 'waiting_browser_handoff',
+        lastCaptchaWait: {
+          enabled: true,
+          success: false,
+          status: 'waiting_browser_handoff',
+          timeoutMs: waitOptions.timeoutMs,
+          pollIntervalMs: waitOptions.pollIntervalMs,
+          postClearDelayMs: waitOptions.postClearDelayMs,
+          startedAt: new Date().toISOString(),
+          completedAt: null
+        }
+      });
+    }
+
+    captchaWait = await waitForCaptchaResolutionOnTab(preparation.tabId, waitOptions);
+    captchaWait = {
+      enabled: true,
+      timeoutMs: waitOptions.timeoutMs,
+      ...captchaWait
+    };
+
+    if (directPublishState?.tabId === preparation.tabId) {
+      await updateDirectPublishState({
+        status: captchaWait.success
+          ? 'ready_to_resume'
+          : (captchaWait.status === 'editor_not_ready' ? 'editor_not_ready' : 'captcha_required'),
+        lastCheckedAt: new Date().toISOString(),
+        lastCaptchaWait: summarizeCaptchaWaitResult(captchaWait, waitOptions)
+      });
+    }
+
+    if (!captchaWait.success) {
       const handoff = await captureCaptchaHandoffForTab(preparation.tabId);
       const nextState = liveState || buildDirectPublishState({
-        response: { ...captchaCheck, status: 'captcha_required', tabId: preparation.tabId },
+        response: { status: captchaWait.status, tabId: preparation.tabId },
         preparation,
         requestData: mergedRequestData,
         captchaContext: handoff.captchaContext || null
@@ -652,18 +823,47 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
         tabId: preparation.tabId,
         blogName: mergedRequestData.blogName || nextState.blogName || preparation.blogName,
         url: preparation.url || nextState.url,
-        status: 'captcha_required',
+        status: captchaWait.status === 'editor_not_ready' ? 'editor_not_ready' : 'captcha_required',
         requestData: normalizeDirectPublishRequestData(mergedRequestData),
         captchaContext: handoff.captchaContext || null,
-        lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
+        lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts),
+        lastCaptchaWait: summarizeCaptchaWaitResult(captchaWait, waitOptions)
       });
-      return attachCaptchaHandoff(attachDirectPublishState(withPreparationDetails({
+      return attachCaptchaWait(attachCaptchaHandoff(attachDirectPublishState(withPreparationDetails({
         success: false,
-        error: 'CAPTCHA가 아직 표시되어 있습니다.',
-        status: 'captcha_required'
-      }, preparation)), handoff);
+        error: captchaWait.error || 'CAPTCHA가 아직 표시되어 있습니다.',
+        status: captchaWait.status || 'captcha_wait_timeout'
+      }, preparation)), handoff), captchaWait);
     }
-  } catch (e) { /* 진행 */ }
+  } else {
+    try {
+      const captchaCheck = await chrome.tabs.sendMessage(preparation.tabId, { action: 'CHECK_CAPTCHA' });
+      if (captchaCheck?.captchaPresent) {
+        const handoff = await captureCaptchaHandoffForTab(preparation.tabId);
+        const nextState = liveState || buildDirectPublishState({
+          response: { ...captchaCheck, status: 'captcha_required', tabId: preparation.tabId },
+          preparation,
+          requestData: mergedRequestData,
+          captchaContext: handoff.captchaContext || null
+        });
+        await setDirectPublishState({
+          ...nextState,
+          tabId: preparation.tabId,
+          blogName: mergedRequestData.blogName || nextState.blogName || preparation.blogName,
+          url: preparation.url || nextState.url,
+          status: 'captcha_required',
+          requestData: normalizeDirectPublishRequestData(mergedRequestData),
+          captchaContext: handoff.captchaContext || null,
+          lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
+        });
+        return attachCaptchaHandoff(attachDirectPublishState(withPreparationDetails({
+          success: false,
+          error: 'CAPTCHA가 아직 표시되어 있습니다.',
+          status: 'captcha_required'
+        }, preparation)), handoff);
+      }
+    } catch (e) { /* 진행 */ }
+  }
 
   const draftRestore = await restoreDraftIfNeeded(preparation.tabId, mergedRequestData);
   if (!draftRestore.success) {
@@ -680,12 +880,12 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
       }
     });
 
-    return attachDirectPublishState(withPreparationDetails({
+    return attachCaptchaWait(attachDirectPublishState(withPreparationDetails({
       success: false,
       status: draftRestore.status || 'draft_restore_failed',
       error: draftRestore.error || '발행 재개 전 초안 복구에 실패했습니다.',
       draftRestore
-    }, preparation));
+    }, preparation)), captchaWait);
   }
 
   await updateDirectPublishState({
@@ -709,7 +909,7 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
 
     if (responseWithPreparation.success) {
       await clearDirectPublishState();
-      return responseWithPreparation;
+      return attachCaptchaWait(responseWithPreparation, captchaWait);
     }
 
     if (responseWithPreparation.status === 'captcha_required') {
@@ -732,14 +932,17 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
           checkedAt: new Date().toISOString(),
           snapshot: draftRestore.snapshot || null
         },
+        lastCaptchaWait: captchaWait
+          ? summarizeCaptchaWaitResult(captchaWait, waitOptions)
+          : (directPublishState?.lastCaptchaWait || null),
         lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
       });
-      return attachCaptchaHandoff(attachDirectPublishState(responseWithPreparation), handoff);
+      return attachCaptchaWait(attachCaptchaHandoff(attachDirectPublishState(responseWithPreparation), handoff), captchaWait);
     }
 
-    return attachDirectPublishState(responseWithPreparation);
+    return attachCaptchaWait(attachDirectPublishState(responseWithPreparation), captchaWait);
   } catch (e) {
-    return attachDirectPublishState(makePreparationResponse({
+    return attachCaptchaWait(attachDirectPublishState(makePreparationResponse({
       success: false,
       status: 'editor_not_ready',
       error: e.message,
@@ -747,7 +950,7 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
       url: preparation.url,
       blogName: preparation.blogName,
       diagnostics: preparation.diagnostics
-    }));
+    })), captchaWait);
   }
 }
 
@@ -2455,7 +2658,11 @@ async function handleMessage(message, sender) {
     // CAPTCHA 해결 후 직접 발행 재개 (큐 외부, 팝업/API 직접 발행)
     case 'RESUME_DIRECT_PUBLISH':
       return await resumeDirectPublishFlow(message.data || {}, {
-        preferredTabId: message.data?.tabId || null
+        preferredTabId: message.data?.tabId || null,
+        waitForCaptcha: message.data?.waitForCaptcha ?? message.data?.waitForCaptchaResolution,
+        waitTimeoutMs: message.data?.waitTimeoutMs ?? message.data?.captchaWaitTimeoutMs,
+        pollIntervalMs: message.data?.pollIntervalMs ?? message.data?.captchaPollIntervalMs,
+        postClearDelayMs: message.data?.postClearDelayMs ?? message.data?.captchaPostClearDelayMs
       });
 
     default:
@@ -2494,7 +2701,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (directPublishState?.tabId !== tabId) return;
-  if (!['captcha_required', 'ready_to_resume', 'resuming'].includes(directPublishState?.status)) return;
+  if (!['captcha_required', 'ready_to_resume', 'resuming', 'waiting_browser_handoff'].includes(directPublishState?.status)) return;
 
   const nextUrl = changeInfo.url || tab?.url || '';
   if (!looksLikeDirectPublishCompletionUrl(nextUrl)) return;

@@ -12,6 +12,12 @@
   const MANAGE_POST_DIAG_KEY = '__blog_auto_last_manage_post_diag';
   const MANAGE_POST_DIAG_ATTR = 'data-blog-auto-last-manage-post-diag';
   const MANAGE_POST_SEQ_ATTR = 'data-blog-auto-last-manage-post-seq';
+  const STAGE_JITTER_DEFAULTS = {
+    enabled: true,
+    extraRatio: 0.18,
+    minExtraMs: 20,
+    maxExtraMs: 450
+  };
 
   function visibilityToNumber(visibility = 'public') {
     return visibility === 'private' ? 0 : visibility === 'protected' ? 15 : 20;
@@ -64,6 +70,101 @@
   // 유틸: 짧은 딜레이
   function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  }
+
+  function normalizeStageJitterOptions(options = null) {
+    if (!options || options.enabled === false) {
+      return { enabled: false, extraRatio: 0, minExtraMs: 0, maxExtraMs: 0 };
+    }
+
+    return {
+      enabled: true,
+      extraRatio: clamp(Number(options.extraRatio) || 0, 0, 1),
+      minExtraMs: Math.max(0, Number(options.minExtraMs) || 0),
+      maxExtraMs: Math.max(0, Number(options.maxExtraMs) || 0)
+    };
+  }
+
+  function getJitterDelay(baseMs, options = null) {
+    const normalizedBaseMs = Math.max(0, Number(baseMs) || 0);
+    const normalized = normalizeStageJitterOptions(options);
+
+    if (!normalized.enabled || normalizedBaseMs === 0) {
+      return {
+        enabled: false,
+        baseMs: normalizedBaseMs,
+        extraMs: 0,
+        waitMs: normalizedBaseMs
+      };
+    }
+
+    const computedExtraMax = Math.min(
+      normalized.maxExtraMs || Math.round(normalizedBaseMs * normalized.extraRatio),
+      Math.round(normalizedBaseMs * normalized.extraRatio)
+    );
+    const extraMaxMs = Math.max(0, computedExtraMax);
+    const extraMinMs = Math.min(extraMaxMs, normalized.minExtraMs);
+    const extraMs = extraMaxMs > 0
+      ? extraMinMs + Math.floor(Math.random() * (extraMaxMs - extraMinMs + 1))
+      : 0;
+
+    return {
+      enabled: true,
+      baseMs: normalizedBaseMs,
+      extraMs,
+      waitMs: normalizedBaseMs + extraMs
+    };
+  }
+
+  async function delayWithStageJitter(baseMs, options = null) {
+    const jitter = getJitterDelay(baseMs, options);
+    await delay(jitter.waitMs);
+    return jitter;
+  }
+
+  function cloneTraceEntries(trace = []) {
+    return Array.isArray(trace)
+      ? trace.map(entry => (entry && typeof entry === 'object' ? { ...entry } : entry)).filter(Boolean)
+      : [];
+  }
+
+  function buildTraceEntry(stage, extra = {}) {
+    const entry = {
+      stage,
+      phase: extra.phase || 'content',
+      at: new Date().toISOString()
+    };
+
+    for (const [key, value] of Object.entries(extra || {})) {
+      if (key === 'phase' || value === undefined) continue;
+      entry[key] = value;
+    }
+
+    return entry;
+  }
+
+  function pushTraceEntry(trace, stage, extra = {}) {
+    const entry = buildTraceEntry(stage, extra);
+    trace.push(entry);
+    return entry;
+  }
+
+  function attachTraceMetadata(response, traceKey, trace, stage, phase, extra = {}) {
+    const normalizedTrace = cloneTraceEntries(trace);
+    const lastTransition = normalizedTrace.length > 0 ? normalizedTrace[normalizedTrace.length - 1] : null;
+
+    return {
+      ...response,
+      ...extra,
+      phase,
+      stage,
+      lastTransition,
+      [traceKey]: normalizedTrace
+    };
   }
 
   function normalizeText(value) {
@@ -2256,22 +2357,38 @@
    * 발행 실행 ("완료" 버튼) — captcha 감지 + 발행 검증 포함
    */
   async function publish(visibility = 'public') {
+    const publishTrace = [];
+    const phase = 'publish';
+    const mark = (stage, extra = {}) => pushTraceEntry(publishTrace, stage, { phase, ...extra });
+    const respond = (response, stage, extra = {}) => attachTraceMetadata(response, 'publishTrace', publishTrace, stage, phase, extra);
+
     try {
+      mark('publish_invoked', { visibility });
+
       // 사전 체크: CAPTCHA가 이미 표시되어 있는지
       if (detectCaptcha()) {
         const captchaContext = getCaptchaContext();
+        mark('captcha_detected_before_publish', {
+          captchaPresent: true,
+          preferredSolveMode: captchaContext?.preferredSolveMode || null
+        });
         console.warn('[TistoryAuto] CAPTCHA 감지됨 — same-tab handoff 필요');
-        return {
+        return respond({
           success: false,
           error: 'CAPTCHA가 감지되었습니다. 같은 탭에서 browser/CDP handoff로 풀이를 진행하세요.',
           status: 'captcha_required',
-          captchaContext
-        };
+          captchaContext,
+          captchaStage: 'before_publish'
+        }, 'captcha_detected_before_publish');
       }
 
       const initialSnapshot = getEditorSnapshot();
+      mark('editor_snapshot_captured', {
+        snapshot: summarizeSnapshotForLog(initialSnapshot)
+      });
       if (!initialSnapshot.hasMeaningfulContent) {
-        return {
+        mark('editor_snapshot_empty');
+        return respond({
           success: false,
           error: '발행 직전 에디터 본문이 비어 있어 발행을 중단합니다.',
           status: 'content_empty',
@@ -2282,12 +2399,16 @@
             error: formatPersistenceIssues(['editor_content_missing']),
             snapshot: summarizeSnapshotForLog(initialSnapshot)
           }
-        };
+        }, 'editor_snapshot_empty');
       }
 
       const prePublishPersistence = await ensureEditorStatePersistence(initialSnapshot, { reason: 'pre_publish' });
+      mark(prePublishPersistence.success ? 'pre_publish_persistence_ready' : 'pre_publish_persistence_failed', {
+        persistenceStatus: prePublishPersistence.status || null,
+        persistenceIssues: prePublishPersistence.issues || []
+      });
       if (!prePublishPersistence.success) {
-        return {
+        return respond({
           success: false,
           error: prePublishPersistence.error || '발행 직전 에디터 동기화 검증에 실패했습니다.',
           status: prePublishPersistence.status,
@@ -2298,68 +2419,103 @@
             error: prePublishPersistence.error,
             snapshot: summarizeSnapshotForLog(prePublishPersistence.snapshot)
           }
-        };
+        }, 'pre_publish_persistence_failed');
       }
 
       const expectedSnapshot = prePublishPersistence.snapshot;
       clearLastManagePostDiag();
       const managePostSeqBefore = getLastManagePostSeq();
+      mark('manage_post_diag_reset', { managePostSeqBefore });
 
       // 최종 발행 직전에 MAIN world interceptor를 주입해 실제 페이지 XHR/fetch payload도 교정한다.
       try {
         await chrome.runtime.sendMessage({ action: 'INJECT_MAIN_WORLD_VISIBILITY_HELPER' });
+        mark('main_world_interceptor_ready');
       } catch (e) {
+        mark('main_world_interceptor_failed', { error: e.message });
         console.warn('[TistoryAuto] MAIN world interceptor 주입 요청 실패:', e);
       }
       const forcedVisibilityNum = String(visibilityToNumber(visibility));
       document.documentElement.dataset.blogAutoTargetVisibilityNum = forcedVisibilityNum;
       document.documentElement.setAttribute('data-blog-auto-target-visibility-num', forcedVisibilityNum);
       try { localStorage.setItem('__blog_auto_publish_marker', forcedVisibilityNum); } catch (_) {}
+      mark('target_visibility_marker_set', { forcedVisibilityNum });
 
       // TinyMCE save() 호출하여 에디터 내용을 textarea에 동기화
       const editor = getTinyMCEEditor();
       if (editor) {
-        try { editor.save(); } catch (e) { /* 무시 */ }
+        try {
+          editor.save();
+          mark('editor_save_synced_to_textarea');
+        } catch (e) {
+          mark('editor_save_sync_failed', { error: e.message });
+        }
       }
 
       // 발행 레이어가 이미 열려 있으면 완료 버튼을 다시 누르지 않음
       let publishLayer = document.querySelector('.publish-layer, #publish-layer, .layer-publish');
       let confirmBtn = findElement(S.publish.confirmButton, null);
       const layerAlreadyOpen = !!(publishLayer && confirmBtn);
+      mark(layerAlreadyOpen ? 'publish_layer_already_open' : 'publish_layer_closed_before_open', {
+        publishLayerPresent: !!publishLayer,
+        confirmButtonPresent: !!confirmBtn
+      });
 
       if (!layerAlreadyOpen) {
         // "완료" 버튼 클릭 → 발행 설정 레이어 열림
         const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
         if (!completeBtn) {
-          return { success: false, error: '완료 버튼을 찾을 수 없음', status: 'editor_not_ready' };
+          mark('complete_button_missing');
+          return respond({ success: false, error: '완료 버튼을 찾을 수 없음', status: 'editor_not_ready' }, 'complete_button_missing');
         }
 
         completeBtn.click();
-        await delay(1500);
+        mark('open_publish_layer_clicked');
+        const openLayerDelay = await delayWithStageJitter(1500, STAGE_JITTER_DEFAULTS);
+        mark('open_publish_layer_wait_complete', {
+          baseDelayMs: openLayerDelay.baseMs,
+          jitterExtraMs: openLayerDelay.extraMs,
+          waitedMs: openLayerDelay.waitMs
+        });
 
         // CAPTCHA 체크 (완료 버튼 클릭 후 나타날 수 있음)
         if (detectCaptcha()) {
           const captchaContext = getCaptchaContext();
+          mark('captcha_after_open_publish_layer', {
+            captchaPresent: true,
+            preferredSolveMode: captchaContext?.preferredSolveMode || null
+          });
           console.warn('[TistoryAuto] 발행 시도 후 CAPTCHA 감지됨');
-          return {
+          return respond({
             success: false,
             error: '발행 중 CAPTCHA가 감지되었습니다.',
             status: 'captcha_required',
-            captchaContext
-          };
+            captchaContext,
+            captchaStage: 'after_open_publish_layer'
+          }, 'captcha_after_open_publish_layer');
         }
 
         publishLayer = document.querySelector('.publish-layer, #publish-layer, .layer-publish');
         confirmBtn = findElement(S.publish.confirmButton, null);
-      } else {
-        console.log('[TistoryAuto] 발행 레이어가 이미 열려 있어 완료 버튼 클릭 생략');
+        mark('publish_layer_state_checked', {
+          publishLayerPresent: !!publishLayer,
+          confirmButtonPresent: !!confirmBtn
+        });
       }
 
       if (confirmBtn) {
         // 발행 레이어가 열린 뒤 최종 공개 설정을 적용
         const visibilityResult = await setVisibility(visibility);
+        mark(visibilityResult.success ? 'visibility_applied' : 'visibility_apply_failed', {
+          visibilityStatus: visibilityResult.status || null,
+          expectedValue: visibilityResult.expectedValue || visibility
+        });
         if (!visibilityResult.success) {
-          return { success: false, error: `공개 설정 적용 실패 (${visibilityResult.expectedValue || visibility})`, status: 'visibility_failed' };
+          return respond({
+            success: false,
+            error: `공개 설정 적용 실패 (${visibilityResult.expectedValue || visibility})`,
+            status: 'visibility_failed'
+          }, 'visibility_apply_failed');
         }
 
         // React re-render로 confirmBtn 참조가 stale할 수 있으므로 다시 찾기
@@ -2369,33 +2525,62 @@
           confirmBtn = Array.from(document.querySelectorAll('button')).find(b => /(발행|저장)/.test(b.textContent.trim()) && b.closest('.layer_foot, .wrap_btn, .ReactModal__Content'));
         }
         if (!confirmBtn) {
-          return { success: false, error: '최종 발행 버튼을 다시 찾을 수 없음 (React re-render)', status: 'editor_not_ready' };
+          mark('confirm_button_missing_after_rerender');
+          return respond({
+            success: false,
+            error: '최종 발행 버튼을 다시 찾을 수 없음 (React re-render)',
+            status: 'editor_not_ready'
+          }, 'confirm_button_missing_after_rerender');
         }
 
         const urlBefore = window.location.href;
+        const preConfirmDelay = await delayWithStageJitter(350, STAGE_JITTER_DEFAULTS);
+        mark('before_final_confirm_wait_complete', {
+          baseDelayMs: preConfirmDelay.baseMs,
+          jitterExtraMs: preConfirmDelay.extraMs,
+          waitedMs: preConfirmDelay.waitMs
+        });
 
         confirmBtn.click();
         console.log('[TistoryAuto] 최종 발행 버튼 클릭');
-        await delay(2000);
+        mark('final_confirm_clicked', { urlBefore });
+        const afterConfirmDelay = await delayWithStageJitter(2000, STAGE_JITTER_DEFAULTS);
+        mark('after_final_confirm_wait_complete', {
+          baseDelayMs: afterConfirmDelay.baseMs,
+          jitterExtraMs: afterConfirmDelay.extraMs,
+          waitedMs: afterConfirmDelay.waitMs
+        });
 
         // CAPTCHA 체크 (최종 발행 후)
         if (detectCaptcha()) {
-          return {
+          const captchaContext = getCaptchaContext();
+          mark('captcha_after_final_confirm', {
+            captchaPresent: true,
+            preferredSolveMode: captchaContext?.preferredSolveMode || null
+          });
+          return respond({
             success: false,
             error: '최종 발행 후 CAPTCHA가 감지되었습니다.',
             status: 'captcha_required',
-            captchaContext: getCaptchaContext()
-          };
+            captchaContext,
+            captchaStage: 'after_final_confirm'
+          }, 'captcha_after_final_confirm');
         }
 
         // "저장중" 스피너 대기
         const saveComplete = await waitForSaveComplete(15000);
+        mark(saveComplete ? 'save_indicator_cleared' : 'save_indicator_timeout');
         if (!saveComplete) {
-          return { success: false, error: '"저장중" 상태가 15초 이상 지속됨', status: 'save_timeout' };
+          return respond({ success: false, error: '"저장중" 상태가 15초 이상 지속됨', status: 'save_timeout' }, 'save_indicator_timeout');
         }
 
         // 발행 성공 검증: URL 변경 또는 성공 알림 확인
-        await delay(1000);
+        const verificationDelay = await delayWithStageJitter(1000, STAGE_JITTER_DEFAULTS);
+        mark('post_save_verification_wait_complete', {
+          baseDelayMs: verificationDelay.baseMs,
+          jitterExtraMs: verificationDelay.extraMs,
+          waitedMs: verificationDelay.waitMs
+        });
         const urlAfter = window.location.href;
         const urlChanged = urlAfter !== urlBefore;
         const hasSuccessIndicator = !!document.querySelector('.success, .alert-success, [class*="complete"]');
@@ -2404,90 +2589,127 @@
         // 에러 메시지 체크
         const errorEl = document.querySelector('.error-message, .alert-error, [class*="error"]:not([class*="error-hide"])');
         if (errorEl && errorEl.offsetParent !== null && errorEl.textContent.trim().length > 0) {
-          return { success: false, error: `발행 오류: ${errorEl.textContent.trim()}`, status: 'publish_error' };
+          const errorText = errorEl.textContent.trim();
+          mark('publish_error_visible', { errorText });
+          return respond({ success: false, error: `발행 오류: ${errorText}`, status: 'publish_error' }, 'publish_error_visible');
         }
 
         const requestDiag = await waitForNextManagePostDiag(managePostSeqBefore, 12000);
         const lateCaptchaContext = getCaptchaContext();
+        mark(requestDiag ? 'manage_post_diag_observed' : 'manage_post_diag_missing', {
+          requestSequence: requestDiag?.sequence || null,
+          captchaPresentDuringVerification: !!lateCaptchaContext?.captchaPresent
+        });
         if (!requestDiag && lateCaptchaContext?.captchaPresent) {
-          return {
+          return respond({
             success: false,
             error: '최종 발행 검증 중 CAPTCHA가 감지되었습니다.',
             status: 'captcha_required',
             url: urlAfter,
-            captchaContext: lateCaptchaContext
-          };
+            captchaContext: lateCaptchaContext,
+            captchaStage: 'during_verification'
+          }, 'captcha_during_verification');
         }
 
         const persistenceCheck = verifyPublishRequestPersistence(expectedSnapshot, requestDiag);
+        mark(persistenceCheck.confirmed ? 'persistence_verified' : 'persistence_unverified', {
+          persistenceStatus: persistenceCheck.status || null,
+          persistenceIssues: persistenceCheck.issues || []
+        });
         if (!persistenceCheck.confirmed) {
-          return {
+          return respond({
             success: false,
             error: persistenceCheck.error || '발행 payload 검증에 실패했습니다.',
             status: persistenceCheck.status,
             url: urlAfter,
             persistenceCheck
-          };
+          }, 'persistence_unverified');
         }
 
         if (urlChanged || hasSuccessIndicator) {
           console.log('[TistoryAuto] 발행 완료! URL:', urlAfter);
-          return { success: true, status: 'published', url: urlAfter, persistenceCheck };
+          mark('publish_verified', { urlAfter, urlChanged, hasSuccessIndicator });
+          return respond({ success: true, status: 'published', url: urlAfter, persistenceCheck }, 'publish_verified');
         }
 
         // URL 변경 없이 여전히 newpost 페이지라면 의심
         if (isStillOnNewPost) {
+          mark('verification_failed_still_on_editor', { urlAfter });
           console.warn('[TistoryAuto] 발행 후에도 글쓰기 페이지에 머물러 있음');
-          return { success: false, error: '발행 후에도 글쓰기 페이지에서 이동하지 않음', status: 'verification_failed' };
+          return respond({ success: false, error: '발행 후에도 글쓰기 페이지에서 이동하지 않음', status: 'verification_failed' }, 'verification_failed_still_on_editor');
         }
 
-        return { success: true, status: 'published', persistenceCheck };
+        mark('publish_verified_without_redirect', { urlAfter, urlChanged, hasSuccessIndicator });
+        return respond({ success: true, status: 'published', url: urlAfter, persistenceCheck }, 'publish_verified_without_redirect');
       }
 
       // 발행 레이어 없이 바로 발행 시도된 경우 — 검증 수행
-      await delay(2000);
+      const noLayerDelay = await delayWithStageJitter(2000, STAGE_JITTER_DEFAULTS);
+      mark('publish_without_layer_wait_complete', {
+        baseDelayMs: noLayerDelay.baseMs,
+        jitterExtraMs: noLayerDelay.extraMs,
+        waitedMs: noLayerDelay.waitMs
+      });
       const saveComplete = await waitForSaveComplete(15000);
+      mark(saveComplete ? 'save_indicator_cleared_without_layer' : 'save_indicator_timeout_without_layer');
       if (!saveComplete) {
-        return { success: false, error: '"저장중" 상태가 지속됨', status: 'save_timeout' };
+        return respond({ success: false, error: '"저장중" 상태가 지속됨', status: 'save_timeout' }, 'save_indicator_timeout_without_layer');
       }
 
       if (detectCaptcha()) {
-        return {
+        const captchaContext = getCaptchaContext();
+        mark('captcha_without_layer', {
+          captchaPresent: true,
+          preferredSolveMode: captchaContext?.preferredSolveMode || null
+        });
+        return respond({
           success: false,
           error: 'CAPTCHA 감지됨',
           status: 'captcha_required',
-          captchaContext: getCaptchaContext()
-        };
+          captchaContext,
+          captchaStage: 'without_layer'
+        }, 'captcha_without_layer');
       }
 
       const requestDiag = await waitForNextManagePostDiag(managePostSeqBefore, 12000);
       const lateCaptchaContext = getCaptchaContext();
+      mark(requestDiag ? 'manage_post_diag_observed_without_layer' : 'manage_post_diag_missing_without_layer', {
+        requestSequence: requestDiag?.sequence || null,
+        captchaPresentDuringVerification: !!lateCaptchaContext?.captchaPresent
+      });
       if (!requestDiag && lateCaptchaContext?.captchaPresent) {
-        return {
+        return respond({
           success: false,
           error: '발행 검증 중 CAPTCHA가 감지되었습니다.',
           status: 'captcha_required',
           url: window.location.href,
-          captchaContext: lateCaptchaContext
-        };
+          captchaContext: lateCaptchaContext,
+          captchaStage: 'without_layer_verification'
+        }, 'captcha_without_layer_verification');
       }
 
       const persistenceCheck = verifyPublishRequestPersistence(expectedSnapshot, requestDiag);
+      mark(persistenceCheck.confirmed ? 'persistence_verified_without_layer' : 'persistence_unverified_without_layer', {
+        persistenceStatus: persistenceCheck.status || null,
+        persistenceIssues: persistenceCheck.issues || []
+      });
       if (!persistenceCheck.confirmed) {
-        return {
+        return respond({
           success: false,
           error: persistenceCheck.error || '발행 payload 검증에 실패했습니다.',
           status: persistenceCheck.status,
           url: window.location.href,
           persistenceCheck
-        };
+        }, 'persistence_unverified_without_layer');
       }
 
       console.log('[TistoryAuto] 완료 버튼으로 발행됨 (레이어 없음)');
-      return { success: true, status: 'published', persistenceCheck };
+      mark('publish_verified_without_layer', { url: window.location.href });
+      return respond({ success: true, status: 'published', url: window.location.href, persistenceCheck }, 'publish_verified_without_layer');
     } catch (error) {
+      mark('publish_exception', { error: error.message });
       console.error('[TistoryAuto] 발행 실패:', error);
-      return { success: false, error: error.message };
+      return respond({ success: false, error: error.message }, 'publish_exception');
     }
   }
 
@@ -2496,14 +2718,34 @@
    */
   async function writePost(postData) {
     const results = {};
+    const writeTrace = [];
+    const phase = 'write_post';
+    const mark = (stage, extra = {}) => pushTraceEntry(writeTrace, stage, { phase, ...extra });
+    const respond = (response, stage, extra = {}) => attachTraceMetadata(response, 'writeTrace', writeTrace, stage, phase, extra);
+
+    mark('write_post_invoked', {
+      hasTitle: !!postData.title,
+      hasCategory: !!postData.category,
+      hasContent: !!postData.content,
+      imageCount: Array.isArray(postData.images) ? postData.images.length : 0,
+      tagCount: Array.isArray(postData.tags) ? postData.tags.length : 0,
+      autoPublish: !!postData.autoPublish,
+      visibility: postData.visibility || null
+    });
+
     const writePreflight = await waitForEditorReady({
       timeoutMs: 4000,
       intervalMs: 250,
       settleDelayMs: 150
     });
+    mark(writePreflight.success ? 'editor_preflight_ready' : 'editor_preflight_failed', {
+      waitedMs: writePreflight.waitedMs,
+      pollCount: writePreflight.pollCount,
+      reason: writePreflight.reason || null
+    });
 
     if (!writePreflight.success) {
-      return {
+      return respond({
         success: false,
         status: writePreflight.status,
         error: writePreflight.error,
@@ -2515,46 +2757,101 @@
           diagnostics: writePreflight.diagnostics
         },
         message: '실제 에디터가 준비되지 않아 제목 입력 전에 쓰기를 중단했습니다.'
-      };
+      }, 'editor_preflight_failed');
     }
 
     // 1. 제목
     if (postData.title) {
+      mark('title_step_started');
       results.title = await setTitle(postData.title);
-      await delay(300);
+      mark(results.title?.success ? 'title_step_completed' : 'title_step_failed', {
+        titleStatus: results.title?.status || null
+      });
+      const titleDelay = await delayWithStageJitter(300, STAGE_JITTER_DEFAULTS);
+      mark('title_gap_wait_complete', {
+        baseDelayMs: titleDelay.baseMs,
+        jitterExtraMs: titleDelay.extraMs,
+        waitedMs: titleDelay.waitMs
+      });
     }
 
     // 2. 카테고리 (본문보다 먼저 — 본문 입력 후 포커스 문제 방지)
     if (postData.category) {
+      mark('category_step_started');
       results.category = await setCategory(postData.category);
-      await delay(300);
+      mark(results.category?.success ? 'category_step_completed' : 'category_step_failed', {
+        categoryStatus: results.category?.status || null
+      });
+      const categoryDelay = await delayWithStageJitter(300, STAGE_JITTER_DEFAULTS);
+      mark('category_gap_wait_complete', {
+        baseDelayMs: categoryDelay.baseMs,
+        jitterExtraMs: categoryDelay.extraMs,
+        waitedMs: categoryDelay.waitMs
+      });
     }
 
     // 3. 본문
     if (postData.content) {
+      mark('content_step_started');
       results.content = await setContent(postData.content);
-      await delay(500);
+      mark(results.content?.success ? 'content_step_completed' : 'content_step_failed', {
+        contentStatus: results.content?.status || null
+      });
+      const contentDelay = await delayWithStageJitter(500, STAGE_JITTER_DEFAULTS);
+      mark('content_gap_wait_complete', {
+        baseDelayMs: contentDelay.baseMs,
+        jitterExtraMs: contentDelay.extraMs,
+        waitedMs: contentDelay.waitMs
+      });
     }
 
     // 4. 이미지 삽입 (본문 뒤에 추가)
     if (postData.images && postData.images.length > 0) {
+      mark('images_step_started', { imageCount: postData.images.length });
       results.images = await insertImages(postData.images);
-      await delay(500);
+      mark(results.images?.success ? 'images_step_completed' : 'images_step_failed', {
+        imageStatus: results.images?.status || null
+      });
+      const imagesDelay = await delayWithStageJitter(500, STAGE_JITTER_DEFAULTS);
+      mark('images_gap_wait_complete', {
+        baseDelayMs: imagesDelay.baseMs,
+        jitterExtraMs: imagesDelay.extraMs,
+        waitedMs: imagesDelay.waitMs
+      });
     }
 
     // 5. 태그
     if (postData.tags && postData.tags.length > 0) {
+      mark('tags_step_started', { tagCount: postData.tags.length });
       results.tags = await setTags(postData.tags);
-      await delay(300);
+      mark(results.tags?.success ? 'tags_step_completed' : 'tags_step_failed', {
+        tagStatus: results.tags?.status || null
+      });
+      const tagsDelay = await delayWithStageJitter(300, STAGE_JITTER_DEFAULTS);
+      mark('tags_gap_wait_complete', {
+        baseDelayMs: tagsDelay.baseMs,
+        jitterExtraMs: tagsDelay.extraMs,
+        waitedMs: tagsDelay.waitMs
+      });
     }
 
     // 6. 공개 설정
     // autoPublish=true인 경우 실제 공개 설정은 publish() 내부의 발행 레이어에서 최종 적용한다.
     if (postData.visibility && !postData.autoPublish) {
+      mark('visibility_step_started', { visibility: postData.visibility });
       results.visibility = await setVisibility(postData.visibility);
-      await delay(300);
+      mark(results.visibility?.success ? 'visibility_step_completed' : 'visibility_step_failed', {
+        visibilityStatus: results.visibility?.status || null
+      });
+      const visibilityDelay = await delayWithStageJitter(300, STAGE_JITTER_DEFAULTS);
+      mark('visibility_gap_wait_complete', {
+        baseDelayMs: visibilityDelay.baseMs,
+        jitterExtraMs: visibilityDelay.extraMs,
+        waitedMs: visibilityDelay.waitMs
+      });
     } else if (postData.visibility && postData.autoPublish) {
       results.visibility = { success: true, deferred: true, target: postData.visibility };
+      mark('visibility_deferred_to_publish', { visibility: postData.visibility });
     }
 
     // 7. 발행 (autoPublish가 true인 경우)
@@ -2562,43 +2859,85 @@
       // 발행 전 에디터 내용 최종 확인 — publish() 호출 이전에 수행
       if (results.content?.success || results.images?.success) {
         const preflightSnapshot = getEditorSnapshot();
+        mark('publish_preflight_snapshot_captured', {
+          snapshot: summarizeSnapshotForLog(preflightSnapshot)
+        });
         if (!preflightSnapshot.hasMeaningfulContent) {
-          return {
+          mark('publish_preflight_snapshot_empty');
+          return respond({
             success: false,
             status: 'content_empty',
+            error: '발행 직전 에디터 본문이 비어있어 발행을 중단합니다.',
             results,
             message: '발행 직전 에디터 본문이 비어있어 발행을 중단합니다.'
-          };
+          }, 'publish_preflight_snapshot_empty');
         }
 
         const preflightPersistence = await ensureEditorStatePersistence(preflightSnapshot, { reason: 'write_post_preflight' });
+        mark(preflightPersistence.success ? 'publish_preflight_persistence_ready' : 'publish_preflight_persistence_failed', {
+          persistenceStatus: preflightPersistence.status || null,
+          persistenceIssues: preflightPersistence.issues || []
+        });
         if (!preflightPersistence.success) {
-          return {
+          return respond({
             success: false,
             status: preflightPersistence.status,
+            error: preflightPersistence.error || '발행 직전 에디터 동기화 검증에 실패했습니다.',
             results,
             message: preflightPersistence.error || '발행 직전 에디터 동기화 검증에 실패했습니다.'
-          };
+          }, 'publish_preflight_persistence_failed');
         }
       }
 
-      await delay(500);
+      const beforePublishDelay = await delayWithStageJitter(500, STAGE_JITTER_DEFAULTS);
+      mark('before_publish_wait_complete', {
+        baseDelayMs: beforePublishDelay.baseMs,
+        jitterExtraMs: beforePublishDelay.extraMs,
+        waitedMs: beforePublishDelay.waitMs
+      });
       results.publish = await publish(postData.visibility || 'public');
+      mark(results.publish?.success ? 'publish_step_completed' : 'publish_step_failed', {
+        publishStatus: results.publish?.status || null,
+        publishStage: results.publish?.stage || null
+      });
     }
 
     const allSuccess = Object.values(results).every(r => r.success);
     // 개별 단계에서 특수 상태가 반환된 경우 전파
     const failedStep = Object.entries(results).find(([, r]) => !r.success && r.status);
     const status = failedStep ? failedStep[1].status : (allSuccess ? 'published' : 'partial_failure');
+    const finalWriteStage = failedStep ? `${failedStep[0]}_step_failed` : (allSuccess ? 'write_post_completed' : 'write_post_partial_failure');
 
     console.log('[TistoryAuto] 글 작성 결과:', results);
 
-    return {
+    const baseResponse = respond({
       success: allSuccess,
       status,
+      error: failedStep ? (failedStep[1].error || null) : null,
       results,
+      publishTrace: results.publish?.publishTrace || null,
+      publishPhase: results.publish?.phase || null,
+      publishStage: results.publish?.stage || null,
+      publishLastTransition: results.publish?.lastTransition || null,
+      captchaContext: results.publish?.captchaContext || null,
+      persistenceCheck: results.publish?.persistenceCheck || null,
       message: allSuccess ? '글 작성이 완료되었습니다.' : '일부 단계에서 오류가 발생했습니다.'
-    };
+    }, finalWriteStage);
+
+    if (results.publish?.publishTrace) {
+      baseResponse.publishTrace = cloneTraceEntries(results.publish.publishTrace);
+    }
+    if (results.publish?.phase) {
+      baseResponse.phase = results.publish.phase;
+    }
+    if (results.publish?.stage) {
+      baseResponse.stage = results.publish.stage;
+    }
+    if (results.publish?.lastTransition) {
+      baseResponse.lastTransition = results.publish.lastTransition;
+    }
+
+    return baseResponse;
   }
 
   function getCurrentTagsSnapshot() {

@@ -21,13 +21,25 @@ const EDITOR_PREPARE_DEFAULTS = {
   postLoadDelayMs: 700,
   editorProbeWaitMs: 1600,
   editorProbeIntervalMs: 250,
-  editorProbeSettleDelayMs: 150
+  editorProbeSettleDelayMs: 150,
+  stageJitter: {
+    enabled: true,
+    extraRatio: 0.18,
+    minExtraMs: 20,
+    maxExtraMs: 450
+  }
 };
 
 const DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS = {
   timeoutMs: 120000,
   pollIntervalMs: 1000,
-  postClearDelayMs: 1200
+  postClearDelayMs: 1200,
+  stageJitter: {
+    enabled: true,
+    extraRatio: 0.15,
+    minExtraMs: 20,
+    maxExtraMs: 320
+  }
 };
 
 /**
@@ -104,6 +116,113 @@ function looksLikeDirectPublishCompletionUrl(url = '') {
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function cloneTraceEntries(trace = []) {
+  return Array.isArray(trace)
+    ? trace.map(entry => (entry && typeof entry === 'object' ? { ...entry } : entry)).filter(Boolean)
+    : [];
+}
+
+function buildTraceEntry(stage, extra = {}) {
+  const entry = {
+    stage,
+    phase: extra.phase || 'background',
+    at: new Date().toISOString()
+  };
+
+  for (const [key, value] of Object.entries(extra || {})) {
+    if (key === 'phase' || value === undefined) continue;
+    entry[key] = value;
+  }
+
+  return entry;
+}
+
+function buildTransitionPatch(base = {}, stage, extra = {}) {
+  const phase = extra.phase || base.phase || 'background';
+  const trace = cloneTraceEntries(base.publishTrace);
+  const entry = buildTraceEntry(stage, { ...extra, phase });
+  trace.push(entry);
+
+  return {
+    phase,
+    stage,
+    publishTrace: trace,
+    lastTransition: entry
+  };
+}
+
+function normalizeStageJitterOptions(options = null) {
+  if (!options || options.enabled === false) {
+    return { enabled: false, extraRatio: 0, minExtraMs: 0, maxExtraMs: 0 };
+  }
+
+  return {
+    enabled: true,
+    extraRatio: clamp(Number(options.extraRatio) || 0, 0, 1),
+    minExtraMs: Math.max(0, Number(options.minExtraMs) || 0),
+    maxExtraMs: Math.max(0, Number(options.maxExtraMs) || 0)
+  };
+}
+
+function getJitterDelay(baseMs, options = null) {
+  const normalizedBaseMs = Math.max(0, Number(baseMs) || 0);
+  const normalized = normalizeStageJitterOptions(options);
+
+  if (!normalized.enabled || normalizedBaseMs === 0) {
+    return {
+      enabled: false,
+      baseMs: normalizedBaseMs,
+      extraMs: 0,
+      waitMs: normalizedBaseMs
+    };
+  }
+
+  const computedExtraMax = Math.min(
+    normalized.maxExtraMs || Math.round(normalizedBaseMs * normalized.extraRatio),
+    Math.round(normalizedBaseMs * normalized.extraRatio)
+  );
+  const extraMaxMs = Math.max(0, computedExtraMax);
+  const extraMinMs = Math.min(extraMaxMs, normalized.minExtraMs);
+  const extraMs = extraMaxMs > 0
+    ? extraMinMs + Math.floor(Math.random() * (extraMaxMs - extraMinMs + 1))
+    : 0;
+
+  return {
+    enabled: true,
+    baseMs: normalizedBaseMs,
+    extraMs,
+    waitMs: normalizedBaseMs + extraMs
+  };
+}
+
+async function delayWithStageJitter(baseMs, options = null) {
+  const jitter = getJitterDelay(baseMs, options);
+  await delay(jitter.waitMs);
+  return jitter;
+}
+
+async function applyPreparationStageDelay(diagnostics, step, baseMs, options = null, extra = {}) {
+  const jitter = await delayWithStageJitter(baseMs, options);
+  diagnostics?.attempts?.push({
+    step,
+    outcome: 'settled',
+    baseDelayMs: jitter.baseMs,
+    jitterExtraMs: jitter.extraMs,
+    waitedMs: jitter.waitMs,
+    jitterEnabled: jitter.enabled,
+    ...extra
+  });
+  return jitter;
+}
+
+function buildManageHomeUrl(blogName) {
+  return `https://${blogName}.tistory.com/manage`;
 }
 
 function buildNewPostUrl(blogName) {
@@ -214,6 +333,885 @@ function normalizeDirectPublishRequestData(requestData = {}) {
   return cloned;
 }
 
+
+function compactFallbackText(value = '', maxLength = 160) {
+  const normalized = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
+}
+
+function withFrameMetadata(candidate, frameId) {
+  if (!candidate || typeof candidate !== 'object') return candidate || null;
+  return {
+    ...candidate,
+    frameId
+  };
+}
+
+function buildFrameCandidateScore(entry = {}) {
+  const frameContext = entry.frameContext || {};
+  let score = Number(frameContext.score) || 0;
+  if (entry.frameId !== 0) score += 10;
+  if (frameContext.activeAnswerInput) score += 10;
+  if (frameContext.activeSubmitButton) score += 8;
+  if (frameContext.activeCaptureCandidate) score += 6;
+  if (frameContext.captchaLike) score += 12;
+  return score;
+}
+
+function normalizeCaptchaFrameEntries(injectionResults = []) {
+  return (Array.isArray(injectionResults) ? injectionResults : [])
+    .map((item) => {
+      const payload = item?.result && typeof item.result === 'object'
+        ? item.result
+        : { success: false, status: 'captcha_frame_result_missing', error: 'frame_result_missing' };
+      const frameContext = payload.frameContext || payload.frameContextBefore || payload.captureContext || null;
+      return {
+        frameId: Number.isFinite(item?.frameId) ? item.frameId : 0,
+        documentId: item?.documentId || null,
+        payload,
+        frameContext,
+        score: buildFrameCandidateScore({ frameId: item?.frameId, frameContext })
+      };
+    })
+    .filter((entry) => {
+      const frameContext = entry.frameContext || {};
+      return !!(
+        entry.payload?.success
+        || frameContext?.captchaLike
+        || frameContext?.candidateCount
+        || frameContext?.activeAnswerInput
+        || frameContext?.activeSubmitButton
+        || frameContext?.activeCaptureCandidate
+      );
+    })
+    .sort((a, b) => b.score - a.score);
+}
+
+function summarizeCaptchaFrameEntry(entry = {}) {
+  const frameContext = entry.frameContext || {};
+  return {
+    frameId: entry.frameId,
+    documentId: entry.documentId || null,
+    url: frameContext.url || entry.payload?.url || null,
+    origin: frameContext.origin || null,
+    title: frameContext.title || null,
+    score: Number.isFinite(entry.score) ? entry.score : (Number(frameContext.score) || 0),
+    reasons: Array.isArray(frameContext.reasons) ? frameContext.reasons : [],
+    candidateCount: Number(frameContext.candidateCount) || 0,
+    captchaLike: !!frameContext.captchaLike,
+    activeAnswerInput: withFrameMetadata(frameContext.activeAnswerInput, entry.frameId),
+    activeSubmitButton: withFrameMetadata(frameContext.activeSubmitButton, entry.frameId),
+    activeCaptureCandidate: withFrameMetadata(frameContext.activeCaptureCandidate, entry.frameId)
+  };
+}
+
+function mergeCaptchaContexts(baseContext = null, frameContextResult = null) {
+  if (!frameContextResult?.success) {
+    return cloneJsonValue(baseContext) || baseContext || null;
+  }
+
+  const next = cloneJsonValue(baseContext) || {
+    success: true,
+    url: frameContextResult.activeFrame?.url || null,
+    title: frameContextResult.activeFrame?.title || null,
+    captchaPresent: true,
+    candidateCount: 0,
+    candidates: []
+  };
+
+  next.captchaPresent = baseContext?.captchaPresent ?? true;
+  next.crossFrameAvailable = true;
+  next.frameSolveSupported = true;
+  next.frameCaptchaCandidateCount = Number(frameContextResult.frameCandidateCount) || 0;
+  next.frameCaptchaCandidates = cloneJsonValue(frameContextResult.frameCandidates) || [];
+  next.activeFrame = cloneJsonValue(frameContextResult.activeFrame) || null;
+  next.effectiveSolveMode = frameContextResult.preferredSolveMode || next.preferredSolveMode || null;
+
+  if (frameContextResult.preferredSolveMode) {
+    next.preferredSolveMode = frameContextResult.preferredSolveMode;
+  }
+
+  if (frameContextResult.activeAnswerInput) {
+    next.activeAnswerInput = cloneJsonValue(frameContextResult.activeAnswerInput);
+  }
+
+  if (frameContextResult.activeSubmitButton) {
+    next.activeSubmitButton = cloneJsonValue(frameContextResult.activeSubmitButton);
+  }
+
+  if (frameContextResult.activeCaptureCandidate) {
+    next.activeCaptureCandidate = cloneJsonValue(frameContextResult.activeCaptureCandidate);
+  }
+
+  return next;
+}
+
+function mergeResolvedCaptchaContext(baseContext = null, resolvedContext = null) {
+  const next = {};
+  let hasValue = false;
+
+  const apply = (context) => {
+    if (!context || typeof context !== 'object') return;
+
+    for (const [key, value] of Object.entries(context)) {
+      if (value === undefined || value === null) continue;
+      next[key] = cloneJsonValue(value) || value;
+      hasValue = true;
+    }
+  };
+
+  apply(baseContext);
+  apply(resolvedContext);
+
+  return hasValue ? next : null;
+}
+
+function isIframeCaptchaCandidate(candidate = null) {
+  const kind = String(candidate?.kind || '').toLowerCase();
+  const tagName = String(candidate?.tagName || '').toLowerCase();
+  return tagName === 'iframe' || kind.includes('iframe');
+}
+
+function hasActionableFrameCaptchaCandidate(candidate = null) {
+  if (!candidate || typeof candidate !== 'object') return false;
+  return !!(
+    candidate.captchaLike
+    || candidate.activeAnswerInput
+    || candidate.activeSubmitButton
+    || candidate.activeCaptureCandidate
+    || Number(candidate.candidateCount) > 0
+  );
+}
+
+function hasActionableMainDomCaptcha(context = null) {
+  if (!context || typeof context !== 'object') return false;
+
+  if (context.activeAnswerInput || context.activeSubmitButton) {
+    return true;
+  }
+
+  if (context.activeCaptureCandidate && !isIframeCaptchaCandidate(context.activeCaptureCandidate)) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasActionableFrameCaptcha(context = null, frameContextResult = null) {
+  const frameCandidates = [
+    ...(Array.isArray(frameContextResult?.frameCandidates) ? frameContextResult.frameCandidates : []),
+    ...(Array.isArray(context?.frameCaptchaCandidates) ? context.frameCaptchaCandidates : [])
+  ];
+
+  if (frameCandidates.some(hasActionableFrameCaptchaCandidate)) {
+    return true;
+  }
+
+  return !!(
+    frameContextResult?.activeAnswerInput
+    || frameContextResult?.activeSubmitButton
+    || frameContextResult?.activeCaptureCandidate
+    || context?.activeFrame
+  );
+}
+
+function finalizeResolvedCaptchaContext(baseContext = null, frameContextResult = null) {
+  const mergedContext = frameContextResult?.success
+    ? mergeCaptchaContexts(baseContext, frameContextResult)
+    : (cloneJsonValue(baseContext) || baseContext || null);
+
+  if (!mergedContext || typeof mergedContext !== 'object') {
+    return mergedContext;
+  }
+
+  const frameScanFailedClosed = !!(
+    mergedContext.iframeCaptchaPresent
+    && frameContextResult
+    && frameContextResult.success === false
+    && frameContextResult.status !== 'captcha_frame_not_found'
+  );
+
+  const captchaBlocking = hasActionableFrameCaptcha(mergedContext, frameContextResult)
+    || hasActionableMainDomCaptcha(mergedContext)
+    || (!mergedContext.iframeCaptchaPresent && !!mergedContext.captchaPresent)
+    || frameScanFailedClosed;
+
+  mergedContext.captchaPresent = captchaBlocking;
+  mergedContext.captchaBlocking = captchaBlocking;
+  mergedContext.iframeShellOnly = !!(mergedContext.iframeCaptchaPresent && !captchaBlocking);
+
+  return mergedContext;
+}
+
+async function captchaFrameAction(action, options = {}) {
+  const INPUT_HINT_RE = /(captcha|dkaptcha|kcaptcha|보안문자|자동등록방지|문자|입력|인증|security|answer)/i;
+  const BUTTON_HINT_RE = /(확인|입력|완료|등록|전송|submit|verify|ok|done)/i;
+  const IMAGE_HINT_RE = /(captcha|dkaptcha|kcaptcha|security|verify|code|image)/i;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const compactText = (value = '', maxLength = 160) => {
+    const normalized = String(value ?? '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
+  };
+
+  const normalizeText = (value = '') => String(value ?? '').replace(/\s+/g, ' ').trim();
+
+  const serializeRect = (rect) => {
+    if (!rect) return null;
+    return {
+      left: Math.round(rect.left * 100) / 100,
+      top: Math.round(rect.top * 100) / 100,
+      width: Math.round(rect.width * 100) / 100,
+      height: Math.round(rect.height * 100) / 100,
+      right: Math.round(rect.right * 100) / 100,
+      bottom: Math.round(rect.bottom * 100) / 100
+    };
+  };
+
+  const isVisible = (element) => {
+    if (!(element instanceof Element)) return false;
+    const style = window.getComputedStyle(element);
+    if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') <= 0.01) {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    return rect.width >= 1 && rect.height >= 1;
+  };
+
+  const getAssociatedText = (element) => {
+    const parts = [];
+
+    if (element?.labels?.length) {
+      parts.push(...Array.from(element.labels).map((label) => label?.textContent || ''));
+    }
+
+    const closestLabel = element?.closest?.('label');
+    if (closestLabel) parts.push(closestLabel.textContent || '');
+    if (element?.previousElementSibling) parts.push(element.previousElementSibling.textContent || '');
+    if (element?.nextElementSibling) parts.push(element.nextElementSibling.textContent || '');
+    if (element?.parentElement) parts.push(element.parentElement.textContent || '');
+
+    return compactText(parts.filter(Boolean).join(' '), 160);
+  };
+
+  const getDescriptor = (element) => normalizeText([
+    element?.getAttribute?.('placeholder'),
+    element?.getAttribute?.('aria-label'),
+    element?.getAttribute?.('title'),
+    element?.getAttribute?.('name'),
+    element?.id,
+    element?.className,
+    element?.getAttribute?.('alt'),
+    element?.getAttribute?.('src'),
+    getAssociatedText(element),
+    element?.textContent
+  ].filter(Boolean).join(' '));
+
+  const summarizeElement = (element, kind, score, extra = {}) => ({
+    kind,
+    tagName: element?.tagName?.toLowerCase?.() || null,
+    type: element?.getAttribute?.('type') || null,
+    id: element?.id || null,
+    name: element?.getAttribute?.('name') || null,
+    placeholder: compactText(element?.getAttribute?.('placeholder') || '', 80) || null,
+    ariaLabel: compactText(element?.getAttribute?.('aria-label') || '', 80) || null,
+    title: compactText(element?.getAttribute?.('title') || '', 80) || null,
+    text: compactText(element?.textContent || '', 80) || null,
+    className: compactText(element?.className || '', 120) || null,
+    rect: serializeRect(element?.getBoundingClientRect?.()),
+    score,
+    ...extra
+  });
+
+  const collectInputs = () => Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'))
+    .filter(isVisible)
+    .map((element) => {
+      const tagName = element.tagName?.toLowerCase?.() || '';
+      const inputType = (element.getAttribute?.('type') || '').toLowerCase();
+      if (tagName === 'input' && ['hidden', 'checkbox', 'radio', 'file', 'image', 'range', 'color'].includes(inputType)) {
+        return null;
+      }
+
+      let score = 0;
+      const descriptor = getDescriptor(element);
+      if (INPUT_HINT_RE.test(descriptor)) score += 18;
+      if (tagName === 'textarea' || element.isContentEditable || ['text', 'search', 'tel', 'number'].includes(inputType) || !inputType) score += 8;
+      const maxLength = Number(element.getAttribute?.('maxlength') || 0);
+      if (maxLength >= 2 && maxLength <= 12) score += 5;
+      if (element.disabled) score -= 20;
+      if (element.readOnly) score -= 8;
+      if (score <= 0) return null;
+
+      return {
+        element,
+        score,
+        summary: summarizeElement(element, 'captcha_answer_input', score, {
+          associatedText: getAssociatedText(element),
+          maxLength: Number.isFinite(maxLength) && maxLength > 0 ? maxLength : null,
+          valueLength: typeof element.value === 'string' ? element.value.length : compactText(element.textContent || '').length
+        })
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  const collectButtons = () => Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"], a, div, span'))
+    .filter((element) => {
+      if (!isVisible(element)) return false;
+      const tagName = element.tagName?.toLowerCase?.() || '';
+      if (['div', 'span', 'a'].includes(tagName)) {
+        const text = normalizeText(element.textContent || '');
+        return BUTTON_HINT_RE.test(text);
+      }
+      return true;
+    })
+    .map((element) => {
+      const descriptor = getDescriptor(element);
+      let score = 0;
+      if (BUTTON_HINT_RE.test(descriptor)) score += 18;
+      if (element.tagName?.toLowerCase?.() === 'button') score += 6;
+      if (element.tagName?.toLowerCase?.() === 'input') score += 6;
+      if (element.disabled || element.getAttribute?.('aria-disabled') === 'true') score -= 18;
+      if (score <= 0) return null;
+
+      return {
+        element,
+        score,
+        summary: summarizeElement(element, 'captcha_submit_button', score)
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  const collectImages = () => Array.from(document.querySelectorAll('img, canvas, svg'))
+    .filter(isVisible)
+    .map((element) => {
+      const rect = element.getBoundingClientRect();
+      const descriptor = getDescriptor(element);
+      let score = 0;
+      if (IMAGE_HINT_RE.test(descriptor)) score += 18;
+      if (element.tagName?.toLowerCase?.() === 'img') score += 10;
+      if (element.tagName?.toLowerCase?.() === 'canvas') score += 8;
+      if (rect.width >= 60 && rect.height >= 18) score += 4;
+      if (rect.width <= 420 && rect.height <= 220) score += 3;
+      if (score <= 0) return null;
+
+      return {
+        element,
+        score,
+        summary: summarizeElement(element, 'captcha_capture_candidate', score, {
+          sourceUrl: element.tagName?.toLowerCase?.() === 'img'
+            ? (element.currentSrc || element.getAttribute('src') || null)
+            : null
+        })
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  const collectRuntime = () => {
+    const answerInputs = collectInputs();
+    const submitButtons = collectButtons();
+    const captureCandidates = collectImages();
+    const bodyHint = compactText(document.body?.innerText || '', 360);
+    const reasons = [];
+    let score = 0;
+
+    if (INPUT_HINT_RE.test(bodyHint) || INPUT_HINT_RE.test(window.location.href || '') || INPUT_HINT_RE.test(document.title || '')) {
+      score += 20;
+      reasons.push('captcha_text_hint');
+    }
+    if (captureCandidates[0]) {
+      score += 12;
+      reasons.push('visual_candidate');
+    }
+    if (answerInputs[0]) {
+      score += 14;
+      reasons.push('answer_input');
+    }
+    if (submitButtons[0]) {
+      score += 10;
+      reasons.push('submit_button');
+    }
+    if (captureCandidates[0] && answerInputs[0]) {
+      score += 8;
+      reasons.push('visual_plus_input');
+    }
+    if (answerInputs[0] && submitButtons[0]) {
+      score += 6;
+      reasons.push('input_plus_button');
+    }
+
+    const candidateCount = answerInputs.length + submitButtons.length + captureCandidates.length;
+    return {
+      url: window.location.href || null,
+      origin: window.location.origin || null,
+      title: document.title || null,
+      bodyHint,
+      reasons,
+      score,
+      captchaLike: score >= 22 || (!!captureCandidates[0] && !!answerInputs[0] && !!submitButtons[0]),
+      candidateCount,
+      viewport: {
+        innerWidth: window.innerWidth || null,
+        innerHeight: window.innerHeight || null,
+        devicePixelRatio: window.devicePixelRatio || 1
+      },
+      answerInputs,
+      submitButtons,
+      captureCandidates
+    };
+  };
+
+  const toSerializableContext = (runtime) => ({
+    success: true,
+    url: runtime.url,
+    origin: runtime.origin,
+    title: runtime.title,
+    bodyHint: runtime.bodyHint,
+    reasons: runtime.reasons,
+    score: runtime.score,
+    captchaLike: runtime.captchaLike,
+    candidateCount: runtime.candidateCount,
+    answerInputCandidateCount: runtime.answerInputs.length,
+    answerInputCandidates: runtime.answerInputs.map((entry) => entry.summary),
+    activeAnswerInput: runtime.answerInputs[0]?.summary || null,
+    submitButtonCandidateCount: runtime.submitButtons.length,
+    submitButtonCandidates: runtime.submitButtons.map((entry) => entry.summary),
+    activeSubmitButton: runtime.submitButtons[0]?.summary || null,
+    captureCandidateCount: runtime.captureCandidates.length,
+    captureCandidates: runtime.captureCandidates.map((entry) => entry.summary),
+    activeCaptureCandidate: runtime.captureCandidates[0]?.summary || null,
+    viewport: runtime.viewport
+  });
+
+  const blobToDataUrl = (blob) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error('frame_blob_read_failed'));
+    reader.readAsDataURL(blob);
+  });
+
+  const extractArtifact = async () => {
+    const runtime = collectRuntime();
+    const selected = runtime.captureCandidates[0] || null;
+    if (!selected) {
+      return {
+        success: false,
+        status: 'captcha_frame_artifact_not_found',
+        error: 'cross-frame CAPTCHA 이미지 후보를 찾지 못했습니다.',
+        frameContext: toSerializableContext(runtime)
+      };
+    }
+
+    const element = selected.element;
+    const tagName = element?.tagName?.toLowerCase?.() || null;
+    try {
+      let dataUrl = null;
+      let mimeType = 'image/png';
+
+      if (tagName === 'canvas') {
+        dataUrl = element.toDataURL('image/png');
+      } else if (tagName === 'img') {
+        const sourceUrl = element.currentSrc || element.src || element.getAttribute('src') || null;
+        if (!sourceUrl) throw new Error('captcha_frame_image_src_missing');
+        if (sourceUrl.startsWith('data:')) {
+          dataUrl = sourceUrl;
+          mimeType = sourceUrl.slice(5, sourceUrl.indexOf(';')) || mimeType;
+        } else {
+          try {
+            const response = await fetch(sourceUrl, { credentials: 'include', cache: 'no-store' });
+            if (!response.ok) throw new Error(`captcha_frame_fetch_${response.status}`);
+            const blob = await response.blob();
+            mimeType = blob.type || mimeType;
+            dataUrl = await blobToDataUrl(blob);
+          } catch (fetchError) {
+            const canvas = document.createElement('canvas');
+            canvas.width = element.naturalWidth || element.width || 1;
+            canvas.height = element.naturalHeight || element.height || 1;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw fetchError;
+            ctx.drawImage(element, 0, 0);
+            dataUrl = canvas.toDataURL('image/png');
+            mimeType = 'image/png';
+          }
+        }
+      } else {
+        throw new Error(`captcha_frame_unsupported_tag:${tagName || 'unknown'}`);
+      }
+
+      return {
+        success: true,
+        status: 'captcha_frame_artifact_ready',
+        frameContext: toSerializableContext(runtime),
+        selectedCandidate: selected.summary,
+        artifact: {
+          kind: 'frame_direct_image',
+          mimeType,
+          dataUrl,
+          width: tagName === 'canvas'
+            ? (element.width || null)
+            : (element.naturalWidth || element.width || null),
+          height: tagName === 'canvas'
+            ? (element.height || null)
+            : (element.naturalHeight || element.height || null),
+          sourceTagName: tagName,
+          sourceUrl: tagName === 'img'
+            ? (element.currentSrc || element.src || element.getAttribute('src') || null)
+            : null,
+          rect: selected.summary?.rect || null
+        }
+      };
+    } catch (error) {
+      return {
+        success: false,
+        status: 'captcha_frame_artifact_failed',
+        error: error.message,
+        selectedCandidate: selected.summary,
+        frameContext: toSerializableContext(runtime)
+      };
+    }
+  };
+
+  const simulateClick = (element) => {
+    if (!element) return false;
+    element.scrollIntoView?.({ block: 'center', inline: 'center' });
+    element.focus?.();
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach((type) => {
+      element.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+    });
+    if (typeof element.click === 'function') {
+      element.click();
+    } else {
+      element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    }
+    return true;
+  };
+
+  const applyTextValue = (element, value) => {
+    if (!element) return false;
+
+    element.scrollIntoView?.({ block: 'center', inline: 'center' });
+    element.focus?.();
+
+    if (element.isContentEditable) {
+      element.textContent = value;
+    } else {
+      const prototype = element.tagName?.toLowerCase?.() === 'textarea'
+        ? window.HTMLTextAreaElement?.prototype
+        : window.HTMLInputElement?.prototype;
+      const descriptor = prototype ? Object.getOwnPropertyDescriptor(prototype, 'value') : null;
+      if (descriptor?.set) {
+        descriptor.set.call(element, value);
+      } else {
+        element.value = value;
+      }
+    }
+
+    element.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+    element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+    element.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter' }));
+    element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: 'Enter' }));
+    return true;
+  };
+
+  const normalizedAnswer = normalizeText(options.answer || '').replace(/\s+/g, '');
+
+  if (action === 'submit') {
+    const runtimeBefore = collectRuntime();
+    const selectedInput = runtimeBefore.answerInputs[0] || null;
+    const selectedButton = runtimeBefore.submitButtons[0] || null;
+
+    if (!normalizedAnswer) {
+      return {
+        success: false,
+        status: 'captcha_answer_required',
+        error: 'CAPTCHA 답안을 입력하세요.',
+        frameContext: toSerializableContext(runtimeBefore)
+      };
+    }
+
+    if (!selectedInput) {
+      return {
+        success: false,
+        status: 'captcha_frame_input_not_found',
+        error: 'cross-frame CAPTCHA 입력창을 찾지 못했습니다.',
+        frameContext: toSerializableContext(runtimeBefore)
+      };
+    }
+
+    if (!selectedButton) {
+      return {
+        success: false,
+        status: 'captcha_frame_submit_not_found',
+        error: 'cross-frame CAPTCHA 제출 버튼을 찾지 못했습니다.',
+        frameContext: toSerializableContext(runtimeBefore)
+      };
+    }
+
+    applyTextValue(selectedInput.element, normalizedAnswer);
+    await sleep(80);
+    const appliedValue = selectedInput.element.isContentEditable
+      ? normalizeText(selectedInput.element.textContent || '')
+      : normalizeText(selectedInput.element.value || selectedInput.element.textContent || '');
+    const inputApplied = appliedValue.replace(/\s+/g, '') === normalizedAnswer;
+
+    if (!inputApplied) {
+      return {
+        success: false,
+        status: 'captcha_frame_input_not_applied',
+        error: 'cross-frame CAPTCHA 답안을 입력창에 적용하지 못했습니다.',
+        selectedInput: selectedInput.summary,
+        frameContext: toSerializableContext(runtimeBefore)
+      };
+    }
+
+    simulateClick(selectedButton.element);
+    await sleep(Math.max(300, Number(options.waitMs) || 1200));
+
+    const runtimeAfter = collectRuntime();
+    return {
+      success: true,
+      status: runtimeAfter.captchaLike ? 'captcha_still_present' : 'captcha_submitted',
+      url: window.location.href || null,
+      clicked: true,
+      inputApplied,
+      answerLength: normalizedAnswer.length,
+      captchaStillAppears: runtimeAfter.captchaLike,
+      selectedInput: selectedInput.summary,
+      selectedButton: selectedButton.summary,
+      frameContextBefore: toSerializableContext(runtimeBefore),
+      frameContextAfter: toSerializableContext(runtimeAfter),
+      frameContext: toSerializableContext(runtimeAfter)
+    };
+  }
+
+  if (action === 'extract_artifact') {
+    return await extractArtifact();
+  }
+
+  const runtime = collectRuntime();
+  return {
+    success: true,
+    status: 'captcha_frame_context_ready',
+    frameContext: toSerializableContext(runtime)
+  };
+}
+
+async function executeCaptchaFrameActionOnAllFrames(tabId, action, options = {}) {
+  if (!tabId) {
+    return {
+      success: false,
+      status: 'editor_not_ready',
+      error: 'cross-frame CAPTCHA 처리를 위한 탭 ID가 없습니다.',
+      tabId
+    };
+  }
+
+  try {
+    const injectionResults = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: captchaFrameAction,
+      args: [action, options]
+    });
+    return {
+      success: true,
+      status: 'captcha_frame_action_ready',
+      tabId,
+      frames: normalizeCaptchaFrameEntries(injectionResults)
+    };
+  } catch (error) {
+    return {
+      success: false,
+      status: 'captcha_frame_action_failed',
+      error: error.message,
+      tabId
+    };
+  }
+}
+
+async function getCrossFrameCaptchaContextForTab(tabId) {
+  const frameScan = await executeCaptchaFrameActionOnAllFrames(tabId, 'inspect');
+  if (!frameScan.success) {
+    return frameScan;
+  }
+
+  const frameEntries = (frameScan.frames || []).filter((entry) => {
+    const frameContext = entry.frameContext || {};
+    return !!(
+      frameContext.captchaLike
+      || frameContext.activeAnswerInput
+      || frameContext.activeSubmitButton
+      || frameContext.activeCaptureCandidate
+    );
+  });
+
+  if (frameEntries.length === 0) {
+    return {
+      success: false,
+      status: 'captcha_frame_not_found',
+      error: 'cross-frame CAPTCHA 후보를 찾지 못했습니다.',
+      tabId,
+      frameCandidates: []
+    };
+  }
+
+  const activeEntry = frameEntries[0];
+  const activeSummary = summarizeCaptchaFrameEntry(activeEntry);
+  const frameCandidates = frameEntries.map(summarizeCaptchaFrameEntry);
+
+  return {
+    success: true,
+    status: 'captcha_frame_context_ready',
+    tabId,
+    frameCandidateCount: frameCandidates.length,
+    frameCandidates,
+    activeFrame: {
+      frameId: activeSummary.frameId,
+      documentId: activeSummary.documentId,
+      url: activeSummary.url,
+      origin: activeSummary.origin,
+      title: activeSummary.title,
+      score: activeSummary.score,
+      reasons: activeSummary.reasons,
+      candidateCount: activeSummary.candidateCount
+    },
+    activeAnswerInput: activeSummary.activeAnswerInput,
+    activeSubmitButton: activeSummary.activeSubmitButton,
+    activeCaptureCandidate: activeSummary.activeCaptureCandidate,
+    preferredSolveMode: activeSummary.activeAnswerInput && activeSummary.activeSubmitButton
+      ? 'extension_frame_dom'
+      : 'browser_handoff',
+    frameContext: mergeCaptchaContexts(null, {
+      success: true,
+      frameCandidateCount: frameCandidates.length,
+      frameCandidates,
+      activeFrame: {
+        frameId: activeSummary.frameId,
+        documentId: activeSummary.documentId,
+        url: activeSummary.url,
+        origin: activeSummary.origin,
+        title: activeSummary.title,
+        score: activeSummary.score,
+        reasons: activeSummary.reasons,
+        candidateCount: activeSummary.candidateCount
+      },
+      activeAnswerInput: activeSummary.activeAnswerInput,
+      activeSubmitButton: activeSummary.activeSubmitButton,
+      activeCaptureCandidate: activeSummary.activeCaptureCandidate,
+      preferredSolveMode: activeSummary.activeAnswerInput && activeSummary.activeSubmitButton
+        ? 'extension_frame_dom'
+        : 'browser_handoff'
+    })
+  };
+}
+
+async function getCrossFrameCaptchaArtifactForTab(tabId, options = {}) {
+  const frameContextResult = await getCrossFrameCaptchaContextForTab(tabId);
+  if (!frameContextResult.success || !frameContextResult.activeFrame?.frameId) {
+    return {
+      ...frameContextResult,
+      tabId
+    };
+  }
+
+  try {
+    const injectionResults = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameContextResult.activeFrame.frameId] },
+      func: captchaFrameAction,
+      args: ['extract_artifact', { includeSourceImage: !!options.includeSourceImage }]
+    });
+    const payload = injectionResults?.[0]?.result || null;
+    if (!payload) {
+      return {
+        success: false,
+        status: 'captcha_frame_artifact_failed',
+        error: 'cross-frame CAPTCHA 아티팩트 응답이 비어 있습니다.',
+        tabId,
+        frameId: frameContextResult.activeFrame.frameId,
+        frameContextResult
+      };
+    }
+
+    return {
+      ...payload,
+      tabId,
+      frameId: frameContextResult.activeFrame.frameId,
+      selectedCandidate: withFrameMetadata(payload.selectedCandidate, frameContextResult.activeFrame.frameId),
+      artifact: payload.artifact
+        ? {
+            ...payload.artifact,
+            frameId: frameContextResult.activeFrame.frameId
+          }
+        : null,
+      frameContext: mergeCaptchaContexts(payload.frameContext || null, frameContextResult),
+      frameContextResult
+    };
+  } catch (error) {
+    return {
+      success: false,
+      status: 'captcha_frame_artifact_failed',
+      error: error.message,
+      tabId,
+      frameId: frameContextResult.activeFrame.frameId,
+      frameContextResult
+    };
+  }
+}
+
+async function submitCaptchaViaFrameForTab(tabId, answer, options = {}) {
+  const frameContextResult = await getCrossFrameCaptchaContextForTab(tabId);
+  if (!frameContextResult.success || !frameContextResult.activeFrame?.frameId) {
+    return {
+      ...frameContextResult,
+      tabId
+    };
+  }
+
+  try {
+    const injectionResults = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameContextResult.activeFrame.frameId] },
+      func: captchaFrameAction,
+      args: ['submit', { answer, waitMs: options.waitMs }]
+    });
+    const payload = injectionResults?.[0]?.result || null;
+    if (!payload) {
+      return {
+        success: false,
+        status: 'captcha_frame_submit_failed',
+        error: 'cross-frame CAPTCHA 제출 응답이 비어 있습니다.',
+        tabId,
+        frameId: frameContextResult.activeFrame.frameId,
+        frameContextResult
+      };
+    }
+
+    return {
+      ...payload,
+      tabId,
+      frameId: frameContextResult.activeFrame.frameId,
+      submitStrategy: 'extension_frame_dom',
+      selectedInput: withFrameMetadata(payload.selectedInput, frameContextResult.activeFrame.frameId),
+      selectedButton: withFrameMetadata(payload.selectedButton, frameContextResult.activeFrame.frameId),
+      frameContext: mergeCaptchaContexts(payload.frameContext || payload.frameContextAfter || payload.frameContextBefore || null, frameContextResult),
+      frameContextResult
+    };
+  } catch (error) {
+    return {
+      success: false,
+      status: 'captcha_frame_submit_failed',
+      error: error.message,
+      tabId,
+      frameId: frameContextResult.activeFrame.frameId,
+      frameContextResult
+    };
+  }
+}
+
 function stripHtmlTags(value = '') {
   return String(value || '')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -290,9 +1288,65 @@ function buildDraftRestorePlan(snapshot = {}, requestData = {}) {
   };
 }
 
+function isMissingTabConnectionError(error) {
+  return /Could not establish connection|Receiving end does not exist/i.test(error?.message || '');
+}
+
+async function injectTistoryContentScripts(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  const url = tab?.url || '';
+
+  if (!isNewPostTab(url) && !isEditPostTab(url)) {
+    return {
+      success: false,
+      status: 'editor_not_ready',
+      error: '콘텐츠 스크립트를 재주입할 수 없는 탭입니다.',
+      tabId,
+      url
+    };
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['content/selectors.js']
+  });
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['utils/image-handler.js']
+  });
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['content/tistory.js']
+  });
+
+  return {
+    success: true,
+    status: 'content_script_reinjected',
+    tabId,
+    url
+  };
+}
+
+async function sendTabMessageWithRecovery(tabId, message, options = {}) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch (error) {
+    if (!options.reinjectOnMissing || !isMissingTabConnectionError(error)) {
+      throw error;
+    }
+
+    const reinjected = await injectTistoryContentScripts(tabId);
+    if (!reinjected.success) {
+      throw error;
+    }
+
+    return await chrome.tabs.sendMessage(tabId, message);
+  }
+}
+
 async function sendEditorMessage(tabId, action, data = {}) {
   await ensurePageWorldVisibilityInterceptor(tabId);
-  return await chrome.tabs.sendMessage(tabId, { action, data });
+  return await sendTabMessageWithRecovery(tabId, { action, data }, { reinjectOnMissing: true });
 }
 
 async function getDraftSnapshotForTab(tabId) {
@@ -404,6 +1458,15 @@ async function restoreDraftIfNeeded(tabId, requestData = {}) {
 }
 
 function buildDirectPublishState({ response, preparation, requestData = {}, captchaContext = null }) {
+  const phase = response?.phase || 'publish';
+  const stage = response?.stage || response?.status || 'captcha_required';
+  const publishTrace = cloneTraceEntries(response?.publishTrace);
+  const fallbackTransition = buildTraceEntry(stage, {
+    phase,
+    status: response?.status || 'captcha_required',
+    source: 'service_worker_build_state'
+  });
+
   return {
     tabId: response?.tabId ?? preparation?.tabId ?? null,
     blogName: requestData.blogName || response?.blogName || preparation?.blogName || null,
@@ -414,7 +1477,11 @@ function buildDirectPublishState({ response, preparation, requestData = {}, capt
     updatedAt: new Date().toISOString(),
     diagnostics: preparation?.diagnostics || null,
     captchaContext: captchaContext || null,
-    requestData: normalizeDirectPublishRequestData(requestData)
+    requestData: normalizeDirectPublishRequestData(requestData),
+    phase,
+    stage,
+    publishTrace: publishTrace.length > 0 ? publishTrace : [fallbackTransition],
+    lastTransition: cloneJsonValue(response?.lastTransition) || (publishTrace.length > 0 ? publishTrace[publishTrace.length - 1] : fallbackTransition)
   };
 }
 
@@ -455,12 +1522,23 @@ async function getLiveDirectPublishState(options = {}) {
   }
 
   if (options.includeCaptchaContext) {
-    try {
-      const captchaContext = await chrome.tabs.sendMessage(snapshot.tabId, { action: 'GET_CAPTCHA_CONTEXT' });
+    const captchaContextResult = await getCaptchaContextForTab(snapshot.tabId);
+    if (captchaContextResult.success) {
+      const captchaContext = mergeResolvedCaptchaContext(snapshot.captchaContext, captchaContextResult.captchaContext);
       snapshot.captchaContext = captchaContext;
       await updateDirectPublishState({ captchaContext, url: captchaContext?.url || snapshot.url });
-    } catch (error) {
-      snapshot.captchaContext = { success: false, error: error.message };
+    } else if (snapshot.captchaContext && typeof snapshot.captchaContext === 'object') {
+      snapshot.captchaContext = {
+        ...(cloneJsonValue(snapshot.captchaContext) || snapshot.captchaContext),
+        liveRefreshStatus: captchaContextResult.status || null,
+        liveRefreshError: captchaContextResult.error || null
+      };
+    } else {
+      snapshot.captchaContext = {
+        success: false,
+        status: captchaContextResult.status || 'editor_not_ready',
+        error: captchaContextResult.error || 'CAPTCHA 컨텍스트를 새로 읽지 못했습니다.'
+      };
     }
   }
 
@@ -480,6 +1558,8 @@ async function buildPreparationFromDirectPublishState(options = {}) {
     currentTabId,
     candidateCount: 1,
     source: 'direct_publish_state',
+    entryStrategy: 'resume_saved_editor_tab',
+    entryPath: [{ step: 'resume_saved_editor_tab', url: liveState.url || null }],
     attempts: []
   };
 
@@ -510,12 +1590,63 @@ async function getCaptchaContextForTab(tabId) {
     return { success: false, status: 'editor_not_ready', error: 'CAPTCHA 컨텍스트를 읽을 탭 ID가 없습니다.' };
   }
 
+  let baseResult = null;
   try {
-    const captchaContext = await chrome.tabs.sendMessage(tabId, { action: 'GET_CAPTCHA_CONTEXT' });
-    return { success: true, tabId, captchaContext };
+    const captchaContext = await sendTabMessageWithRecovery(tabId, { action: 'GET_CAPTCHA_CONTEXT' }, { reinjectOnMissing: true });
+    baseResult = { success: true, tabId, captchaContext };
   } catch (error) {
-    return { success: false, status: 'editor_not_ready', error: error.message, tabId };
+    baseResult = { success: false, status: 'editor_not_ready', error: error.message, tabId };
   }
+
+  const shouldTryFrameFallback = !baseResult.success
+    || !!baseResult.captchaContext?.iframeCaptchaPresent
+    || (!baseResult.captchaContext?.activeAnswerInput && !baseResult.captchaContext?.activeSubmitButton);
+
+  if (!shouldTryFrameFallback) {
+    return baseResult.success
+      ? {
+          ...baseResult,
+          captchaContext: finalizeResolvedCaptchaContext(baseResult.captchaContext || null, null)
+        }
+      : baseResult;
+  }
+
+  const frameContextResult = await getCrossFrameCaptchaContextForTab(tabId);
+  if (!frameContextResult.success) {
+    return baseResult.success
+      ? {
+          ...baseResult,
+          captchaContext: finalizeResolvedCaptchaContext(baseResult.captchaContext || null, frameContextResult),
+          frameContextFallback: frameContextResult
+        }
+      : frameContextResult;
+  }
+
+  return {
+    success: true,
+    tabId,
+    captchaContext: finalizeResolvedCaptchaContext(baseResult.captchaContext || null, frameContextResult),
+    frameContextResult
+  };
+}
+
+async function getBlockingCaptchaStateForTab(tabId) {
+  const captchaContextResult = await getCaptchaContextForTab(tabId);
+  if (!captchaContextResult.success) {
+    return captchaContextResult;
+  }
+
+  const captchaContext = captchaContextResult.captchaContext || null;
+  return {
+    success: true,
+    status: captchaContext?.captchaPresent ? 'captcha_required' : 'captcha_cleared',
+    tabId,
+    captchaPresent: !!captchaContext?.captchaPresent,
+    iframeCaptchaPresent: !!captchaContext?.iframeCaptchaPresent,
+    iframeShellOnly: !!captchaContext?.iframeShellOnly,
+    preferredSolveMode: captchaContext?.preferredSolveMode || null,
+    captchaContext
+  };
 }
 
 function normalizeCaptchaAnswer(answer) {
@@ -546,22 +1677,53 @@ async function submitCaptchaForTab(tabId, answer, options = {}) {
     return { success: false, status: 'captcha_answer_required', error: 'CAPTCHA 답안을 입력하세요.', tabId, answerNormalization: normalization.summary };
   }
 
+  let primaryResult = null;
   try {
-    const result = await chrome.tabs.sendMessage(tabId, {
+    const result = await sendTabMessageWithRecovery(tabId, {
       action: 'SUBMIT_CAPTCHA',
       data: {
         answer: normalization.value,
         waitMs: options.waitMs
       }
     });
-    return {
+    primaryResult = {
       ...result,
       tabId,
       answerNormalization: normalization.summary
     };
   } catch (error) {
-    return { success: false, status: 'editor_not_ready', error: error.message, tabId, answerNormalization: normalization.summary };
+    primaryResult = {
+      success: false,
+      status: 'editor_not_ready',
+      error: error.message,
+      tabId,
+      answerNormalization: normalization.summary
+    };
   }
+
+  const shouldTryFrameFallback = primaryResult.status === 'captcha_browser_handoff_required'
+    || primaryResult.status === 'captcha_input_not_found'
+    || primaryResult.status === 'captcha_submit_not_found'
+    || (!!primaryResult.diagnostics?.before?.iframeCaptchaPresent && !primaryResult.success);
+
+  if (!shouldTryFrameFallback) {
+    return primaryResult;
+  }
+
+  const frameFallback = await submitCaptchaViaFrameForTab(tabId, normalization.value, options);
+  if (!frameFallback.success) {
+    return {
+      ...primaryResult,
+      frameSubmitFallback: frameFallback
+    };
+  }
+
+  return {
+    ...frameFallback,
+    tabId,
+    answerNormalization: normalization.summary,
+    previousSubmitResult: primaryResult
+  };
 }
 
 function normalizeDirectPublishCaptchaWaitOptions(options = {}) {
@@ -585,7 +1747,8 @@ function normalizeDirectPublishCaptchaWaitOptions(options = {}) {
     postClearDelayMs: Math.max(
       0,
       Number(options.postClearDelayMs) || Number(options.captchaPostClearDelayMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.postClearDelayMs
-    )
+    ),
+    stageJitter: options.stageJitter || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.stageJitter
   };
 }
 
@@ -600,6 +1763,8 @@ function summarizeCaptchaWaitResult(waitResult = null, options = {}) {
     attempts: Number.isFinite(waitResult.attempts) ? waitResult.attempts : null,
     pollIntervalMs: Number.isFinite(waitResult.pollIntervalMs) ? waitResult.pollIntervalMs : null,
     postClearDelayMs: Number.isFinite(waitResult.postClearDelayMs) ? waitResult.postClearDelayMs : null,
+    postClearDelayAppliedMs: Number.isFinite(waitResult.postClearDelayAppliedMs) ? waitResult.postClearDelayAppliedMs : null,
+    postClearDelayExtraMs: Number.isFinite(waitResult.postClearDelayExtraMs) ? waitResult.postClearDelayExtraMs : null,
     captchaStillPresent: typeof waitResult.captchaStillPresent === 'boolean' ? waitResult.captchaStillPresent : null,
     completedAt: new Date().toISOString()
   };
@@ -622,6 +1787,7 @@ async function waitForCaptchaResolutionOnTab(tabId, options = {}) {
   const timeoutMs = Math.max(1000, Number(options.timeoutMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.timeoutMs);
   const pollIntervalMs = Math.max(250, Number(options.pollIntervalMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.pollIntervalMs);
   const postClearDelayMs = Math.max(0, Number(options.postClearDelayMs) || 0);
+  const postClearJitterOptions = options.stageJitter || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.stageJitter;
   const startedAt = Date.now();
   let attempts = 0;
   let lastCheck = null;
@@ -630,7 +1796,7 @@ async function waitForCaptchaResolutionOnTab(tabId, options = {}) {
     attempts += 1;
 
     try {
-      lastCheck = await chrome.tabs.sendMessage(tabId, { action: 'CHECK_CAPTCHA' });
+      lastCheck = await getBlockingCaptchaStateForTab(tabId);
     } catch (error) {
       return {
         success: false,
@@ -646,8 +1812,15 @@ async function waitForCaptchaResolutionOnTab(tabId, options = {}) {
     }
 
     if (!lastCheck?.captchaPresent) {
+      let postClearDelay = {
+        enabled: false,
+        baseMs: postClearDelayMs,
+        extraMs: 0,
+        waitMs: postClearDelayMs
+      };
+
       if (postClearDelayMs > 0) {
-        await delay(postClearDelayMs);
+        postClearDelay = await delayWithStageJitter(postClearDelayMs, postClearJitterOptions);
       }
 
       return {
@@ -658,6 +1831,8 @@ async function waitForCaptchaResolutionOnTab(tabId, options = {}) {
         attempts,
         pollIntervalMs,
         postClearDelayMs,
+        postClearDelayAppliedMs: postClearDelay.waitMs,
+        postClearDelayExtraMs: postClearDelay.extraMs,
         lastCheck,
         captchaStillPresent: false
       };
@@ -675,7 +1850,7 @@ async function waitForCaptchaResolutionOnTab(tabId, options = {}) {
   return {
     success: false,
     status: 'captcha_wait_timeout',
-    error: 'CAPTCHA가 아직 표시되어 있습니다. 같은 탭에서 browser/CDP handoff를 완료한 뒤 다시 시도하거나 waitTimeoutMs를 늘리세요.',
+    error: 'CAPTCHA가 아직 표시되어 있습니다. 같은 탭에서 solve 경로를 완료한 뒤 다시 시도하거나 waitTimeoutMs를 늘리세요.',
     tabId,
     waitedMs: Date.now() - startedAt,
     attempts,
@@ -720,6 +1895,8 @@ async function buildPreparationFromPreferredTab(tabId, requestData = {}) {
     currentTabId,
     candidateCount: 1,
     source: 'preferred_tab',
+    entryStrategy: 'resume_preferred_editor_tab',
+    entryPath: [{ step: 'resume_preferred_editor_tab', url: null }],
     attempts: []
   };
 
@@ -736,6 +1913,9 @@ async function buildPreparationFromPreferredTab(tabId, requestData = {}) {
   try {
     const tab = await chrome.tabs.get(tabId);
     currentTabId = tabId;
+    if (Array.isArray(diagnostics.entryPath) && diagnostics.entryPath[0]) {
+      diagnostics.entryPath[0].url = tab.url || null;
+    }
 
     return makePreparationResponse({
       success: true,
@@ -782,6 +1962,11 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
   if (waitOptions.enabled) {
     if (directPublishState?.tabId === preparation.tabId) {
       await updateDirectPublishState({
+        ...buildTransitionPatch(directPublishState || {}, 'waiting_browser_handoff', {
+          phase: 'captcha_handoff',
+          status: 'waiting_browser_handoff',
+          tabId: preparation.tabId
+        }),
         status: 'waiting_browser_handoff',
         lastCaptchaWait: {
           enabled: true,
@@ -804,10 +1989,18 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
     };
 
     if (directPublishState?.tabId === preparation.tabId) {
+      const nextStatus = captchaWait.success
+        ? 'ready_to_resume'
+        : (captchaWait.status === 'editor_not_ready' ? 'editor_not_ready' : 'captcha_required');
+
       await updateDirectPublishState({
-        status: captchaWait.success
-          ? 'ready_to_resume'
-          : (captchaWait.status === 'editor_not_ready' ? 'editor_not_ready' : 'captcha_required'),
+        ...buildTransitionPatch(directPublishState || {}, captchaWait.success ? 'captcha_cleared_wait_complete' : 'captcha_wait_failed', {
+          phase: 'captcha_handoff',
+          status: nextStatus,
+          waitStatus: captchaWait.status || null,
+          tabId: preparation.tabId
+        }),
+        status: nextStatus,
         lastCheckedAt: new Date().toISOString(),
         lastCaptchaWait: summarizeCaptchaWaitResult(captchaWait, waitOptions)
       });
@@ -821,7 +2014,7 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
         requestData: mergedRequestData,
         captchaContext: handoff.captchaContext || null
       });
-      await setDirectPublishState({
+      const failedState = {
         ...nextState,
         tabId: preparation.tabId,
         blogName: mergedRequestData.blogName || nextState.blogName || preparation.blogName,
@@ -831,6 +2024,15 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
         captchaContext: handoff.captchaContext || null,
         lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts),
         lastCaptchaWait: summarizeCaptchaWaitResult(captchaWait, waitOptions)
+      };
+      await setDirectPublishState({
+        ...failedState,
+        ...buildTransitionPatch(failedState, 'captcha_handoff_still_blocked', {
+          phase: 'captcha_handoff',
+          status: failedState.status,
+          waitStatus: captchaWait.status || null,
+          tabId: preparation.tabId
+        })
       });
       return attachCaptchaWait(attachCaptchaHandoff(attachDirectPublishState(withPreparationDetails({
         success: false,
@@ -840,7 +2042,7 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
     }
   } else {
     try {
-      const captchaCheck = await chrome.tabs.sendMessage(preparation.tabId, { action: 'CHECK_CAPTCHA' });
+      const captchaCheck = await getBlockingCaptchaStateForTab(preparation.tabId);
       if (captchaCheck?.captchaPresent) {
         const handoff = await captureCaptchaHandoffForTab(preparation.tabId);
         const nextState = liveState || buildDirectPublishState({
@@ -849,7 +2051,7 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
           requestData: mergedRequestData,
           captchaContext: handoff.captchaContext || null
         });
-        await setDirectPublishState({
+        const blockedState = {
           ...nextState,
           tabId: preparation.tabId,
           blogName: mergedRequestData.blogName || nextState.blogName || preparation.blogName,
@@ -858,6 +2060,14 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
           requestData: normalizeDirectPublishRequestData(mergedRequestData),
           captchaContext: handoff.captchaContext || null,
           lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
+        };
+        await setDirectPublishState({
+          ...blockedState,
+          ...buildTransitionPatch(blockedState, 'captcha_still_present_before_resume', {
+            phase: 'captcha_handoff',
+            status: 'captcha_required',
+            tabId: preparation.tabId
+          })
         });
         return attachCaptchaHandoff(attachDirectPublishState(withPreparationDetails({
           success: false,
@@ -871,6 +2081,11 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
   const draftRestore = await restoreDraftIfNeeded(preparation.tabId, mergedRequestData);
   if (!draftRestore.success) {
     await updateDirectPublishState({
+      ...buildTransitionPatch(directPublishState || {}, 'draft_restore_failed', {
+        phase: 'resume_publish',
+        status: draftRestore.status || 'draft_restore_failed',
+        tabId: preparation.tabId
+      }),
       tabId: preparation.tabId,
       url: preparation.url,
       requestData: normalizeDirectPublishRequestData(mergedRequestData),
@@ -892,6 +2107,12 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
   }
 
   await updateDirectPublishState({
+    ...buildTransitionPatch(directPublishState || {}, 'draft_restore_ready', {
+      phase: 'resume_publish',
+      status: 'ready_to_resume',
+      restored: !!draftRestore.restored,
+      tabId: preparation.tabId
+    }),
     tabId: preparation.tabId,
     url: preparation.url,
     requestData: normalizeDirectPublishRequestData(mergedRequestData),
@@ -957,10 +2178,6 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
   }
 }
 
-function clamp(value, min, max) {
-  return Math.min(Math.max(value, min), max);
-}
-
 function arrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
   const chunkSize = 0x8000;
@@ -985,7 +2202,7 @@ async function prepareCaptchaCaptureForTab(tabId) {
   }
 
   try {
-    const result = await chrome.tabs.sendMessage(tabId, { action: 'PREPARE_CAPTCHA_CAPTURE' });
+    const result = await sendTabMessageWithRecovery(tabId, { action: 'PREPARE_CAPTCHA_CAPTURE' }, { reinjectOnMissing: true });
     return { ...result, tabId };
   } catch (error) {
     return { success: false, status: 'editor_not_ready', error: error.message, tabId };
@@ -998,7 +2215,7 @@ async function getCaptchaImageArtifactForTab(tabId) {
   }
 
   try {
-    const result = await chrome.tabs.sendMessage(tabId, { action: 'GET_CAPTCHA_IMAGE_ARTIFACT' });
+    const result = await sendTabMessageWithRecovery(tabId, { action: 'GET_CAPTCHA_IMAGE_ARTIFACT' }, { reinjectOnMissing: true });
     return { ...result, tabId };
   } catch (error) {
     return { success: false, status: 'editor_not_ready', error: error.message, tabId };
@@ -1220,10 +2437,13 @@ async function getCaptchaArtifactsForTab(tabId, options = {}) {
     };
   }
 
-  const captureContext = prepared.captureContext || null;
-  const selectedCandidate = captureContext?.activeCaptureCandidate || prepared.selectedCandidate || null;
+  let captureContext = prepared.captureContext || null;
+  let selectedCandidate = captureContext?.activeCaptureCandidate || prepared.selectedCandidate || null;
   const directImageResult = await getCaptchaImageArtifactForTab(tabId);
   const viewportCropResult = await captureCaptchaViewportCrop(tab, captureContext, options);
+  const frameArtifactResult = (captureContext?.iframeCaptchaPresent || !directImageResult.success)
+    ? await getCrossFrameCaptchaArtifactForTab(tabId, options)
+    : null;
   const artifacts = {};
   const captureErrors = [];
 
@@ -1247,7 +2467,26 @@ async function getCaptchaArtifactsForTab(tabId, options = {}) {
     });
   }
 
-  const preferredArtifactKey = artifacts.viewportCrop ? 'viewportCrop' : (artifacts.directImage ? 'directImage' : null);
+  if (frameArtifactResult?.success && frameArtifactResult.artifact?.dataUrl) {
+    artifacts.frameDirectImage = frameArtifactResult.artifact;
+    captureContext = finalizeResolvedCaptchaContext(captureContext, frameArtifactResult.frameContextResult || null);
+    selectedCandidate = frameArtifactResult.selectedCandidate || selectedCandidate;
+  } else if (frameArtifactResult && !frameArtifactResult.success) {
+    captureErrors.push({
+      type: 'frame_direct_image',
+      status: frameArtifactResult.status || null,
+      error: frameArtifactResult.error || 'frame_direct_image_unavailable'
+    });
+  }
+
+  captureContext = finalizeResolvedCaptchaContext(
+    captureContext,
+    frameArtifactResult?.frameContextResult || frameArtifactResult || null
+  );
+
+  const preferredArtifactKey = artifacts.frameDirectImage
+    ? 'frameDirectImage'
+    : (artifacts.viewportCrop ? 'viewportCrop' : (artifacts.directImage ? 'directImage' : null));
   if (!preferredArtifactKey) {
     return {
       success: false,
@@ -1318,9 +2557,18 @@ async function captureCaptchaHandoffForTab(tabId, options = {}) {
 function attachCaptchaHandoff(response, handoff = null) {
   if (!handoff) return response;
 
+  const captchaContext = mergeResolvedCaptchaContext(response?.captchaContext, handoff.captchaContext);
+  const directPublish = response?.directPublish
+    ? {
+        ...response.directPublish,
+        captchaContext: mergeResolvedCaptchaContext(response.directPublish.captchaContext, handoff.captchaContext)
+      }
+    : response?.directPublish;
+
   return {
     ...response,
-    captchaContext: response?.captchaContext || handoff.captchaContext || null,
+    directPublish,
+    captchaContext,
     captchaArtifacts: handoff.captchaArtifacts || null
   };
 }
@@ -1330,7 +2578,7 @@ async function sendTabMessageWithTimeout(tabId, message, timeoutMs = EDITOR_PREP
 
   try {
     return await Promise.race([
-      chrome.tabs.sendMessage(tabId, message),
+      sendTabMessageWithRecovery(tabId, message, { reinjectOnMissing: true }),
       new Promise((_, reject) => {
         timerId = setTimeout(() => reject(new Error('ping_timeout')), timeoutMs);
       })
@@ -1474,7 +2722,13 @@ async function probeTabReady(tabId, diagnostics, step, options = {}) {
     }
 
     if (attempt < retries) {
-      await delay(intervalMs);
+      await applyPreparationStageDelay(
+        diagnostics,
+        `${step}_retry_wait`,
+        intervalMs,
+        EDITOR_PREPARE_DEFAULTS.stageJitter,
+        { tabId, attempt }
+      );
     }
   }
 
@@ -1518,10 +2772,7 @@ async function processNextInQueue() {
       currentTabId = preparation.tabId;
       await ensurePageWorldVisibilityInterceptor(preparation.tabId);
 
-      const response = await chrome.tabs.sendMessage(preparation.tabId, {
-        action: 'WRITE_POST',
-        data: { ...item.data, autoPublish: true }
-      });
+      const response = await sendEditorMessage(preparation.tabId, 'WRITE_POST', { ...item.data, autoPublish: true });
       const responseWithPreparation = normalizePublishResponse(withPreparationDetails(response, preparation));
 
       if (responseWithPreparation.success) {
@@ -2115,44 +3366,84 @@ async function ensurePageWorldVisibilityInterceptor(tabId) {
   }
 }
 
-async function navigateCandidateToEditor(tab, targetUrl, diagnostics) {
+async function navigateTabToUrl(tab, targetUrl, diagnostics, options = {}) {
+  const sameTarget = normalizeUrl(tab.url) === normalizeUrl(targetUrl);
+  const step = options.step || (sameTarget ? 'reuse_loaded_target' : 'navigate_tab');
+
   diagnostics.attempts.push({
-    step: normalizeUrl(tab.url) === normalizeUrl(targetUrl) ? 'reload_candidate' : 'navigate_candidate',
+    step,
     tabId: tab.id,
     fromUrl: tab.url || null,
-    toUrl: targetUrl
+    toUrl: targetUrl,
+    sameTarget
   });
 
   try {
-    if (normalizeUrl(tab.url) === normalizeUrl(targetUrl)) {
-      await chrome.tabs.reload(tab.id);
-    } else {
+    if (!sameTarget) {
       await chrome.tabs.update(tab.id, { url: targetUrl, active: true });
     }
   } catch (error) {
     diagnostics.attempts.push({
-      step: 'navigate_candidate_result',
+      step: `${step}_result`,
       tabId: tab.id,
       outcome: 'failed',
       error: error.message
     });
-    return { success: false, error: error.message };
+    return { success: false, error: error.message, tab };
   }
 
   const loadResult = await waitForTabLoadComplete(tab.id);
   diagnostics.attempts.push({
-    step: 'wait_for_load',
+    step: options.loadStep || 'wait_for_load',
     tabId: tab.id,
     outcome: loadResult.success ? 'complete' : 'failed',
-    error: loadResult.error || null
+    error: loadResult.error || null,
+    targetUrl
   });
 
   if (!loadResult.success) {
-    return { success: false, error: loadResult.error, tab: tab };
+    return { success: false, error: loadResult.error, tab };
   }
 
-  await delay(EDITOR_PREPARE_DEFAULTS.postLoadDelayMs);
-  return { success: true, tab: loadResult.tab };
+  await applyPreparationStageDelay(
+    diagnostics,
+    options.settleStep || `${step}_settle`,
+    options.settleDelayMs || EDITOR_PREPARE_DEFAULTS.postLoadDelayMs,
+    options.jitterOptions || EDITOR_PREPARE_DEFAULTS.stageJitter,
+    {
+      tabId: tab.id,
+      targetUrl,
+      sameTarget
+    }
+  );
+
+  return { success: true, tab: loadResult.tab || tab };
+}
+
+async function navigateTabToEditorViaManage(tab, blogName, diagnostics, options = {}) {
+  const manageUrl = buildManageHomeUrl(blogName);
+  const editorUrl = buildNewPostUrl(blogName);
+
+  diagnostics.entryPath = diagnostics.entryPath || [];
+  diagnostics.entryPath.push({ step: 'manage_home', url: manageUrl });
+
+  const manageNavigation = await navigateTabToUrl(tab, manageUrl, diagnostics, {
+    step: options.manageStep || 'navigate_manage_home',
+    loadStep: options.manageLoadStep || 'wait_for_manage_home_load',
+    settleStep: options.manageSettleStep || 'settle_manage_home'
+  });
+  if (!manageNavigation.success) {
+    return manageNavigation;
+  }
+
+  const manageTab = manageNavigation.tab || tab;
+  diagnostics.entryPath.push({ step: 'newpost', url: editorUrl });
+
+  return navigateTabToUrl(manageTab, editorUrl, diagnostics, {
+    step: options.editorStep || 'navigate_newpost',
+    loadStep: options.editorLoadStep || 'wait_for_newpost_load',
+    settleStep: options.editorSettleStep || 'settle_newpost'
+  });
 }
 
 function shouldReuseByNavigation(tab, targetBlogName) {
@@ -2193,6 +3484,10 @@ async function tryPrepareCandidateTab(tab, diagnostics, targetBlogName = null) {
 
   const initialProbe = await probeTabReady(tab.id, diagnostics, 'probe_existing');
   if (initialProbe.success) {
+    diagnostics.entryStrategy = diagnostics.entryStrategy || 'reuse_ready_tab';
+    diagnostics.entryPath = diagnostics.entryPath?.length
+      ? diagnostics.entryPath
+      : [{ step: 'reuse_existing_editor', url: tab.url || null }];
     currentTabId = tab.id;
     return makePreparationResponse({
       success: true,
@@ -2207,8 +3502,15 @@ async function tryPrepareCandidateTab(tab, diagnostics, targetBlogName = null) {
     return { success: false, error: initialProbe.error, tab };
   }
 
-  const targetUrl = buildNewPostUrl(targetBlogName);
-  const navigation = await navigateCandidateToEditor(tab, targetUrl, diagnostics);
+  diagnostics.entryStrategy = diagnostics.entryStrategy || 'candidate_manage_home_to_newpost';
+  const navigation = await navigateTabToEditorViaManage(tab, targetBlogName, diagnostics, {
+    manageStep: 'candidate_manage_home',
+    manageLoadStep: 'candidate_manage_home_load',
+    manageSettleStep: 'candidate_manage_home_settle',
+    editorStep: 'candidate_newpost',
+    editorLoadStep: 'candidate_newpost_load',
+    editorSettleStep: 'candidate_newpost_settle'
+  });
   if (!navigation.success) {
     return { success: false, error: navigation.error, tab };
   }
@@ -2230,16 +3532,17 @@ async function tryPrepareCandidateTab(tab, diagnostics, targetBlogName = null) {
 }
 
 async function openFreshEditorTab(blogName, diagnostics) {
-  const url = buildNewPostUrl(blogName);
+  const manageUrl = buildManageHomeUrl(blogName);
   let createdTab;
 
+  diagnostics.entryStrategy = diagnostics.entryStrategy || 'fresh_manage_home_to_newpost';
   diagnostics.attempts.push({
     step: 'open_fresh_tab',
-    toUrl: url
+    toUrl: manageUrl
   });
 
   try {
-    createdTab = await chrome.tabs.create({ url, active: true });
+    createdTab = await chrome.tabs.create({ url: manageUrl, active: true });
   } catch (error) {
     diagnostics.attempts.push({
       step: 'open_fresh_tab_result',
@@ -2249,30 +3552,29 @@ async function openFreshEditorTab(blogName, diagnostics) {
     return { success: false, error: error.message };
   }
 
-  const loadResult = await waitForTabLoadComplete(createdTab.id);
-  diagnostics.attempts.push({
-    step: 'wait_for_fresh_tab_load',
-    tabId: createdTab.id,
-    outcome: loadResult.success ? 'complete' : 'failed',
-    error: loadResult.error || null
+  const navigation = await navigateTabToEditorViaManage(createdTab, blogName, diagnostics, {
+    manageStep: 'fresh_manage_home',
+    manageLoadStep: 'wait_for_fresh_manage_home_load',
+    manageSettleStep: 'fresh_manage_home_settle',
+    editorStep: 'fresh_newpost',
+    editorLoadStep: 'wait_for_fresh_newpost_load',
+    editorSettleStep: 'fresh_newpost_settle'
   });
-
-  if (!loadResult.success) {
-    return { success: false, error: loadResult.error, tab: createdTab };
+  if (!navigation.success) {
+    return { success: false, error: navigation.error, tab: navigation.tab || createdTab };
   }
 
-  await delay(EDITOR_PREPARE_DEFAULTS.postLoadDelayMs);
-
-  const probeResult = await probeTabReady(createdTab.id, diagnostics, 'probe_fresh_tab');
+  const preparedTab = navigation.tab || createdTab;
+  const probeResult = await probeTabReady(preparedTab.id, diagnostics, 'probe_fresh_tab');
   if (!probeResult.success) {
-    return { success: false, error: probeResult.error, tab: loadResult.tab || createdTab };
+    return { success: false, error: probeResult.error, tab: preparedTab };
   }
 
-  currentTabId = createdTab.id;
+  currentTabId = preparedTab.id;
   return makePreparationResponse({
     success: true,
     status: 'editor_ready',
-    tab: loadResult.tab || createdTab,
+    tab: preparedTab,
     blogName,
     diagnostics
   });
@@ -2286,6 +3588,8 @@ async function prepareEditorTab(options = {}) {
     blogName,
     currentTabId,
     candidateCount: 0,
+    entryStrategy: null,
+    entryPath: [],
     attempts: []
   };
 
@@ -2365,7 +3669,7 @@ async function handleMessage(message, sender) {
 
       try {
         await ensurePageWorldVisibilityInterceptor(preparation.tabId);
-        const response = await chrome.tabs.sendMessage(preparation.tabId, message);
+        const response = await sendEditorMessage(preparation.tabId, message.action, message.data);
         const responseWithPreparation = normalizePublishResponse(withPreparationDetails(response, preparation));
 
         if (responseWithPreparation.status === 'captcha_required') {
@@ -2415,7 +3719,7 @@ async function handleMessage(message, sender) {
 
       try {
         await ensurePageWorldVisibilityInterceptor(preparation.tabId);
-        const response = await chrome.tabs.sendMessage(preparation.tabId, message);
+        const response = await sendEditorMessage(preparation.tabId, message.action, message.data);
         return normalizePublishResponse(withPreparationDetails(response, preparation));
       } catch (err) {
         return makePreparationResponse({
@@ -2655,7 +3959,7 @@ async function handleMessage(message, sender) {
 
       // CAPTCHA가 아직 표시되어 있는지 확인
       try {
-        const captchaCheck = await chrome.tabs.sendMessage(tabId, { action: 'CHECK_CAPTCHA' });
+        const captchaCheck = await getBlockingCaptchaStateForTab(tabId);
         if (captchaCheck?.captchaPresent) {
           return { success: false, error: 'CAPTCHA가 아직 표시되어 있습니다. 먼저 해결해주세요.', status: 'captcha_required' };
         }

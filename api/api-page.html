@@ -242,7 +242,7 @@
                 `PREPARE_EDITOR`는 이제 content script alive만 보지 않고 <strong>실제 editor body/TinyMCE/contenteditable</strong>까지 확인합니다. fresh 진입은 기본적으로 <strong>`manage → newpost`</strong> 경로를 탑니다.
                 `editor_not_ready`가 오면 <strong>`diagnostics.attempts[].editorProbe`</strong>, <strong>`diagnostics.entryPath`</strong>, <strong>`contentScriptAlive`</strong>, 그리고 `WRITE_POST` 실패 시 <strong>`preflight.reason`</strong>을 먼저 확인하세요.<br>
                 `captcha_required`가 오면 먼저 응답의 <strong>`captchaArtifacts`</strong>와 <strong>`stage` / `phase` / `publishTrace`</strong>를 확인하고, 필요하면 <strong>DIRECT STATE / CAPTCHA ARTIFACTS</strong>로 막힌 탭과 캡차 이미지를 다시 가져오세요. 응답의 <strong>`captchaContext.preferredSolveMode`</strong>와 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)`의 값은 서비스워커가 frame scan까지 merge한 최종 힌트입니다. solve 뒤 iframe 껍데기만 남아 있으면 wait/resume은 이 merged context 기준으로 unblock 됩니다.
-                OCR/비전으로 답안을 구하고 <strong>`SUBMIT_CAPTCHA_AND_RESUME`를 우선</strong> 호출하세요. v1.8.0부터는 iframe-only / cross-origin CAPTCHA도 확장이 same-tab frame solve를 먼저 시도합니다. 정말 <code>captcha_browser_handoff_required</code>가 남을 때만 browser/CDP fallback + <strong>`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`</strong>를 사용하세요.
+                OCR/비전으로 답안을 구하고 <strong>`SUBMIT_CAPTCHA_AND_RESUME`를 우선</strong> 호출하세요. v1.8.0부터는 iframe-only / cross-origin CAPTCHA도 확장이 same-tab frame solve를 먼저 시도합니다. 정말 <code>captcha_browser_handoff_required</code>가 남을 때만 browser/CDP fallback + <strong>`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`</strong>를 사용하세요. 이 wait 모드는 저장된 blocked tab이 아직 <code>captcha_present</code>여도 같은 탭을 그대로 잡고 대기한 뒤, CAPTCHA 해제 후 same-tab probe를 거쳐 재개합니다. handoff 중 일시적인 <code>editor_not_ready</code> / frame scan miss는 clear로 치지 않고 saved tab polling을 계속합니다.
                 구버전 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH`를 따로 사용하세요.
             </div>
             <div class="result" id="connect-result"></div>
@@ -373,7 +373,7 @@
                 }, (response) => {
                 <span class="key">if</span> (response.status === <span class="str">"captcha_browser_handoff_required"</span>) { <span class="key">// rare fallback only</span>
                 chrome.runtime.sendMessage(EXTENSION_ID, {
-                <span class="key">action</span>: <span class="str">"RESUME_DIRECT_PUBLISH"</span>,
+                <span class="key">action</span>: <span class="str">"RESUME_DIRECT_PUBLISH"</span>, <span class="key">// saved blocked tab 유지</span>
                 <span class="key">data</span>: {
                 <span class="key">waitForCaptcha</span>: <span class="str">true</span>,
                 <span class="key">waitTimeoutMs</span>: <span class="str">120000</span>,
@@ -395,7 +395,7 @@
                 console.log(response);
                 <span class="key">if</span> (!response.captchaStillAppears) {
                 chrome.runtime.sendMessage(EXTENSION_ID, {
-                <span class="key">action</span>: <span class="str">"RESUME_DIRECT_PUBLISH"</span>,
+                <span class="key">action</span>: <span class="str">"RESUME_DIRECT_PUBLISH"</span>, <span class="key">// saved blocked tab 유지</span>
                 <span class="key">data</span>: {
                 <span class="key">waitForCaptcha</span>: <span class="str">true</span>,
                 <span class="key">waitTimeoutMs</span>: <span class="str">120000</span>,
@@ -441,11 +441,14 @@
             const waitTimeoutMs = Number($('#resume-wait-timeout')?.value || 120000);
             const pollIntervalMs = Number($('#resume-poll-interval')?.value || 1000);
 
-            return {
-                waitForCaptcha,
-                waitTimeoutMs: Number.isFinite(waitTimeoutMs) ? Math.max(1000, waitTimeoutMs) : 120000,
-                pollIntervalMs: Number.isFinite(pollIntervalMs) ? Math.max(250, pollIntervalMs) : 1000
-            };
+            const payload = { waitForCaptcha };
+
+            if (waitForCaptcha) {
+                payload.waitTimeoutMs = Number.isFinite(waitTimeoutMs) ? Math.max(1000, waitTimeoutMs) : 120000;
+                payload.pollIntervalMs = Number.isFinite(pollIntervalMs) ? Math.max(250, pollIntervalMs) : 1000;
+            }
+
+            return payload;
         }
 
         function getOptionalTabId(inputId) {

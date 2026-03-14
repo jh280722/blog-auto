@@ -16,7 +16,7 @@
 > - **`captcha_required` / `captcha_browser_handoff_required` 응답에 same-tab artifact handoff 정보 즉시 포함**
 > - **CAPTCHA answer submit API (same blocked tab main DOM + cross-origin iframe 답안 입력 + 확인 버튼 클릭)**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`로 same-tab CAPTCHA 제출 + 즉시 발행 재개 일원화**
-> - **`RESUME_DIRECT_PUBLISH(waitForCaptcha)`로 extension-frame/browser fallback same-tab solve 완료까지 대기 후 즉시 재개**
+> - **`RESUME_DIRECT_PUBLISH(waitForCaptcha)`로 saved blocked tab을 유지한 채 extension-frame/browser fallback same-tab solve 완료까지 대기 후 즉시 재개**
 > - **stale tab 회피 + 실제 editor body readiness gate**
 > - **`WRITE_POST` 시작 전 final preflight로 title-only draft fail-closed**
 > - 자동저장 복구 팝업 자동 dismiss
@@ -36,7 +36,7 @@
 - **직접 응답 handoff**: `WRITE_POST` / `RESUME_DIRECT_PUBLISH` / `SUBMIT_CAPTCHA*`가 CAPTCHA로 막히면 응답에 `captchaArtifacts`를 같이 붙여 크론이 추가 왕복 없이 바로 OCR/비전으로 넘어갈 수 있음
 - **CAPTCHA submit API**: 에이전트가 blocked tab의 main DOM뿐 아니라 cross-origin iframe에도 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음
 - **CAPTCHA submit+resume API**: `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭 답안 제출과 직접 발행 재개를 한 번에 처리
-- **solve wait-resume**: `RESUME_DIRECT_PUBLISH`가 same-tab extension-frame/browser fallback 풀이가 끝날 때까지 내부 polling 후 즉시 발행 재개 가능
+- **solve wait-resume**: `RESUME_DIRECT_PUBLISH`가 `editorProbe.reason === "captcha_present"`인 blocked tab도 그대로 wait target으로 유지하고, same-tab extension-frame/browser fallback 풀이가 끝난 뒤 같은 탭 기준으로만 재개를 이어감. handoff 중 일시적인 `editor_not_ready` / frame-scan miss는 clear로 취급하지 않음
 - **실제 에디터 준비 probe**: `PREPARE_EDITOR`가 content script alive만 보지 않고 TinyMCE body / contenteditable / publish layer / CAPTCHA 상태까지 확인
 - **fail-closed 쓰기 preflight**: `WRITE_POST`는 title/category 쓰기 전에 실제 editor body를 다시 확인하고, 미준비면 `editor_not_ready` + `preflight`로 즉시 중단
 - **재개 전 draft self-heal**: CAPTCHA 후 재개 전에 제목/본문/카테고리/이미지/태그 스냅샷을 확인하고, 비어 있으면 같은 탭에서 자동 복구 후 발행
@@ -84,7 +84,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 → OCR/비전으로 답안 추출
 → `preferredSolveMode`가 `extension_dom` / `extension_frame_dom`이면 SUBMIT_CAPTCHA_AND_RESUME로 같은 탭 답안 입력 + 즉시 재개
 → iframe-only / cross-origin CAPTCHA도 우선 `extension_frame_dom`으로 처리되며, frame solve가 막힐 때만 `captcha_browser_handoff_required` + `preferredSolveMode=browser_handoff` 기준 browser/CDP fallback 사용
-→ fallback이 필요할 때 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`를 걸어두면 CAPTCHA 해제 감지 직후 같은 탭에서 자동 재개
+→ fallback이 필요할 때 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`를 걸어두면 blocked tab이 아직 `captcha_present` 상태여도 새 탭으로 갈아타지 않고, CAPTCHA 해제 감지 직후 같은 탭에서 자동 재개
 → CAPTCHA가 계속 보이면 새 답안/새 artifact로 재시도, 사라지면 발행 완료
 ```
 
@@ -418,7 +418,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - `lastCaptchaWait`: 마지막 `RESUME_DIRECT_PUBLISH(waitForCaptcha)` 대기 결과 요약
 - `lastDraftRestore`: 마지막 draft snapshot 점검/복구 결과 요약
 
-이 상태 덕분에 외부 에이전트/크론은 새 탭을 다시 고르지 않고, **막힌 동일 탭**을 기준으로 캡차 이미지를 가져오고 `SUBMIT_CAPTCHA_AND_RESUME`를 바로 호출할 수 있습니다. v1.8.0부터는 cross-origin iframe도 `frameDirectImage` + same-tab frame submit 경로를 우선 시도하며, frame solve가 막힌 예외 케이스에서만 `browser_handoff` + `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })` fallback을 사용합니다. 또한 초기 `captcha_required` 응답과 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)`는 서비스워커가 main DOM + frame scan 결과를 merge한 `captchaContext`를 반환하므로, 자동화는 raw iframe 감지값 대신 이 `preferredSolveMode`를 그대로 신뢰하면 됩니다. solve 뒤 iframe 껍데기만 남아 있는 경우에는 이 merged context가 `captchaPresent: false`로 정규화되어 불필요한 wait/resume timeout을 줄입니다.
+이 상태 덕분에 외부 에이전트/크론은 새 탭을 다시 고르지 않고, **막힌 동일 탭**을 기준으로 캡차 이미지를 가져오고 `SUBMIT_CAPTCHA_AND_RESUME`를 바로 호출할 수 있습니다. v1.8.0부터는 cross-origin iframe도 `frameDirectImage` + same-tab frame submit 경로를 우선 시도하며, frame solve가 막힌 예외 케이스에서만 `browser_handoff` + `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })` fallback을 사용합니다. 또한 초기 `captcha_required` 응답과 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)`는 서비스워커가 main DOM + frame scan 결과를 merge한 `captchaContext`를 반환하므로, 자동화는 raw iframe 감지값 대신 이 `preferredSolveMode`를 그대로 신뢰하면 됩니다. solve 뒤 iframe 껍데기만 남아 있는 경우에는 이 merged context가 `captchaPresent: false`로 정규화되어 불필요한 wait/resume timeout을 줄입니다. `waitForCaptcha` 모드는 저장된 blocked tab이 `captcha_present` 때문에 일반 editor-ready probe에 실패하더라도 같은 탭을 wait target으로 유지하고, CAPTCHA가 사라진 뒤에만 post-clear probe를 수행합니다. 이때 publish layer가 그대로 열려 있어도 `RESUME_PUBLISH`가 이어서 처리할 수 있는 상태로 간주합니다. handoff 중 일시적인 `editor_not_ready` / frame scan miss는 clear로 보지 않고 saved tab polling을 계속합니다.
 
 ### CAPTCHA Context / Submit 응답 포인트
 
@@ -430,7 +430,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`는 답안을 `trim`하고 내부 공백을 제거해 OCR 공백 노이즈를 줄입니다.
 - `SUBMIT_CAPTCHA_AND_RESUME`는 `submitResult` + `resumeResult`를 함께 반환하고, CAPTCHA가 사라졌으면 top-level `success` / `status` / `url`이 재개 결과를 반영합니다. `resumeResult.draftRestore`로 재개 전 self-heal 결과를 확인할 수 있습니다.
 - `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`는 iframe-only CAPTCHA에서도 우선 same-tab frame submit을 시도하고, 막히면 응답에 `captchaArtifacts`를 함께 실어 browser/CDP fallback으로 바로 이어지게 합니다.
-- `RESUME_DIRECT_PUBLISH`는 `data.waitForCaptcha`, `data.waitTimeoutMs`, `data.pollIntervalMs`를 지원하며, wait 모드일 때 응답의 `captchaWait`에 대기 결과를 포함합니다.
+- `RESUME_DIRECT_PUBLISH`는 `data.waitForCaptcha`, `data.waitTimeoutMs`, `data.pollIntervalMs`를 지원하며, wait 모드일 때 응답의 `captchaWait`에 대기 결과를 포함합니다. 이 wait는 저장된 blocked tab을 우선 유지하고, CAPTCHA 해제 뒤 same-tab post-clear probe를 거쳐 재개합니다. handoff 중 일시적인 `editor_not_ready` / frame scan miss는 clear로 취급하지 않습니다.
 - `SUBMIT_CAPTCHA.status`
   - `captcha_submitted`: 답안 입력 + 클릭 수행 후 짧은 대기 뒤 visible CAPTCHA가 더 이상 감지되지 않음
   - `captcha_still_present`: 답안 입력 + 클릭은 수행했지만 CAPTCHA가 계속 보임
@@ -455,7 +455,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 | `GET_CAPTCHA_ARTIFACTS` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)의 CAPTCHA 이미지 아티팩트 조회 |
 | `SUBMIT_CAPTCHA_AND_RESUME` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)에 CAPTCHA 답안을 제출하고 같은 탭에서 즉시 직접 발행 재개 |
 | `SUBMIT_CAPTCHA` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)에 CAPTCHA 답안 입력 + 확인 버튼 클릭 |
-| `RESUME_DIRECT_PUBLISH` | CAPTCHA 해결 후 직접 발행 재개 (saved tab 우선, `waitForCaptcha`/`waitTimeoutMs`/`pollIntervalMs` 지원) |
+| `RESUME_DIRECT_PUBLISH` | CAPTCHA 해결 후 직접 발행 재개 (saved blocked tab 우선, `waitForCaptcha`/`waitTimeoutMs`/`pollIntervalMs` 지원) |
 | `RESUME_AFTER_CAPTCHA` | CAPTCHA 해결 후 큐 항목 재개 (`data.id` 필요) |
 | `RETRY_ITEM` | 큐 항목 처음부터 재시도 (`data.id` 필요) |
 | `ADD_TO_QUEUE` | 큐에 추가 |

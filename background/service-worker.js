@@ -1288,6 +1288,281 @@ function buildDraftRestorePlan(snapshot = {}, requestData = {}) {
   };
 }
 
+
+function formatRecoveryVerificationIssues(issues = []) {
+  const messages = {
+    recovery_post_missing: '발행 직후 생성된 글을 찾지 못했습니다.',
+    recovery_post_title_mismatch: '발행 직후 글 제목이 요청과 일치하지 않습니다.',
+    recovery_post_content_missing: '발행 직후 저장된 글 본문이 비어 있습니다.',
+    recovery_post_text_too_small: '발행 직후 저장된 글 본문 길이가 기대치보다 너무 짧습니다.',
+    recovery_post_images_missing: '발행 직후 저장된 글 이미지가 누락되었습니다.',
+    recovery_snapshot_unavailable: '발행 직후 저장된 글 편집 화면을 확인하지 못했습니다.'
+  };
+
+  return issues.map((issue) => messages[issue] || issue).join(' ');
+}
+
+async function fetchManagePostsListForTab(tabId) {
+  if (!tabId) {
+    return {
+      success: false,
+      status: 'editor_not_ready',
+      error: 'posts 목록을 읽을 탭 ID가 없습니다.'
+    };
+  }
+
+  try {
+    const injectionResults = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: async () => {
+        try {
+          const response = await fetch('/manage/posts.json', { credentials: 'include', cache: 'no-store' });
+          const text = await response.text();
+          let json = null;
+          try {
+            json = JSON.parse(text);
+          } catch (_error) {}
+
+          return {
+            ok: response.ok,
+            status: response.status,
+            json,
+            textPreview: typeof text === 'string' ? text.slice(0, 500) : ''
+          };
+        } catch (error) {
+          return {
+            ok: false,
+            status: 0,
+            error: error.message || String(error)
+          };
+        }
+      }
+    });
+
+    const result = injectionResults?.[0]?.result || null;
+    if (!result?.ok || !result?.json) {
+      return {
+        success: false,
+        status: 'manage_posts_unavailable',
+        error: result?.error || `manage/posts.json fetch failed (${result?.status || 'unknown'})`,
+        response: result || null
+      };
+    }
+
+    return {
+      success: true,
+      status: 'manage_posts_ready',
+      items: Array.isArray(result.json.items) ? result.json.items : [],
+      totalCount: Number(result.json.totalCount) || 0,
+      response: result
+    };
+  } catch (error) {
+    return {
+      success: false,
+      status: 'manage_posts_unavailable',
+      error: error.message,
+      response: null
+    };
+  }
+}
+
+async function captureEditPostSnapshotForTab(tabId, blogName, postId) {
+  if (!tabId || !blogName || !postId) {
+    return {
+      success: false,
+      status: 'recovery_snapshot_unavailable',
+      error: 'edit snapshot에 필요한 정보(tabId/blogName/postId)가 부족합니다.'
+    };
+  }
+
+  const targetUrl = `https://${blogName}.tistory.com/manage/post/${postId}`;
+
+  try {
+    await chrome.tabs.update(tabId, { url: targetUrl, active: true });
+    const loadResult = await waitForTabLoadComplete(tabId, 15000);
+    if (!loadResult.success) {
+      return {
+        success: false,
+        status: 'recovery_snapshot_unavailable',
+        error: loadResult.error || 'edit page load failed',
+        url: targetUrl
+      };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    const injectionResults = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const titleCandidates = [
+          'input[name="title"]',
+          'textarea[name="title"]',
+          'input[placeholder*="제목"]',
+          'textarea[placeholder*="제목"]'
+        ];
+        const titleEl = titleCandidates.map((selector) => document.querySelector(selector)).find(Boolean);
+
+        const frames = Array.from(document.querySelectorAll('iframe'));
+        let editorBody = null;
+        for (const frame of frames) {
+          try {
+            const doc = frame.contentDocument || frame.contentWindow?.document;
+            const body = doc?.body;
+            if (body && (body.innerHTML || body.textContent)) {
+              editorBody = body;
+              break;
+            }
+          } catch (_error) {}
+        }
+
+        const html = (editorBody?.innerHTML || '').trim();
+        const text = (editorBody?.innerText || editorBody?.textContent || '').replace(/\s+/g, ' ').trim();
+
+        return {
+          url: window.location.href,
+          documentTitle: document.title || '',
+          title: titleEl?.value?.trim() || titleEl?.textContent?.trim() || '',
+          contentHtmlLength: html.length,
+          contentTextLength: text.length,
+          imageCount: (html.match(/<img\b/gi) || []).length,
+          hasMeaningfulContent: text.length > 0 || /<img\b/i.test(html),
+          hasImgur: /i\.imgur\.com/i.test(html)
+        };
+      }
+    });
+
+    return {
+      success: true,
+      status: 'recovery_snapshot_ready',
+      postId: String(postId),
+      snapshot: injectionResults?.[0]?.result || null,
+      url: targetUrl
+    };
+  } catch (error) {
+    return {
+      success: false,
+      status: 'recovery_snapshot_unavailable',
+      error: error.message,
+      postId: String(postId),
+      url: targetUrl
+    };
+  }
+}
+
+function verifyRecoverySnapshotAgainstRequest({ requestData = {}, item = null, snapshot = null }) {
+  const expected = buildExpectedDraftShape(requestData);
+  const issues = [];
+  const titleFromItem = String(item?.title || '').trim();
+  const titleFromSnapshot = String(snapshot?.title || '').trim();
+  const expectedTitle = String(expected.title || '').trim();
+
+  if (!item) {
+    issues.push('recovery_post_missing');
+  }
+
+  if (expectedTitle && titleFromItem !== expectedTitle && titleFromSnapshot !== expectedTitle) {
+    issues.push('recovery_post_title_mismatch');
+  }
+
+  if (!snapshot) {
+    issues.push('recovery_snapshot_unavailable');
+  } else {
+    if (!snapshot.hasMeaningfulContent) {
+      issues.push('recovery_post_content_missing');
+    }
+
+    if ((expected.contentTextLength || 0) > 0 && (Number(snapshot.contentTextLength) || 0) < Math.min(40, expected.contentTextLength)) {
+      issues.push('recovery_post_text_too_small');
+    }
+
+    if ((expected.images || []).length > 0 && (Number(snapshot.imageCount) || 0) < expected.images.length) {
+      issues.push('recovery_post_images_missing');
+    }
+  }
+
+  return {
+    confirmed: issues.length === 0,
+    issues,
+    error: issues.length === 0 ? null : formatRecoveryVerificationIssues(issues),
+    expected: {
+      title: expectedTitle,
+      contentTextLength: expected.contentTextLength,
+      imageCount: (expected.images || []).length
+    },
+    actual: snapshot ? {
+      title: titleFromSnapshot || titleFromItem,
+      contentTextLength: Number(snapshot.contentTextLength) || 0,
+      imageCount: Number(snapshot.imageCount) || 0,
+      hasMeaningfulContent: !!snapshot.hasMeaningfulContent,
+      hasImgur: !!snapshot.hasImgur
+    } : null
+  };
+}
+
+async function verifyPublishedPostRecovery(tabId, blogName, requestData = {}) {
+  const postsResult = await fetchManagePostsListForTab(tabId);
+  if (!postsResult.success) {
+    return {
+      success: false,
+      status: 'persistence_unverified',
+      error: postsResult.error || '발행 직후 posts 목록을 확인하지 못했습니다.',
+      postsResult
+    };
+  }
+
+  const expected = buildExpectedDraftShape(requestData);
+  const items = Array.isArray(postsResult.items) ? postsResult.items : [];
+  const candidates = items
+    .filter((item) => !expected.title || String(item.title || '').trim() === expected.title)
+    .sort((a, b) => Number(b.id || 0) - Number(a.id || 0))
+    .slice(0, 3);
+
+  if (candidates.length === 0) {
+    return {
+      success: false,
+      status: 'persistence_unverified',
+      error: formatRecoveryVerificationIssues(['recovery_post_missing']),
+      candidates: []
+    };
+  }
+
+  const failures = [];
+  for (const candidate of candidates) {
+    const snapshotResult = await captureEditPostSnapshotForTab(tabId, blogName, candidate.id);
+    const verification = verifyRecoverySnapshotAgainstRequest({
+      requestData,
+      item: candidate,
+      snapshot: snapshotResult.success ? snapshotResult.snapshot : null
+    });
+
+    if (verification.confirmed) {
+      return {
+        success: true,
+        status: 'confirmed',
+        item: candidate,
+        snapshot: snapshotResult.snapshot,
+        verification,
+        permalink: candidate.permalink || null,
+        editUrl: snapshotResult.snapshot?.url || snapshotResult.url || null
+      };
+    }
+
+    failures.push({
+      item: candidate,
+      snapshot: snapshotResult.success ? snapshotResult.snapshot : null,
+      snapshotResult,
+      verification
+    });
+  }
+
+  return {
+    success: false,
+    status: 'persistence_unverified',
+    error: failures[0]?.verification?.error || '발행 직후 생성된 글 본문/이미지 검증에 실패했습니다.',
+    candidates: failures
+  };
+}
+
 function isMissingTabConnectionError(error) {
   return /Could not establish connection|Receiving end does not exist/i.test(error?.message || '');
 }
@@ -3039,7 +3314,7 @@ async function getTistoryTabCandidates(targetBlogName = null) {
 
     const [sameBlogA, trackedA, pageA, accessA] = score(a);
     const [sameBlogB, trackedB, pageB, accessB] = score(b);
-    return sameBlogA - sameBlogB || trackedA - trackedB || pageA - pageB || accessA - accessB;
+    return sameBlogA - sameBlogB || pageA - pageB || trackedA - trackedB || accessA - accessB;
   });
 }
 
@@ -3394,6 +3669,113 @@ function installPageWorldPostInterceptor() {
     return pageState.captchaPayload;
   };
 
+  const MAIN_WORLD_REQUEST_EVENT = 'blog-auto-main-world-request';
+  const MAIN_WORLD_RESPONSE_EVENT = 'blog-auto-main-world-response';
+
+  const getMainWorldEditor = () => {
+    try {
+      if (window.tinymce?.activeEditor) return window.tinymce.activeEditor;
+      if (window.tinymce?.editors?.length > 0) return window.tinymce.editors[0];
+    } catch (_error) {}
+    return null;
+  };
+
+  const summarizeMainWorldEditor = (editor) => {
+    if (!editor) {
+      return {
+        hasEditor: false,
+        htmlLength: 0,
+        textLength: 0,
+        imageCount: 0
+      };
+    }
+
+    try {
+      const html = String(editor.getContent({ format: 'html' }) || '');
+      const text = stripHtml(html);
+      return {
+        hasEditor: true,
+        htmlLength: html.trim().length,
+        textLength: text.length,
+        imageCount: countMatches(html, /<img\b/gi)
+      };
+    } catch (error) {
+      return {
+        hasEditor: true,
+        htmlLength: 0,
+        textLength: 0,
+        imageCount: 0,
+        error: error.message || String(error)
+      };
+    }
+  };
+
+  const handleMainWorldEditorAction = (detail = {}) => {
+    const action = detail.action || null;
+
+    if (action === 'SET_EDITOR_CONTENT') {
+      const editor = getMainWorldEditor();
+      if (!editor) {
+        return {
+          success: false,
+          status: 'main_world_editor_missing',
+          error: 'MAIN world tinymce editor를 찾지 못했습니다.'
+        };
+      }
+
+      try {
+        const html = String(detail.html || '');
+        editor.focus?.();
+        editor.setContent(html);
+        editor.setDirty?.(true);
+        editor.nodeChanged?.();
+        editor.save?.();
+        editor.fire?.('change');
+        editor.fire?.('input');
+
+        const textarea = editor.getElement?.();
+        if (textarea && 'value' in textarea) {
+          textarea.value = html;
+          textarea.dispatchEvent(new Event('input', { bubbles: true }));
+          textarea.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        return {
+          success: true,
+          status: 'main_world_content_set',
+          snapshot: summarizeMainWorldEditor(editor)
+        };
+      } catch (error) {
+        return {
+          success: false,
+          status: 'main_world_content_set_failed',
+          error: error.message || String(error),
+          snapshot: summarizeMainWorldEditor(editor)
+        };
+      }
+    }
+
+    return {
+      success: false,
+      status: 'main_world_action_unknown',
+      error: `지원하지 않는 MAIN world action: ${action || 'unknown'}`
+    };
+  };
+
+  if (!window.__blogAutoMainWorldRequestHandlerInstalled) {
+    window.__blogAutoMainWorldRequestHandlerInstalled = true;
+    window.addEventListener(MAIN_WORLD_REQUEST_EVENT, (event) => {
+      const requestId = event?.detail?.requestId || null;
+      const result = handleMainWorldEditorAction(event?.detail || {});
+      window.dispatchEvent(new CustomEvent(MAIN_WORLD_RESPONSE_EVENT, {
+        detail: {
+          requestId,
+          result
+        }
+      }));
+    }, true);
+  }
+
   window.addEventListener('message', (event) => {
     const payload = extractPayload(event.data, { path: `message:${event.origin || 'unknown'}`, depth: 0 });
     if (payload) {
@@ -3699,6 +4081,34 @@ async function tryPrepareCandidateTab(tab, diagnostics, targetBlogName = null) {
     return { success: false, error: initialProbe.error, tab };
   }
 
+  // ── Fast-path: tab is already on /manage/newpost with a live content script ──
+  // probeTabReady sends PROBE_EDITOR_READY which requires full editor init,
+  // but the content script may already be alive (responds to PING).
+  // If so, skip the heavy navigation that would destroy the running content script.
+  if (isNewPostTab(tab.url)) {
+    const liveness = await probeContentScriptLiveness(tab.id);
+    diagnostics.attempts.push({
+      step: 'liveness_check_before_navigation',
+      tabId: tab.id,
+      url: tab.url,
+      alive: liveness.success
+    });
+    if (liveness.success) {
+      diagnostics.entryStrategy = diagnostics.entryStrategy || 'reuse_live_newpost_tab';
+      diagnostics.entryPath = diagnostics.entryPath?.length
+        ? diagnostics.entryPath
+        : [{ step: 'skip_navigation_content_script_alive', url: tab.url }];
+      currentTabId = tab.id;
+      return makePreparationResponse({
+        success: true,
+        status: 'editor_ready',
+        tab,
+        blogName: targetBlogName,
+        diagnostics
+      });
+    }
+  }
+
   diagnostics.entryStrategy = diagnostics.entryStrategy || 'candidate_manage_home_to_newpost';
   const navigation = await navigateTabToEditorViaManage(tab, targetBlogName, diagnostics, {
     manageStep: 'candidate_manage_home',
@@ -3889,6 +4299,110 @@ async function handleMessage(message, sender) {
 
         return responseWithPreparation;
       } catch (err) {
+        // ── Post-publish communication recovery ──
+        // The content script may have successfully published but the message
+        // channel closed before the response arrived (e.g., page navigation,
+        // content script re-injection, or long async publish flow timeout).
+        // Strategy: wait briefly, then check tab state and try PING.
+        console.warn('[TistoryAuto BG] WRITE_POST sendEditorMessage error:', err?.message || err);
+        preparation.diagnostics.attempts.push({
+          step: 'write_post_catch_recovery',
+          tabId: preparation.tabId,
+          originalError: err?.message || String(err)
+        });
+
+        try {
+          // Wait for any ongoing publish to complete
+          await new Promise(r => setTimeout(r, 3000));
+          const tabAfter = await chrome.tabs.get(preparation.tabId);
+          const urlAfter = tabAfter?.url || '';
+
+          const recoveryBlogName = message.data?.blogName || preparation.blogName || getTabBlogName(urlAfter);
+
+          // Case 1: Tab navigated away from newpost (publish redirected to /manage/posts/)
+          if (!isNewPostTab(urlAfter) && urlAfter.includes('/manage/')) {
+            console.log('[TistoryAuto BG] WRITE_POST recovery: tab navigated to', urlAfter);
+            const recoveryVerification = await verifyPublishedPostRecovery(preparation.tabId, recoveryBlogName, message.data || {});
+            if (recoveryVerification.success) {
+              return {
+                ...makePreparationResponse({
+                  success: true,
+                  status: 'published',
+                  tab: tabAfter,
+                  url: recoveryVerification.permalink || urlAfter,
+                  blogName: recoveryBlogName,
+                  diagnostics: preparation.diagnostics
+                }),
+                recoveryVerification,
+                note: '발행 후 페이지 이동 감지 + 저장된 글 본문/이미지 검증 완료'
+              };
+            }
+
+            return {
+              ...makePreparationResponse({
+                success: false,
+                status: recoveryVerification.status || 'persistence_unverified',
+                error: recoveryVerification.error || '발행 후 저장된 글 검증에 실패했습니다.',
+                tabId: preparation.tabId,
+                url: urlAfter,
+                blogName: recoveryBlogName,
+                diagnostics: preparation.diagnostics
+              }),
+              recoveryVerification
+            };
+          }
+
+          // Case 2: Tab still on newpost — probe content script for live status
+          if (isNewPostTab(urlAfter)) {
+            const liveness = await probeContentScriptLiveness(tabAfter.id);
+            if (liveness.success) {
+              // Content script is alive. Try sendEditorMessage one more time with a simple check.
+              try {
+                const snapshot = await sendEditorMessage(tabAfter.id, 'GET_DRAFT_SNAPSHOT');
+                const titlePresent = !!(snapshot?.title && String(snapshot.title).trim());
+                const textLength = Number(snapshot?.contentTextLength || 0);
+                const imageCount = Number(snapshot?.imageCount || 0);
+                const hasMeaningfulContent = titlePresent || textLength > 0 || imageCount > 0;
+                if (!hasMeaningfulContent) {
+                  console.log('[TistoryAuto BG] WRITE_POST recovery: editor empty, verifying latest saved post');
+                  const recoveryVerification = await verifyPublishedPostRecovery(preparation.tabId, recoveryBlogName, message.data || {});
+                  if (recoveryVerification.success) {
+                    return {
+                      ...makePreparationResponse({
+                        success: true,
+                        status: 'published',
+                        tab: tabAfter,
+                        url: recoveryVerification.permalink || urlAfter,
+                        blogName: recoveryBlogName,
+                        diagnostics: preparation.diagnostics
+                      }),
+                      recoveryVerification,
+                      note: '발행 후 에디터 초기화 감지 + 저장된 글 본문/이미지 검증 완료'
+                    };
+                  }
+
+                  return {
+                    ...makePreparationResponse({
+                      success: false,
+                      status: recoveryVerification.status || 'persistence_unverified',
+                      error: recoveryVerification.error || '발행 후 저장된 글 검증에 실패했습니다.',
+                      tabId: preparation.tabId,
+                      url: urlAfter,
+                      blogName: recoveryBlogName,
+                      diagnostics: preparation.diagnostics
+                    }),
+                    recoveryVerification
+                  };
+                }
+              } catch (_snapshotErr) {
+                // ignore, fall through
+              }
+            }
+          }
+        } catch (_tabErr) {
+          // tab might be closed, fall through to original error
+        }
+
         return makePreparationResponse({
           success: false,
           status: 'editor_not_ready',

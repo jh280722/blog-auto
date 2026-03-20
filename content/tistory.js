@@ -7,6 +7,16 @@
 (() => {
   'use strict';
 
+  // ── Double-injection guard ──
+  // Prevent multiple instances when content script is re-injected
+  // (e.g., via sendTabMessageWithRecovery → injectTistoryContentScripts)
+  // while a manifest-driven instance is already running.
+  if (window.__TISTORY_AUTO_CS_LOADED) {
+    console.log('[TistoryAuto] Content Script already loaded, skipping re-injection');
+    return;
+  }
+  window.__TISTORY_AUTO_CS_LOADED = true;
+
   const S = window.__TISTORY_SELECTORS || SELECTORS;
   const IMG = window.__IMAGE_HANDLER || ImageHandler;
   const MANAGE_POST_DIAG_KEY = '__blog_auto_last_manage_post_diag';
@@ -28,6 +38,44 @@
       .catch((error) => {
         console.warn('[TistoryAuto] MAIN world interceptor 초기 주입 실패:', error);
       });
+  }
+
+  function requestMainWorldEditorAction(action, payload = {}, timeout = 8000) {
+    return new Promise((resolve) => {
+      const requestId = `blog-auto-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const eventName = 'blog-auto-main-world-response';
+      let settled = false;
+
+      const cleanup = () => {
+        window.removeEventListener(eventName, handleResponse, true);
+      };
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      };
+
+      const timer = setTimeout(() => {
+        finish({ success: false, status: 'main_world_timeout', error: 'MAIN world editor bridge timed out.' });
+      }, timeout);
+
+      const handleResponse = (event) => {
+        if (event?.detail?.requestId !== requestId) return;
+        clearTimeout(timer);
+        finish(event.detail?.result || { success: false, status: 'main_world_no_result', error: 'MAIN world editor bridge returned no result.' });
+      };
+
+      window.addEventListener(eventName, handleResponse, true);
+      window.dispatchEvent(new CustomEvent('blog-auto-main-world-request', {
+        detail: {
+          requestId,
+          action,
+          ...payload
+        }
+      }));
+    });
   }
 
   // 유틸: 요소 대기 (최대 timeout ms)
@@ -935,9 +983,28 @@
 
       let contentSet = false;
 
-      // 1차: TinyMCE API (가장 안전한 경로 — 내부 textarea 동기화 포함)
+      try {
+        await chrome.runtime.sendMessage({ action: 'INJECT_MAIN_WORLD_VISIBILITY_HELPER' });
+      } catch (e) {
+        console.warn('[TistoryAuto] MAIN world interceptor 재주입 실패:', e);
+      }
+
+      // 1차: MAIN world TinyMCE bridge (isolated world에서 보이지 않는 page editor API 우선 사용)
+      try {
+        const mainWorldResult = await requestMainWorldEditorAction('SET_EDITOR_CONTENT', { html: htmlContent });
+        if (mainWorldResult?.success) {
+          contentSet = true;
+          console.log('[TistoryAuto] MAIN world editor bridge로 본문 입력 완료', mainWorldResult);
+        } else if (mainWorldResult?.error) {
+          console.warn('[TistoryAuto] MAIN world editor bridge 실패, fallback 시도:', mainWorldResult);
+        }
+      } catch (e) {
+        console.warn('[TistoryAuto] MAIN world editor bridge 예외, fallback 시도:', e);
+      }
+
+      // 2차: TinyMCE API (isolated world에서 접근 가능할 때만)
       const editor = getTinyMCEEditor();
-      if (editor) {
+      if (!contentSet && editor) {
         try {
           editor.setContent(htmlContent);
           editor.setDirty?.(true);
@@ -951,7 +1018,7 @@
         }
       }
 
-      // 2차: DOM fallback (TinyMCE API 불가 시 — 에디터 body에 직접 삽입)
+      // 3차: DOM fallback (마지막 수단 — 에디터 body에 직접 삽입)
       if (!contentSet) {
         const editorDoc = getEditorDocument();
         if (!editorDoc) {
@@ -1145,6 +1212,14 @@
       '</figure>',
       '<p>&nbsp;</p>'
     ].join('');
+  }
+
+  function buildPublishContentHtml(content = '', images = []) {
+    const baseHtml = String(content || '').trim();
+    const imageBlocks = Array.isArray(images) ? images.map((image) => buildInlineImageHtml(image)).join('') : '';
+    if (!imageBlocks) return baseHtml;
+    if (!baseHtml) return imageBlocks;
+    return `${baseHtml}<p>&nbsp;</p>${imageBlocks}`;
   }
 
   async function uploadImageViaTistory(imageBlob, filename = 'image.png') {
@@ -2790,33 +2865,30 @@
       });
     }
 
-    // 3. 본문
-    if (postData.content) {
-      mark('content_step_started');
-      results.content = await setContent(postData.content);
+    // 3. 본문 + 이미지 (같은 HTML payload로 page editor 상태에 반영)
+    const publishHtml = buildPublishContentHtml(postData.content || '', postData.images || []);
+    if (publishHtml) {
+      mark('content_step_started', {
+        contentHtmlLength: publishHtml.trim().length,
+        inlineImageCount: Array.isArray(postData.images) ? postData.images.length : 0
+      });
+      results.content = await setContent(publishHtml);
+      results.images = Array.isArray(postData.images) && postData.images.length > 0
+        ? {
+            success: !!results.content?.success,
+            mode: 'inline_content_html',
+            requested: postData.images.length
+          }
+        : { success: true, mode: 'no_images' };
       mark(results.content?.success ? 'content_step_completed' : 'content_step_failed', {
-        contentStatus: results.content?.status || null
+        contentStatus: results.content?.status || null,
+        imagesMode: results.images?.mode || null
       });
       const contentDelay = await delayWithStageJitter(500, STAGE_JITTER_DEFAULTS);
       mark('content_gap_wait_complete', {
         baseDelayMs: contentDelay.baseMs,
         jitterExtraMs: contentDelay.extraMs,
         waitedMs: contentDelay.waitMs
-      });
-    }
-
-    // 4. 이미지 삽입 (본문 뒤에 추가)
-    if (postData.images && postData.images.length > 0) {
-      mark('images_step_started', { imageCount: postData.images.length });
-      results.images = await insertImages(postData.images);
-      mark(results.images?.success ? 'images_step_completed' : 'images_step_failed', {
-        imageStatus: results.images?.status || null
-      });
-      const imagesDelay = await delayWithStageJitter(500, STAGE_JITTER_DEFAULTS);
-      mark('images_gap_wait_complete', {
-        baseDelayMs: imagesDelay.baseMs,
-        jitterExtraMs: imagesDelay.extraMs,
-        waitedMs: imagesDelay.waitMs
       });
     }
 

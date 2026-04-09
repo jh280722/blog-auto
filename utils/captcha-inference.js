@@ -5,6 +5,12 @@ const CAPTCHA_PLACEHOLDER_WORD_RE = /(?:빈\s*칸|공\s*란)/gu;
 const VARIABLE_MASK_CHAR = '¤';
 const ANY_MASK_RUN_RE = /(?:¤+|[□▢◻◼⬜⬛◯○●◎◇◆_＿]+)/gu;
 const COMPARABLE_TEXT_RE = new RegExp(`[^\\p{L}\\p{N}${CAPTCHA_MASK_CHAR_CLASS}${VARIABLE_MASK_CHAR}]`, 'gu');
+const OCR_CANDIDATE_BULLET_RE = /^[\s>*\-–—•·▪▫◦‣⁃]+/u;
+const OCR_CANDIDATE_LIST_PREFIX_RE = /^\s*(?:\d+[).:\-]|[A-Za-z][).:\-])\s*/u;
+const OCR_CANDIDATE_META_RE = /(?:정답(?:을)?\s*입력해주세요|답(?:을)?\s*입력해주세요|새로\s*풀기|음성\s*문제(?:\s*재생)?|답변\s*제출|DKAPTCHA(?:\s*\(CAPTCHA\s*서비스\))?|CAPTCHA\s*서비스)/iu;
+const INSTRUCTION_ACTION_RE = /(?:입력|선택|클릭|고르|찾|맞추|완성)(?:해\s*주|해주)?세요/u;
+const INSTRUCTION_TARGET_RE = /(?:지도|사진|이미지|화면)(?:에|에서)?\s*(?:있는|보이는)?\s*([^.,!?\n]{1,32}?)(?:의\s*(?:전체\s*)?(?:명칭|이름|상호|문구|텍스트|번호|주소)|을|를)\s*(?:정확한\s*)?(?:전체\s*)?(?:명칭|이름|상호|문구|텍스트|번호|주소)?\s*(?:을|를)?\s*(?:입력|선택|클릭|고르|찾|맞추|완성)/u;
+const INSTRUCTION_TRAILING_NOISE_RE = /\s*(?:정답(?:을)?\s*입력해주세요|답(?:을)?\s*입력해주세요|새로\s*풀기|음성\s*문제(?:\s*재생)?|답변\s*제출|DKAPTCHA(?:\s*\(CAPTCHA\s*서비스\))?|CAPTCHA\s*서비스).*$/iu;
 
 function normalizeChallengePlaceholders(value = '', options = {}) {
   const preserveVariableMask = !!options.preserveVariableMask;
@@ -68,6 +74,53 @@ export function parseCaptchaChallengeText(challengeText = '') {
     maskRuns,
     segments
   };
+}
+
+function normalizeInstructionText(value = '') {
+  return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+export function detectCaptchaChallengeKind(challengeText = '') {
+  const parsed = parseCaptchaChallengeText(challengeText);
+  if (parsed.hasMask) return 'masked';
+  if (INSTRUCTION_ACTION_RE.test(normalizeInstructionText(challengeText))) return 'instruction';
+  return null;
+}
+
+export function extractInstructionTargetEntity(challengeText = '') {
+  const normalized = normalizeInstructionText(challengeText).replace(INSTRUCTION_TRAILING_NOISE_RE, '').trim();
+  if (!normalized) return null;
+
+  const match = normalized.match(INSTRUCTION_TARGET_RE);
+  if (!match?.[1]) return null;
+
+  const target = normalizeInstructionText(match[1]).replace(/^(?:있는|보이는)\s*/u, '').trim();
+  return target || null;
+}
+
+function splitRawOcrCandidateText(value = '') {
+  return String(value ?? '')
+    .split(/\r?\n+/)
+    .map((entry) => entry.replace(OCR_CANDIDATE_LIST_PREFIX_RE, '').replace(OCR_CANDIDATE_BULLET_RE, '').trim())
+    .filter(Boolean);
+}
+
+export function normalizeCaptchaOcrCandidateTexts(values = []) {
+  const inputs = Array.isArray(values) ? values : [values];
+  const deduped = [];
+  const seen = new Set();
+
+  inputs.forEach((value) => {
+    if (typeof value !== 'string') return;
+    splitRawOcrCandidateText(value).forEach((candidate) => {
+      const normalized = normalizeComparableCaptchaText(candidate);
+      if (!normalized || seen.has(normalized)) return;
+      seen.add(normalized);
+      deduped.push(candidate);
+    });
+  });
+
+  return deduped;
 }
 
 function resolveAnswerPartsFromCandidate(parsedChallenge, candidateText = '') {
@@ -375,6 +428,165 @@ function buildUniqueAnswerCandidates(evaluatedCandidates = [], limit = null) {
   return uniqueAnswers;
 }
 
+function buildInstructionTargetForms(targetEntity = '') {
+  const normalized = normalizeComparableCaptchaText(targetEntity);
+  if (!normalized) return [];
+
+  const variants = new Set([normalized]);
+  if (normalized.endsWith('의원') && normalized.length > 2) {
+    variants.add(normalized.slice(0, -2));
+  }
+
+  return Array.from(variants).filter(Boolean);
+}
+
+function scoreInstructionAnswerCandidate(candidateText = '', targetForms = []) {
+  const sourceText = String(candidateText ?? '').trim();
+  const normalizedSourceText = normalizeComparableCaptchaText(sourceText);
+  if (!normalizedSourceText) {
+    return {
+      success: false,
+      sourceText,
+      normalizedSourceText,
+      inferredAnswer: '',
+      score: -1,
+      reasons: ['candidate_empty']
+    };
+  }
+
+  let score = 18;
+  const reasons = [];
+  const trimmedWithoutNoise = sourceText.replace(INSTRUCTION_TRAILING_NOISE_RE, '').trim();
+  const normalizedInstructionNoise = normalizeComparableCaptchaText(trimmedWithoutNoise);
+
+  if (OCR_CANDIDATE_META_RE.test(sourceText) || /^(?:답변제출|새로풀기|음성문제|정답입력해주세요|답입력해주세요)$/u.test(normalizedSourceText)) {
+    score -= 28;
+    reasons.push('ui_meta_noise');
+  }
+
+  if (normalizedInstructionNoise && normalizedInstructionNoise !== normalizedSourceText) {
+    score -= 8;
+    reasons.push('trailing_meta_noise');
+  }
+
+  if (normalizedSourceText.length >= 4 && normalizedSourceText.length <= 18) {
+    score += 8;
+    reasons.push('reasonable_length');
+  } else if (normalizedSourceText.length <= 2) {
+    score -= 18;
+    reasons.push('too_short');
+  } else if (normalizedSourceText.length > 24) {
+    score -= 10;
+    reasons.push('too_long');
+  }
+
+  if (targetForms.length > 0) {
+    const exactTarget = targetForms.find((target) => normalizedSourceText === target);
+    const suffixTarget = targetForms.find((target) => normalizedSourceText.length > target.length && normalizedSourceText.endsWith(target));
+    const containsTarget = !suffixTarget && targetForms.find((target) => normalizedSourceText.length > target.length && normalizedSourceText.includes(target));
+
+    if (suffixTarget) {
+      score += 32;
+      reasons.push('target_suffix_match');
+    } else if (containsTarget) {
+      score += 24;
+      reasons.push('target_contains_match');
+    } else if (exactTarget) {
+      score -= 14;
+      reasons.push('target_only');
+    } else {
+      score -= 4;
+      reasons.push('target_missing');
+    }
+  }
+
+  return {
+    success: score >= 18,
+    sourceText,
+    normalizedSourceText,
+    inferredAnswer: sourceText,
+    score,
+    reasons
+  };
+}
+
+export function inferInstructionCaptchaAnswer({ challengeText = '', ocrText = '', ocrTexts = [], targetEntity = null } = {}) {
+  const challengeKind = detectCaptchaChallengeKind(challengeText);
+  const resolvedTargetEntity = targetEntity || extractInstructionTargetEntity(challengeText) || null;
+  const targetForms = buildInstructionTargetForms(resolvedTargetEntity);
+  const candidates = normalizeCaptchaOcrCandidateTexts([...ocrTexts, ocrText]);
+
+  if (challengeKind !== 'instruction') {
+    return {
+      success: false,
+      status: 'captcha_instruction_challenge_missing',
+      error: 'instruction/map CAPTCHA 문제 문구를 찾지 못했습니다.',
+      challengeKind,
+      targetEntity: resolvedTargetEntity,
+      candidates: [],
+      answerCandidates: []
+    };
+  }
+
+  if (candidates.length === 0) {
+    return {
+      success: false,
+      status: 'captcha_ocr_candidate_missing',
+      error: 'OCR 후보 텍스트가 비어 있습니다.',
+      challengeKind,
+      targetEntity: resolvedTargetEntity,
+      candidates: [],
+      answerCandidates: []
+    };
+  }
+
+  const evaluated = candidates
+    .map((candidate) => scoreInstructionAnswerCandidate(candidate, targetForms))
+    .sort((left, right) => (right.score || 0) - (left.score || 0));
+
+  const answerCandidates = buildUniqueAnswerCandidates(evaluated);
+  const best = evaluated.find((candidate) => candidate.success && candidate.inferredAnswer) || null;
+  const runnerUp = evaluated.find((candidate) => candidate !== best && candidate.success && candidate.inferredAnswer) || null;
+
+  if (!best || !best.inferredAnswer) {
+    return {
+      success: false,
+      status: 'captcha_instruction_answer_inference_failed',
+      error: 'instruction/map CAPTCHA 대상 명칭을 OCR 후보에서 고르지 못했습니다.',
+      challengeKind,
+      targetEntity: resolvedTargetEntity,
+      candidates: evaluated,
+      answerCandidates
+    };
+  }
+
+  const bestHasStrongTargetMatch = best.reasons.includes('target_suffix_match') || best.reasons.includes('target_contains_match');
+  const scoreGap = runnerUp ? ((best.score || 0) - (runnerUp.score || 0)) : Infinity;
+  if (runnerUp && !bestHasStrongTargetMatch && scoreGap < 6) {
+    return {
+      success: false,
+      status: 'captcha_instruction_answer_ambiguous',
+      error: 'instruction/map CAPTCHA OCR 후보가 여러 개라 정답을 하나로 좁히지 못했습니다.',
+      challengeKind,
+      targetEntity: resolvedTargetEntity,
+      chosenCandidate: best,
+      candidates: evaluated,
+      answerCandidates
+    };
+  }
+
+  return {
+    success: true,
+    status: 'captcha_instruction_answer_inferred',
+    answer: best.inferredAnswer,
+    challengeKind,
+    targetEntity: resolvedTargetEntity,
+    chosenCandidate: best,
+    candidates: evaluated,
+    answerCandidates
+  };
+}
+
 export function inferCaptchaAnswer({ challengeText = '', ocrText = '', ocrTexts = [], answerLengthHint = null } = {}) {
   const parsedChallenge = parseCaptchaChallengeText(challengeText);
   const normalizedAnswerLengthHint = normalizeCaptchaAnswerLengthHint(answerLengthHint);
@@ -390,16 +602,10 @@ export function inferCaptchaAnswer({ challengeText = '', ocrText = '', ocrTexts 
     };
   }
 
-  const rawCandidates = [];
-  const seen = new Set();
-  [...ocrTexts, ocrText].forEach((entry) => {
-    const raw = String(entry ?? '').trim();
-    if (!raw) return;
-    const normalized = normalizeComparableCaptchaText(raw);
-    if (!normalized || seen.has(normalized)) return;
-    seen.add(normalized);
-    rawCandidates.push({ raw, normalized });
-  });
+  const rawCandidates = normalizeCaptchaOcrCandidateTexts([...ocrTexts, ocrText]).map((raw) => ({
+    raw,
+    normalized: normalizeComparableCaptchaText(raw)
+  }));
 
   if (rawCandidates.length === 0) {
     return {

@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 
 import {
   countCaptchaMaskSlots,
+  extractInstructionTargetEntity,
   inferCaptchaAnswer,
+  inferInstructionCaptchaAnswer,
+  normalizeCaptchaOcrCandidateTexts,
   normalizeComparableCaptchaText,
   parseCaptchaChallengeText
 } from '../utils/captcha-inference.js';
@@ -120,4 +123,42 @@ test('inferCaptchaAnswer fails cleanly when the OCR text does not match the chal
   assert.equal(result.success, false);
   assert.equal(result.status, 'captcha_answer_inference_failed');
   assert.deepEqual(result.answerCandidates, []);
+});
+
+
+test('normalizeCaptchaOcrCandidateTexts splits multiline OCR output and strips list prefixes', () => {
+  assert.deepEqual(
+    normalizeCaptchaOcrCandidateTexts([`1. 새봄한의원\n- 바로선치과\n• 답변 제출`]),
+    ['새봄한의원', '바로선치과', '답변 제출']
+  );
+});
+
+test('extractInstructionTargetEntity reads target entity from instruction challenge', () => {
+  assert.equal(
+    extractInstructionTargetEntity('지도에 있는 한의원의 전체 명칭을 입력해주세요'),
+    '한의원'
+  );
+});
+
+test('inferInstructionCaptchaAnswer picks the target-matching OCR candidate for map challenges', () => {
+  const result = inferInstructionCaptchaAnswer({
+    challengeText: '지도에 있는 한의원의 전체 명칭을 입력해주세요',
+    ocrTexts: ['바로선치과', '새봄한의원', '답변 제출']
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.answer, '새봄한의원');
+  assert.equal(result.targetEntity, '한의원');
+  assert.equal(result.chosenCandidate.sourceText, '새봄한의원');
+  assert.deepEqual(result.answerCandidates.map((candidate) => candidate.answer), ['새봄한의원', '바로선치과']);
+});
+
+test('inferInstructionCaptchaAnswer fails cleanly when multiple weak candidates stay ambiguous', () => {
+  const result = inferInstructionCaptchaAnswer({
+    challengeText: '지도에 있는 장소의 전체 명칭을 입력해주세요',
+    ocrTexts: ['서울약국', '미래문구']
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.status, 'captcha_instruction_answer_ambiguous');
 });

@@ -38,8 +38,12 @@ test('buildCaptchaSolveHints returns full-name guidance for instruction map DKAP
   assert.equal(hints.answerMode, 'read_target_full_text');
   assert.equal(hints.submitField, 'answer');
   assert.equal(hints.useInferenceApi, false);
+  assert.equal(hints.supportsOcrCandidates, true);
+  assert.equal(hints.ocrCandidateSelection, 'prefer_target_entity_match');
   assert.equal(hints.targetEntity, '한의원');
   assert.match(hints.prompt, /대상 유형: 한의원/);
+  assert.match(hints.prompt, /줄바꿈 목록으로 넘겨도 됩니다/);
+  assert.match(hints.nextAction, /ocrTexts fallback/);
   assert.match(hints.prompt, /전체 명칭만 한 줄/);
   assert.equal(hints.responseFormat, 'single_line_exact_name');
 });

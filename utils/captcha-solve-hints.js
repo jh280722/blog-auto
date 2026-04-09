@@ -1,29 +1,12 @@
-import { normalizeCaptchaAnswerLengthHint, parseCaptchaChallengeText } from './captcha-inference.js';
-
-const INSTRUCTION_ACTION_RE = /(?:입력|선택|클릭|고르|찾|맞추|완성)(?:해\s*주|해주)?세요/u;
-const INSTRUCTION_TARGET_RE = /(?:지도|사진|이미지|화면)(?:에|에서)?\s*(?:있는|보이는)?\s*([^.,!?\n]{1,32}?)(?:의\s*(?:전체\s*)?(?:명칭|이름|상호|문구|텍스트|번호|주소)|을|를)\s*(?:정확한\s*)?(?:전체\s*)?(?:명칭|이름|상호|문구|텍스트|번호|주소)?\s*(?:을|를)?\s*(?:입력|선택|클릭|고르|찾|맞추|완성)/u;
-const TRAILING_NOISE_RE = /\s*(?:정답(?:을)?\s*입력해주세요|답(?:을)?\s*입력해주세요|새로\s*풀기|음성\s*문제(?:\s*재생)?|답변\s*제출|DKAPTCHA(?:\s*\(CAPTCHA\s*서비스\))?|CAPTCHA\s*서비스).*$/iu;
+import {
+  detectCaptchaChallengeKind,
+  extractInstructionTargetEntity,
+  normalizeCaptchaAnswerLengthHint,
+  parseCaptchaChallengeText
+} from './captcha-inference.js';
 
 function normalizeText(value = '') {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
-}
-
-function detectChallengeKind(challengeText = '', challengeMasked = '') {
-  const parsed = parseCaptchaChallengeText(challengeText || challengeMasked || '');
-  if (parsed.hasMask) return 'masked';
-  if (INSTRUCTION_ACTION_RE.test(normalizeText(challengeText || challengeMasked))) return 'instruction';
-  return null;
-}
-
-function extractInstructionTarget(challengeText = '') {
-  const normalized = normalizeText(challengeText).replace(TRAILING_NOISE_RE, '').trim();
-  if (!normalized) return null;
-
-  const match = normalized.match(INSTRUCTION_TARGET_RE);
-  if (!match?.[1]) return null;
-
-  const target = normalizeText(match[1]).replace(/^(?:있는|보이는)\s*/u, '').trim();
-  return target || null;
 }
 
 function buildMaskedPrompt({ challengeText, challengeMasked, answerLengthHint }) {
@@ -49,6 +32,7 @@ function buildInstructionPrompt({ challengeText, targetEntity }) {
     `지시문: "${challengeText}"`,
     targetHint,
     '지시문과 일치하는 대상 하나를 이미지에서 찾은 뒤 그 대상의 전체 명칭을 정확히 읽어주세요.',
+    '정답 후보를 여러 줄로 읽었다면 그대로 줄바꿈 목록으로 넘겨도 됩니다.',
     '답변은 전체 명칭만 한 줄로 출력하고 설명은 쓰지 마세요.'
   ].filter(Boolean).join(' ');
 }
@@ -64,12 +48,12 @@ export function buildCaptchaSolveHints(captchaContext = null, extra = {}) {
     return null;
   }
 
-  const challengeKind = detectChallengeKind(challengeText, challengeMasked);
+  const challengeKind = detectCaptchaChallengeKind(challengeText || challengeMasked || '');
   const answerLengthHint = normalizeCaptchaAnswerLengthHint(captchaContext.answerLengthHint)
     || normalizeCaptchaAnswerLengthHint(captchaContext.challengeSlotCount)
     || null;
   const targetEntity = challengeKind === 'instruction'
-    ? extractInstructionTarget(challengeText || challengeMasked)
+    ? extractInstructionTargetEntity(challengeText || challengeMasked)
     : null;
 
   const common = {
@@ -101,10 +85,12 @@ export function buildCaptchaSolveHints(captchaContext = null, extra = {}) {
       answerMode: 'read_target_full_text',
       submitField: 'answer',
       useInferenceApi: false,
+      supportsOcrCandidates: true,
+      ocrCandidateSelection: 'prefer_target_entity_match',
       targetEntity,
       prompt: buildInstructionPrompt({ challengeText, targetEntity }),
       responseFormat: 'single_line_exact_name',
-      nextAction: 'SUBMIT_CAPTCHA_AND_RESUME with answer'
+      nextAction: 'SUBMIT_CAPTCHA_AND_RESUME with answer (or ocrTexts fallback)'
     };
   }
 

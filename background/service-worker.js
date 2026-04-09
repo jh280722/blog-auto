@@ -5,7 +5,14 @@
  * - 발행 큐 관리
  */
 
-import { inferCaptchaAnswer, normalizeCaptchaAnswerLengthHint, parseCaptchaChallengeText } from '../utils/captcha-inference.js';
+import {
+  detectCaptchaChallengeKind,
+  inferCaptchaAnswer,
+  inferInstructionCaptchaAnswer,
+  normalizeCaptchaAnswerLengthHint,
+  normalizeCaptchaOcrCandidateTexts,
+  parseCaptchaChallengeText
+} from '../utils/captcha-inference.js';
 import { buildCaptchaSolveHints } from '../utils/captcha-solve-hints.js';
 import {
   buildCaptchaChallengeSignature,
@@ -2690,35 +2697,13 @@ function normalizeCaptchaAnswer(answer) {
 }
 
 function collectOcrTextCandidates(data = {}) {
-  const rawCandidates = [];
-  const pushValue = (value) => {
-    if (typeof value !== 'string') return;
-    const trimmed = value.trim();
-    if (trimmed) rawCandidates.push(trimmed);
-  };
-
-  pushValue(data.ocrText);
-  pushValue(data.ocrCandidate);
-  pushValue(data.ocrResult);
-
-  if (Array.isArray(data.ocrTexts)) {
-    data.ocrTexts.forEach(pushValue);
-  }
-
-  if (Array.isArray(data.ocrCandidates)) {
-    data.ocrCandidates.forEach(pushValue);
-  }
-
-  const deduped = [];
-  const seen = new Set();
-  rawCandidates.forEach((candidate) => {
-    const key = candidate.replace(/\s+/g, '');
-    if (!key || seen.has(key)) return;
-    seen.add(key);
-    deduped.push(candidate);
-  });
-
-  return deduped;
+  return normalizeCaptchaOcrCandidateTexts([
+    data.ocrText,
+    data.ocrCandidate,
+    data.ocrResult,
+    ...(Array.isArray(data.ocrTexts) ? data.ocrTexts : []),
+    ...(Array.isArray(data.ocrCandidates) ? data.ocrCandidates : [])
+  ]);
 }
 
 async function resolveCaptchaAnswerInput(tabId, data = {}, savedState = null) {
@@ -2813,6 +2798,53 @@ async function resolveCaptchaAnswerInput(tabId, data = {}, savedState = null) {
         inference: null,
         captchaContext,
         ocrCandidates
+      };
+    }
+
+    const challengeKind = detectCaptchaChallengeKind(challenge.challengeText);
+    if (challengeKind === 'instruction') {
+      const instructionInference = inferInstructionCaptchaAnswer({
+        challengeText: challenge.challengeText,
+        ocrTexts: ocrCandidates,
+        targetEntity: data.targetEntity || captchaContext?.solveHints?.targetEntity || null
+      });
+
+      if (instructionInference.success) {
+        const inferredAnswer = normalizeCaptchaAnswer(instructionInference.answer || '');
+        const answerCandidates = (Array.isArray(instructionInference.answerCandidates)
+          ? instructionInference.answerCandidates
+          : [])
+          .map((candidate) => {
+            const normalized = normalizeCaptchaAnswer(candidate.answer || '');
+            return normalized.value
+              ? {
+                  ...candidate,
+                  answer: normalized.value,
+                  normalizedAnswer: normalized.value,
+                  answerNormalization: normalized.summary
+                }
+              : null;
+          })
+          .filter(Boolean);
+
+        return {
+          success: true,
+          source: 'ocr_instruction_inference',
+          answer: inferredAnswer.value,
+          answerNormalization: inferredAnswer.summary,
+          answerCandidates,
+          inference: instructionInference,
+          captchaContext,
+          ocrCandidates
+        };
+      }
+
+      return {
+        success: false,
+        ...instructionInference,
+        captchaContext,
+        ocrCandidates,
+        challenge
       };
     }
 

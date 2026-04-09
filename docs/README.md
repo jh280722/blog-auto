@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.7 (2026-04-10 CAPTCHA solve-hint patch 포함)**
+> 현재 운영 기준: **v1.8.9 (2026-04-10 instruction ranked retry follow-up patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -24,7 +24,8 @@
 > - **live DKAPTCHA frame summary가 frame body line + submit button text까지 다시 합쳐 instruction-style / masked challenge를 재구성하므로 `challengeText: null` 회차를 줄임**
 > - **`INFER_CAPTCHA_ANSWER`로 OCR 후보 텍스트를 빈칸 답안으로 바로 줄이는 helper 추가**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`가 explicit answer뿐 아니라 OCR 후보 텍스트 기반 답안 추론도 바로 수용**
-> - **OCR 후보가 여러 개면 `SUBMIT_CAPTCHA*`가 상위 답안 후보를 같은 challenge에서 순차 재시도하고, challenge가 바뀌면 즉시 중단 후 새 handoff로 전환**
+> - **OCR 후보가 여러 개면 `SUBMIT_CAPTCHA*`가 masked뿐 아니라 instruction/map CAPTCHA도 상위 답안 후보를 같은 challenge에서 순차 재시도하고, challenge가 바뀌면 즉시 중단 후 새 handoff로 전환**
+> - **instruction/map same-challenge retry 직전에는 answer input + submit button이 다시 actionable 해질 때까지 짧게 재대기해서, 첫 오답 직후 transient `captcha_input_not_found`로 두 번째 후보를 놓치는 회차를 줄임**
 > - **challenge 문구를 다시 못 읽는 경우에도 same challenge 동일성을 visual signature fallback으로 계속 비교**
 > - **live `/manage/newpost` 탭에서 content script가 살아 있어도 probe가 실패하면 곧바로 `editor_ready`로 간주하지 않고 `manage → newpost` 회복 경로를 다시 태움**
 > - **`RESUME_DIRECT_PUBLISH(waitForCaptcha)`로 saved blocked tab을 유지한 채 extension-frame/browser fallback same-tab solve 완료까지 대기 후 즉시 재개**
@@ -55,7 +56,8 @@
 - **missing-response submit recovery**: frame submit 직후 iframe reload/navigation으로 응답 payload가 비어도 tab URL과 refreshed `captchaContext`를 다시 읽어 `captcha_submit_tab_navigated` / `captcha_submitted` / `captcha_still_present`를 복구함
 - **CAPTCHA inference API**: `INFER_CAPTCHA_ANSWER`로 `백촌오피스□ + 백촌오피스텔 → 텔` 같은 빈칸 답안을 안정적으로 추론
 - **CAPTCHA submit+resume API**: `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭 답안 제출과 직접 발행 재개를 한 번에 처리하고, submit 단계에서 이미 완료 URL로 이동하면 추가 resume 없이 성공으로 종료함
-- **ranked answer retry**: OCR 후보가 여러 개면 `INFER_CAPTCHA_ANSWER` 응답의 `answerCandidates`를 기준으로 `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`가 같은 challenge 안에서 상위 답안을 자동 재시도
+- **ranked answer retry**: OCR 후보가 여러 개면 `INFER_CAPTCHA_ANSWER` 또는 instruction/map inference의 `answerCandidates`를 기준으로 `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`가 같은 challenge 안에서 상위 답안을 자동 재시도
+- **retry-ready wait**: same-challenge 재시도 직전 `activeAnswerInput` + `activeSubmitButton`이 다시 잡힐 때까지 짧게 polling해서, 첫 submit 직후 iframe이 잠깐 비활성화되는 회차에서도 다음 후보 제출 성공률을 올림
 - **visual challenge fallback**: `challengeText`가 비는 iframe/canvas CAPTCHA에서도 visual signature를 같이 비교해 같은 challenge 재시도를 너무 빨리 끊지 않음
 - **post-publish channel-close recovery 공통화**: 발행 직후 탭 이동으로 content-script 응답 채널이 닫혀도 `WRITE_POST`, queue auto-publish, `RESUME_AFTER_CAPTCHA`, `RESUME_DIRECT_PUBLISH`가 최신 saved post를 다시 검증해 false fail을 줄임
 - **solve wait-resume**: `RESUME_DIRECT_PUBLISH`가 `editorProbe.reason === "captcha_present"`인 blocked tab도 그대로 wait target으로 유지하고, same-tab extension-frame/browser fallback 풀이가 끝난 뒤 같은 탭 기준으로만 재개를 이어감. handoff 중 일시적인 `editor_not_ready` / frame-scan miss는 clear로 취급하지 않음

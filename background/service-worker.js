@@ -23,6 +23,10 @@ import {
   classifyRecoveredCaptchaSubmitOutcome,
   looksLikeDirectPublishCompletionUrl
 } from '../utils/captcha-submit-recovery.js';
+import {
+  buildCaptchaAnswerAttemptCandidates,
+  supportsRankedCaptchaAnswerRetries
+} from '../utils/captcha-answer-retry.js';
 
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
@@ -61,6 +65,11 @@ const DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS = {
     minExtraMs: 20,
     maxExtraMs: 320
   }
+};
+
+const CAPTCHA_RETRY_READY_DEFAULTS = {
+  timeoutMs: 4000,
+  pollIntervalMs: 250
 };
 
 /**
@@ -2899,46 +2908,6 @@ async function resolveCaptchaAnswerInput(tabId, data = {}, savedState = null) {
   };
 }
 
-function buildCaptchaAnswerAttemptCandidates(answerResolution, options = {}) {
-  const defaultMaxAttempts = answerResolution?.source === 'ocr_inference' ? 3 : 1;
-  const maxAttempts = clamp(Number(options.maxAnswerAttempts) || defaultMaxAttempts, 1, 5);
-  const allowExplicitAnswerRetries = options.allowExplicitAnswerRetries === true || options.retryExplicitAnswer === true;
-  const candidates = [];
-  const seenAnswers = new Set();
-
-  const pushCandidate = (candidate = {}, sourceFallback = null) => {
-    const normalized = normalizeCaptchaAnswer(candidate.answer || '');
-    if (!normalized.value || seenAnswers.has(normalized.value)) return;
-    seenAnswers.add(normalized.value);
-    candidates.push({
-      answer: normalized.value,
-      answerNormalization: candidate.answerNormalization || normalized.summary,
-      source: candidate.source || sourceFallback || answerResolution?.source || null,
-      sourceText: candidate.sourceText || null,
-      normalizedSourceText: candidate.normalizedSourceText || null,
-      score: Number.isFinite(candidate.score) ? candidate.score : null,
-      reasons: Array.isArray(candidate.reasons) ? candidate.reasons : []
-    });
-  };
-
-  pushCandidate({
-    answer: answerResolution?.answer,
-    answerNormalization: answerResolution?.answerNormalization,
-    source: answerResolution?.source,
-    reasons: [answerResolution?.source || 'primary_answer']
-  }, 'primary_answer');
-
-  const shouldAppendRankedCandidates = answerResolution?.source === 'ocr_inference' || allowExplicitAnswerRetries;
-  if (shouldAppendRankedCandidates) {
-    const rankedCandidates = Array.isArray(answerResolution?.answerCandidates) && answerResolution.answerCandidates.length > 0
-      ? answerResolution.answerCandidates
-      : (Array.isArray(answerResolution?.inference?.answerCandidates) ? answerResolution.inference.answerCandidates : []);
-    rankedCandidates.forEach((candidate) => pushCandidate(candidate, 'ocr_inference_candidate'));
-  }
-
-  return candidates.slice(0, maxAttempts);
-}
-
 async function hashCaptchaArtifactDataUrl(dataUrl = '') {
   const normalized = typeof dataUrl === 'string' ? dataUrl.trim() : '';
   if (!normalized) return null;
@@ -3019,6 +2988,82 @@ async function getCaptchaChallengeSignature(tabId, captchaContext = null, option
   return buildCaptchaChallengeSignature(captchaContext, { visualSignature });
 }
 
+async function waitForCaptchaRetryReadyOnTab(tabId, options = {}) {
+  if (!tabId) {
+    return {
+      success: false,
+      status: 'editor_not_ready',
+      error: 'CAPTCHA 재시도 대기 대상 탭 ID가 없습니다.',
+      tabId,
+      waitedMs: 0,
+      attempts: 0,
+      pollIntervalMs: options.pollIntervalMs || CAPTCHA_RETRY_READY_DEFAULTS.pollIntervalMs
+    };
+  }
+
+  const timeoutMs = clamp(
+    Number(options.retryReadyTimeoutMs) || Number(options.timeoutMs) || CAPTCHA_RETRY_READY_DEFAULTS.timeoutMs,
+    250,
+    15000
+  );
+  const pollIntervalMs = clamp(
+    Number(options.retryReadyPollIntervalMs) || Number(options.pollIntervalMs) || CAPTCHA_RETRY_READY_DEFAULTS.pollIntervalMs,
+    100,
+    2000
+  );
+  const startedAt = Date.now();
+  let attempts = 0;
+  let lastContextResult = null;
+
+  while ((Date.now() - startedAt) <= timeoutMs) {
+    attempts += 1;
+    lastContextResult = await getCaptchaContextForTab(tabId);
+    const captchaContext = lastContextResult?.success ? lastContextResult.captchaContext || null : null;
+    const ready = !!(captchaContext?.captchaPresent && captchaContext?.activeAnswerInput && captchaContext?.activeSubmitButton);
+
+    if (ready) {
+      return {
+        success: true,
+        status: 'captcha_retry_ready',
+        tabId,
+        waitedMs: Date.now() - startedAt,
+        attempts,
+        pollIntervalMs,
+        captchaContext,
+        contextResult: lastContextResult
+      };
+    }
+
+    if (captchaContext && captchaContext.captchaPresent === false) {
+      return {
+        success: false,
+        status: 'captcha_not_present',
+        tabId,
+        waitedMs: Date.now() - startedAt,
+        attempts,
+        pollIntervalMs,
+        captchaContext,
+        contextResult: lastContextResult
+      };
+    }
+
+    if ((Date.now() - startedAt) >= timeoutMs) break;
+    await delay(pollIntervalMs);
+  }
+
+  return {
+    success: false,
+    status: 'captcha_retry_not_ready',
+    error: 'CAPTCHA 재시도 입력창이 준비될 때까지 기다렸지만 actionable state를 확보하지 못했습니다.',
+    tabId,
+    waitedMs: Date.now() - startedAt,
+    attempts,
+    pollIntervalMs,
+    captchaContext: lastContextResult?.success ? lastContextResult.captchaContext || null : null,
+    contextResult: lastContextResult
+  };
+}
+
 async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}) {
   const answerAttemptPlan = buildCaptchaAnswerAttemptCandidates(answerResolution, options);
   if (answerAttemptPlan.length === 0) {
@@ -3040,7 +3085,7 @@ async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}
     };
   }
 
-  const retryEnabled = answerResolution?.source === 'ocr_inference' && answerAttemptPlan.length > 1;
+  const retryEnabled = supportsRankedCaptchaAnswerRetries(answerResolution, options) && answerAttemptPlan.length > 1;
   const initialChallengeSignature = await getCaptchaChallengeSignature(tabId, answerResolution?.captchaContext, {
     includeVisualFallback: retryEnabled
   });
@@ -3051,6 +3096,19 @@ async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}
 
   for (let index = 0; index < answerAttemptPlan.length; index += 1) {
     const candidate = answerAttemptPlan[index];
+    let retryReadyResult = null;
+
+    if (index > 0) {
+      retryReadyResult = await waitForCaptchaRetryReadyOnTab(tabId, options);
+      if (!retryReadyResult.success) {
+        lastRefreshedContext = retryReadyResult.contextResult?.success ? retryReadyResult.contextResult : lastRefreshedContext;
+        stoppedReason = retryReadyResult.status === 'captcha_not_present'
+          ? 'captcha_cleared_during_retry_wait'
+          : 'retry_context_not_ready';
+        break;
+      }
+    }
+
     const submitResult = await submitCaptchaForTab(tabId, candidate.answer, options);
     const submitCompletedByNavigation = submitResult?.status === 'captcha_submit_tab_navigated'
       || looksLikeDirectPublishCompletionUrl(submitResult?.url || '');
@@ -3099,7 +3157,16 @@ async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}
       challengeChanged: !!(captchaStillAppears && challengeComparison.changed),
       challengeSignature: refreshedChallengeSignature?.primary || null,
       challengeSignatureDetails: refreshedChallengeSignature || null,
-      challengeComparison
+      challengeComparison,
+      retryReady: retryReadyResult
+        ? {
+            success: !!retryReadyResult.success,
+            status: retryReadyResult.status || null,
+            waitedMs: Number.isFinite(retryReadyResult.waitedMs) ? retryReadyResult.waitedMs : null,
+            attempts: Number.isFinite(retryReadyResult.attempts) ? retryReadyResult.attempts : null,
+            pollIntervalMs: Number.isFinite(retryReadyResult.pollIntervalMs) ? retryReadyResult.pollIntervalMs : null
+          }
+        : null
     });
 
     if (!submitResult.success) {

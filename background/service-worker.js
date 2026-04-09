@@ -6,6 +6,7 @@
  */
 
 import { inferCaptchaAnswer, normalizeCaptchaAnswerLengthHint, parseCaptchaChallengeText } from '../utils/captcha-inference.js';
+import { buildCaptchaSolveHints } from '../utils/captcha-solve-hints.js';
 import {
   buildCaptchaChallengeSignature,
   compareCaptchaChallengeSignatures,
@@ -109,7 +110,7 @@ async function persistDirectPublishState() {
 }
 
 async function setDirectPublishState(state) {
-  directPublishState = state ? { ...state } : null;
+  directPublishState = state ? enrichDirectPublishStateWithSolveHints({ ...state }) : null;
   await persistDirectPublishState();
   return directPublishState;
 }
@@ -121,11 +122,11 @@ async function clearDirectPublishState() {
 
 async function updateDirectPublishState(patch = {}) {
   if (!directPublishState) return null;
-  directPublishState = {
+  directPublishState = enrichDirectPublishStateWithSolveHints({
     ...directPublishState,
     ...patch,
     updatedAt: new Date().toISOString()
-  };
+  });
   await persistDirectPublishState();
   return directPublishState;
 }
@@ -333,6 +334,94 @@ function cloneJsonValue(value) {
     console.warn('[TistoryAuto BG] JSON clone 실패:', error);
     return null;
   }
+}
+
+function enrichCaptchaContextWithSolveHints(context = null, extra = {}) {
+  if (!context || typeof context !== 'object') {
+    return context;
+  }
+
+  const next = cloneJsonValue(context) || context || null;
+  if (!next || typeof next !== 'object') {
+    return next;
+  }
+
+  const solveHints = buildCaptchaSolveHints(next, extra);
+  if (solveHints) {
+    next.solveHints = solveHints;
+  } else if ('solveHints' in next) {
+    delete next.solveHints;
+  }
+
+  return next;
+}
+
+function enrichCaptchaArtifactResultWithSolveHints(result = null) {
+  if (!result || typeof result !== 'object') {
+    return result;
+  }
+
+  const next = { ...result };
+  const solveHintExtra = {
+    artifactPreference: result.artifactPreference || null,
+    artifactKinds: Object.entries(result.artifacts || {})
+      .filter(([, artifact]) => artifact?.dataUrl)
+      .map(([key]) => key)
+  };
+
+  if (result.captureContext && typeof result.captureContext === 'object') {
+    next.captureContext = enrichCaptchaContextWithSolveHints(result.captureContext, solveHintExtra);
+  }
+
+  if (result.captchaContext && typeof result.captchaContext === 'object') {
+    next.captchaContext = enrichCaptchaContextWithSolveHints(result.captchaContext, solveHintExtra);
+  }
+
+  const solveHints = next.captureContext?.solveHints
+    || next.captchaContext?.solveHints
+    || buildCaptchaSolveHints(result.captureContext || result.captchaContext || null, solveHintExtra);
+
+  if (solveHints) {
+    next.solveHints = solveHints;
+  } else if ('solveHints' in next) {
+    delete next.solveHints;
+  }
+
+  return next;
+}
+
+function enrichDirectPublishStateWithSolveHints(state = null) {
+  if (!state || typeof state !== 'object') {
+    return state;
+  }
+
+  const next = { ...state };
+  if (next.captchaContext && typeof next.captchaContext === 'object') {
+    next.captchaContext = enrichCaptchaContextWithSolveHints(next.captchaContext);
+  }
+  return next;
+}
+
+function attachSolveHints(response, preferredContext = null) {
+  if (!response || typeof response !== 'object') {
+    return response;
+  }
+
+  const solveHints = preferredContext?.solveHints
+    || response.solveHints
+    || response.captchaContext?.solveHints
+    || response.captureContext?.solveHints
+    || response.directPublish?.captchaContext?.solveHints
+    || null;
+
+  if (!solveHints) {
+    return response;
+  }
+
+  return {
+    ...response,
+    solveHints
+  };
 }
 
 function normalizeDirectPublishRequestData(requestData = {}) {
@@ -727,7 +816,7 @@ function mergeResolvedCaptchaContext(baseContext = null, resolvedContext = null)
   apply(baseContext);
   apply(resolvedContext);
 
-  return hasValue ? next : null;
+  return hasValue ? enrichCaptchaContextWithSolveHints(next) : null;
 }
 
 function isIframeCaptchaCandidate(candidate = null) {
@@ -804,7 +893,7 @@ function finalizeResolvedCaptchaContext(baseContext = null, frameContextResult =
   mergedContext.captchaBlocking = captchaBlocking;
   mergedContext.iframeShellOnly = !!(mergedContext.iframeCaptchaPresent && !captchaBlocking);
 
-  return mergedContext;
+  return enrichCaptchaContextWithSolveHints(mergedContext);
 }
 
 async function captchaFrameAction(action, options = {}) {
@@ -2347,6 +2436,7 @@ async function restoreDraftIfNeeded(tabId, requestData = {}) {
 }
 
 function buildDirectPublishState({ response, preparation, requestData = {}, captchaContext = null }) {
+  const normalizedCaptchaContext = enrichCaptchaContextWithSolveHints(captchaContext);
   const phase = response?.phase || 'publish';
   const stage = response?.stage || response?.status || 'captcha_required';
   const publishTrace = cloneTraceEntries(response?.publishTrace);
@@ -2365,7 +2455,7 @@ function buildDirectPublishState({ response, preparation, requestData = {}, capt
     detectedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     diagnostics: preparation?.diagnostics || null,
-    captchaContext: captchaContext || null,
+    captchaContext: normalizedCaptchaContext || null,
     requestData: normalizeDirectPublishRequestData(requestData),
     phase,
     stage,
@@ -2376,10 +2466,11 @@ function buildDirectPublishState({ response, preparation, requestData = {}, capt
 
 function attachDirectPublishState(response, state = directPublishState) {
   if (!state) return response;
-  return {
+  const normalizedState = enrichDirectPublishStateWithSolveHints(state);
+  return attachSolveHints({
     ...response,
-    directPublish: { ...state }
-  };
+    directPublish: { ...normalizedState }
+  }, normalizedState?.captchaContext || null);
 }
 
 function attachCaptchaWait(response, captchaWait = null) {
@@ -2394,7 +2485,7 @@ async function getLiveDirectPublishState(options = {}) {
   await ensureRuntimeStateLoaded();
   if (!directPublishState) return null;
 
-  const snapshot = { ...directPublishState };
+  const snapshot = enrichDirectPublishStateWithSolveHints({ ...directPublishState });
 
   if (!snapshot.tabId) {
     return snapshot;
@@ -2418,21 +2509,21 @@ async function getLiveDirectPublishState(options = {}) {
       snapshot.captchaContext = captchaContext;
       await updateDirectPublishState({ captchaContext, url: captchaContext?.url || snapshot.url });
     } else if (snapshot.captchaContext && typeof snapshot.captchaContext === 'object') {
-      snapshot.captchaContext = {
+      snapshot.captchaContext = enrichCaptchaContextWithSolveHints({
         ...(cloneJsonValue(snapshot.captchaContext) || snapshot.captchaContext),
         liveRefreshStatus: captchaContextResult.status || null,
         liveRefreshError: captchaContextResult.error || null
-      };
+      });
     } else {
-      snapshot.captchaContext = {
+      snapshot.captchaContext = enrichCaptchaContextWithSolveHints({
         success: false,
         status: captchaContextResult.status || 'editor_not_ready',
         error: captchaContextResult.error || 'CAPTCHA 컨텍스트를 새로 읽지 못했습니다.'
-      };
+      });
     }
   }
 
-  return snapshot;
+  return enrichDirectPublishStateWithSolveHints(snapshot);
 }
 
 function getProbeFailureReason(probeResult = null) {
@@ -4065,7 +4156,7 @@ async function getCaptchaArtifactsForTab(tabId, options = {}) {
     ? 'frameDirectImage'
     : (artifacts.viewportCrop ? 'viewportCrop' : (artifacts.directImage ? 'directImage' : null));
   if (!preferredArtifactKey) {
-    return {
+    return enrichCaptchaArtifactResultWithSolveHints({
       success: false,
       status: 'captcha_artifact_capture_failed',
       error: captureErrors[0]?.error || 'CAPTCHA 이미지 아티팩트를 생성하지 못했습니다.',
@@ -4074,10 +4165,10 @@ async function getCaptchaArtifactsForTab(tabId, options = {}) {
       selectedCandidate,
       captureContext,
       captureErrors
-    };
+    });
   }
 
-  return {
+  return enrichCaptchaArtifactResultWithSolveHints({
     success: true,
     status: 'captcha_artifacts_ready',
     tabId,
@@ -4088,7 +4179,7 @@ async function getCaptchaArtifactsForTab(tabId, options = {}) {
     artifact: artifacts[preferredArtifactKey],
     artifacts,
     captureErrors
-  };
+  });
 }
 
 function summarizeCaptchaArtifactCapture(artifactResult = null) {
@@ -4126,8 +4217,8 @@ async function captureCaptchaHandoffForTab(tabId, options = {}) {
 
   return {
     tabId,
-    captchaContext,
-    captchaArtifacts
+    captchaContext: enrichCaptchaContextWithSolveHints(captchaContext),
+    captchaArtifacts: enrichCaptchaArtifactResultWithSolveHints(captchaArtifacts)
   };
 }
 
@@ -4136,18 +4227,19 @@ function attachCaptchaHandoff(response, handoff = null) {
 
   const captchaContext = mergeResolvedCaptchaContext(response?.captchaContext, handoff.captchaContext);
   const directPublish = response?.directPublish
-    ? {
+    ? enrichDirectPublishStateWithSolveHints({
         ...response.directPublish,
         captchaContext: mergeResolvedCaptchaContext(response.directPublish.captchaContext, handoff.captchaContext)
-      }
+      })
     : response?.directPublish;
+  const captchaArtifacts = enrichCaptchaArtifactResultWithSolveHints(handoff.captchaArtifacts || null);
 
-  return {
+  return attachSolveHints({
     ...response,
     directPublish,
     captchaContext,
-    captchaArtifacts: handoff.captchaArtifacts || null
-  };
+    captchaArtifacts
+  }, captchaContext);
 }
 
 async function sendTabMessageWithTimeout(tabId, message, timeoutMs = EDITOR_PREPARE_DEFAULTS.pingTimeoutMs) {
@@ -5529,7 +5621,7 @@ async function handleMessage(message, sender) {
 
     case 'GET_DIRECT_PUBLISH_STATE': {
       const state = await getLiveDirectPublishState({ includeCaptchaContext: !!message.data?.includeCaptchaContext });
-      return { success: true, directPublish: state };
+      return attachSolveHints({ success: true, directPublish: state }, state?.captchaContext || null);
     }
 
     case 'GET_CAPTCHA_CONTEXT': {
@@ -5550,12 +5642,12 @@ async function handleMessage(message, sender) {
         });
       }
 
-      return {
+      return attachSolveHints({
         success: true,
         tabId,
         captchaContext: captchaContextResult.captchaContext,
-        directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
-      };
+        directPublish: savedState?.tabId === tabId ? enrichDirectPublishStateWithSolveHints({ ...directPublishState }) : null
+      }, captchaContextResult.captchaContext);
     }
 
     case 'GET_CAPTCHA_ARTIFACTS': {
@@ -5573,10 +5665,10 @@ async function handleMessage(message, sender) {
         });
       }
 
-      return {
+      return attachSolveHints({
         ...artifactResult,
-        directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
-      };
+        directPublish: savedState?.tabId === tabId ? enrichDirectPublishStateWithSolveHints({ ...directPublishState }) : null
+      }, artifactResult.captureContext || null);
     }
 
     case 'INFER_CAPTCHA_ANSWER': {

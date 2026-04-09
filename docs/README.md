@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.5 (2026-04-10 frame submit recovery patch 포함)**
+> 현재 운영 기준: **v1.8.6 (2026-04-10 CAPTCHA solve-hint patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -20,6 +20,7 @@
 > - **iframe submit 직후 frame reload/navigation으로 응답이 비어도 tab URL + refreshed captcha context probe로 `captcha_submit_tab_navigated` / `captcha_submitted` / `captcha_still_present`를 복구**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`는 submit 단계에서 이미 `/manage/posts` 또는 permalink로 이동한 회차를 terminal success로 처리해 false `content_empty` 재개를 막음**
 > - **`challengeText` / `challengeSlotCount` / `challengeCandidates`를 same-tab CAPTCHA context와 artifact handoff에 함께 포함**
+> - **`solveHints`를 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` / `captcha_required` handoff 응답에 함께 포함해, 크론이 비전 프롬프트를 추측하지 않고 바로 이미지 판독 → 제출로 이어질 수 있음**
 > - **live DKAPTCHA frame summary가 frame body line + submit button text까지 다시 합쳐 instruction-style / masked challenge를 재구성하므로 `challengeText: null` 회차를 줄임**
 > - **`INFER_CAPTCHA_ANSWER`로 OCR 후보 텍스트를 빈칸 답안으로 바로 줄이는 helper 추가**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`가 explicit answer뿐 아니라 OCR 후보 텍스트 기반 답안 추론도 바로 수용**
@@ -47,6 +48,7 @@
 - **CAPTCHA artifact API**: 에이전트가 같은 blocked tab에서 main DOM/iframe 양쪽 CAPTCHA 이미지를 직접 받아 OCR/비전 입력으로 넘길 수 있음
 - **직접 응답 handoff**: `WRITE_POST` / `RESUME_DIRECT_PUBLISH` / `SUBMIT_CAPTCHA*`가 CAPTCHA로 막히면 응답에 `captchaArtifacts`를 같이 붙여 크론이 추가 왕복 없이 바로 OCR/비전으로 넘어갈 수 있음
 - **CAPTCHA challenge extraction**: context/artifact 응답에 빈칸 문제 문구(`challengeText`)와 칸 수(`challengeSlotCount`)를 포함해 OCR 결과를 답안으로 줄이기 쉬움
+- **CAPTCHA solve hints**: `solveHints.prompt`, `answerMode`, `submitField`, `targetEntity`, `nextAction`을 함께 반환해 masked CAPTCHA는 `ocrTexts` 기반 추론, instruction/map CAPTCHA는 `answer` 직접 제출 흐름으로 바로 연결 가능
 - **live frame fallback extraction**: DKAPTCHA가 문구를 직접 안 내려줘도 frame body line, submit button text, capture candidate 주변 텍스트를 다시 합쳐 `challengeText`를 복원함
 - **CAPTCHA submit API**: 에이전트가 blocked tab의 main DOM뿐 아니라 cross-origin iframe에도 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음
 - **frame-first submit routing**: merged `captchaContext`가 `extension_frame_dom`을 가리키면 `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`가 content DOM 실패 응답을 기다리지 않고 frame submit을 먼저 시도함
@@ -101,8 +103,9 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 ```
 [발행] 클릭 → CAPTCHA 감지 → directPublishState 저장(tabId/blog/url/visibility)
 → 응답의 captchaArtifacts 확인 (없거나 재시도가 필요하면 GET_DIRECT_PUBLISH_STATE / GET_CAPTCHA_ARTIFACTS 호출)
-→ OCR/비전으로 전체 후보 텍스트 추출
-→ `challengeText` / `challengeSlotCount`가 있으면 `INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`로 빈칸 답안 축약
+→ 응답의 `solveHints`를 먼저 읽고, 거기 적힌 `prompt` 그대로 OCR/비전에 전달
+→ `solveHints.submitField === "ocrTexts"`면 전체 후보 텍스트를 줄바꿈 후보로 읽어 `INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`로 빈칸 답안 축약
+→ `solveHints.submitField === "answer"`면 지시문 대상의 전체 명칭을 한 줄 답안으로 읽어 바로 `SUBMIT_CAPTCHA_AND_RESUME({ answer })`
 → v1.8.4 기준 live DKAPTCHA에서도 `challengeText`가 비면 frame body line + submit button text fallback으로 다시 복원되는지 먼저 확인
 → OCR 후보가 여러 개면 `SUBMIT_CAPTCHA*`가 `answerCandidates` 상위 답안을 같은 challenge에서 자동 재시도하고, CAPTCHA 문구가 바뀌면 바로 멈춘 뒤 새 artifact/handoff를 돌려줌
 → `preferredSolveMode`가 `extension_dom` / `extension_frame_dom`이면 SUBMIT_CAPTCHA_AND_RESUME로 같은 탭 답안 입력 + 즉시 재개 (`extension_frame_dom`이면 frame submit 우선)
@@ -162,7 +165,8 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 **운영 권장값**
 - 실제 발행: `visibility: "public"`
 - 테스트 발행: `visibility: "private"`
-- DKAPTCHA 발생 시: 먼저 응답의 `captchaArtifacts`를 확인하고, 필요하면 `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_ARTIFACTS`로 blocked tab과 캡차 이미지를 다시 확보합니다.
+- DKAPTCHA 발생 시: 먼저 응답의 `captchaArtifacts`와 `solveHints`를 확인하고, 필요하면 `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_ARTIFACTS`로 blocked tab과 캡차 이미지를 다시 확보합니다.
+- `solveHints.prompt`는 그대로 OCR/비전 프롬프트로 사용합니다. masked challenge면 **`ocrTexts` 기반 추론**, instruction/map challenge면 **`answer` 직접 제출**이 기본입니다.
 - 일반 DOM형 CAPTCHA면 OCR/비전으로 전체 후보 텍스트를 구한 뒤 **`INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`를 우선 사용**
 - OCR 후보가 여러 개면 `answerCandidates`가 순위대로 내려오고, `SUBMIT_CAPTCHA*`가 기본적으로 상위 3개 답안까지 같은 challenge에서 자동 재시도
 - `captcha_browser_handoff_required` 또는 `preferredSolveMode: "browser_handoff"`면 cross-origin iframe이므로 같은 탭에서 browser/CDP로 직접 풀이하고 **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`** 로 자동 재개 대기를 거는 것이 권장
@@ -197,7 +201,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
   }
 }, (response) => {
   if (response.status === 'captcha_required') {
-    console.log('inline captcha handoff', response.captchaArtifacts); // 바로 OCR/vision 입력에 사용 가능
+    console.log('inline captcha handoff', response.captchaArtifacts, response.solveHints); // solveHints.prompt를 바로 OCR/vision 입력에 사용 가능
     // response.captchaContext / directPublish.captchaContext 의 preferredSolveMode 는 service-worker merged 결과
     chrome.runtime.sendMessage(EXTENSION_ID, {
       action: "GET_DIRECT_PUBLISH_STATE",
@@ -467,7 +471,7 @@ v1.8.5부터는 frame submit 직후 iframe reload/navigation 때문에 content-s
 
 ### CAPTCHA Context / Submit 응답 포인트
 
-- `GET_CAPTCHA_CONTEXT`는 `answerInputCandidates[]`, `submitButtonCandidates[]`, `activeAnswerInput`, `activeSubmitButton`, `captureCandidates[]`, `activeCaptureCandidate`, `challengeText`, `challengeSlotCount`, `challengeCandidates[]`, `answerLengthHint`, `rect`, `matchedSelectors`, `iframeCaptchaPresent`, `preferredSolveMode`를 포함합니다.
+- `GET_CAPTCHA_CONTEXT`는 `answerInputCandidates[]`, `submitButtonCandidates[]`, `activeAnswerInput`, `activeSubmitButton`, `captureCandidates[]`, `activeCaptureCandidate`, `challengeText`, `challengeSlotCount`, `challengeCandidates[]`, `answerLengthHint`, `rect`, `matchedSelectors`, `iframeCaptchaPresent`, `preferredSolveMode`, `solveHints`를 포함합니다.
 - `GET_CAPTCHA_ARTIFACTS`는 기본적으로 저장된 `directPublishState.tabId`를 대상으로 `artifact.dataUrl`, `artifact.kind`, `artifacts.directImage`, `artifacts.viewportCrop`, `selectedCandidate`, `captureContext`를 반환하며, 이 `captureContext`에도 `challengeText` / `challengeSlotCount`가 포함될 수 있습니다.
 - `GET_CAPTCHA_ARTIFACTS.artifactPreference`는 외부 에이전트가 우선 사용할 이미지(`viewportCrop` 또는 `directImage`)를 알려줍니다.
 - `INFER_CAPTCHA_ANSWER`는 `challengeText` + `ocrTexts[]`를 받아 빈칸 답안을 추론하고, `chosenCandidate` / `candidates[]`로 어떤 OCR 후보가 채택됐는지 돌려줍니다.

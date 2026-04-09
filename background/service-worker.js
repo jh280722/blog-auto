@@ -11,6 +11,10 @@ import {
   compareCaptchaChallengeSignatures,
   getChallengeFromCaptchaContext
 } from '../utils/captcha-retry.js';
+import {
+  classifyRecoveredCaptchaSubmitOutcome,
+  looksLikeDirectPublishCompletionUrl
+} from '../utils/captcha-submit-recovery.js';
 
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
@@ -124,20 +128,6 @@ async function updateDirectPublishState(patch = {}) {
   };
   await persistDirectPublishState();
   return directPublishState;
-}
-
-function looksLikeDirectPublishCompletionUrl(url = '') {
-  if (!url) return false;
-
-  try {
-    const parsed = new URL(url);
-    const host = parsed.hostname || '';
-    const path = parsed.pathname || '';
-    if (!host.endsWith('.tistory.com')) return false;
-    return path.startsWith('/manage/posts') || /^\/\d+$/.test(path);
-  } catch {
-    return false;
-  }
 }
 
 function delay(ms) {
@@ -1613,6 +1603,63 @@ async function getCrossFrameCaptchaArtifactForTab(tabId, options = {}) {
   }
 }
 
+async function recoverMissingFrameSubmitResult(tabId, frameContextResult, answer, options = {}) {
+  const probeDelayMs = clamp(Number(options.postSubmitProbeDelayMs) || 450, 50, 5000);
+  await delay(probeDelayMs);
+
+  let liveTab = null;
+  try {
+    liveTab = await chrome.tabs.get(tabId);
+  } catch (_error) {}
+
+  const tabUrl = liveTab?.url || null;
+  let refreshedContextResult = null;
+
+  if (!looksLikeDirectPublishCompletionUrl(tabUrl || '')) {
+    try {
+      refreshedContextResult = await getCaptchaContextForTab(tabId);
+    } catch (_error) {}
+  }
+
+  const recovered = classifyRecoveredCaptchaSubmitOutcome({
+    tabUrl,
+    captchaContext: refreshedContextResult?.success ? refreshedContextResult.captchaContext || null : null
+  });
+
+  if (!recovered) {
+    return null;
+  }
+
+  const recoveredFrameContext = refreshedContextResult?.success
+    ? mergeCaptchaContexts(refreshedContextResult.captchaContext || null, frameContextResult)
+    : (frameContextResult.frameContext || null);
+
+  return {
+    success: true,
+    status: recovered.status,
+    url: recovered.url || tabUrl || null,
+    clicked: true,
+    inputApplied: true,
+    answerLength: normalizeCaptchaAnswer(answer).value.length,
+    captchaStillAppears: !!recovered.captchaStillAppears,
+    submitStrategy: 'extension_frame_dom_recovered',
+    recoveredAfterMissingResponse: true,
+    recoveredReason: recovered.recoveredReason,
+    selectedInput: withFrameMetadata(frameContextResult.activeAnswerInput, frameContextResult.activeFrame?.frameId || null),
+    selectedButton: withFrameMetadata(frameContextResult.activeSubmitButton, frameContextResult.activeFrame?.frameId || null),
+    frameContextBefore: frameContextResult.frameContext || null,
+    frameContextAfter: refreshedContextResult?.success ? refreshedContextResult.captchaContext || null : null,
+    frameContext: recoveredFrameContext,
+    postSubmitProbe: {
+      probeDelayMs,
+      tabUrl,
+      contextStatus: refreshedContextResult?.status || null,
+      contextSuccess: !!refreshedContextResult?.success
+    },
+    frameContextResult
+  };
+}
+
 async function submitCaptchaViaFrameForTab(tabId, answer, options = {}) {
   const frameContextResult = await getCrossFrameCaptchaContextForTab(tabId);
   if (!frameContextResult.success || !frameContextResult.activeFrame?.frameId) {
@@ -1630,6 +1677,11 @@ async function submitCaptchaViaFrameForTab(tabId, answer, options = {}) {
     });
     const payload = injectionResults?.[0]?.result || null;
     if (!payload) {
+      const recoveredResult = await recoverMissingFrameSubmitResult(tabId, frameContextResult, answer, options);
+      if (recoveredResult) {
+        return recoveredResult;
+      }
+
       return {
         success: false,
         status: 'captcha_frame_submit_failed',
@@ -1651,6 +1703,14 @@ async function submitCaptchaViaFrameForTab(tabId, answer, options = {}) {
       frameContextResult
     };
   } catch (error) {
+    const recoveredResult = await recoverMissingFrameSubmitResult(tabId, frameContextResult, answer, options);
+    if (recoveredResult) {
+      return {
+        ...recoveredResult,
+        previousError: error.message
+      };
+    }
+
     return {
       success: false,
       status: 'captcha_frame_submit_failed',
@@ -2869,10 +2929,16 @@ async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}
   for (let index = 0; index < answerAttemptPlan.length; index += 1) {
     const candidate = answerAttemptPlan[index];
     const submitResult = await submitCaptchaForTab(tabId, candidate.answer, options);
-    const refreshedContext = await refreshDirectPublishCaptchaState(tabId, submitResult);
-    const captchaStillAppears = refreshedContext?.success
-      ? !!refreshedContext.captchaContext?.captchaPresent
-      : !!submitResult.captchaStillAppears;
+    const submitCompletedByNavigation = submitResult?.status === 'captcha_submit_tab_navigated'
+      || looksLikeDirectPublishCompletionUrl(submitResult?.url || '');
+    const refreshedContext = submitCompletedByNavigation
+      ? null
+      : await refreshDirectPublishCaptchaState(tabId, submitResult);
+    const captchaStillAppears = submitCompletedByNavigation
+      ? false
+      : (refreshedContext?.success
+        ? !!refreshedContext.captchaContext?.captchaPresent
+        : !!submitResult.captchaStillAppears);
     const refreshedChallengeSignature = captchaStillAppears
       ? await getCaptchaChallengeSignature(
         tabId,
@@ -5612,6 +5678,26 @@ async function handleMessage(message, sender) {
           resumeResult: null,
           directPublish: directPublishState?.tabId === tabId ? { ...directPublishState } : null
         }, handoff);
+      }
+
+      const submitCompletedByNavigation = submitResult?.status === 'captcha_submit_tab_navigated'
+        || looksLikeDirectPublishCompletionUrl(submitResult?.url || '');
+      if (submitCompletedByNavigation) {
+        if (directPublishState?.tabId === tabId) {
+          await clearDirectPublishState();
+        }
+
+        return {
+          ...submitResult,
+          success: true,
+          status: submitResult.status || 'captcha_submit_tab_navigated',
+          url: submitResult.url || null,
+          resumed: false,
+          completedDuringSubmit: true,
+          submitResult,
+          resumeResult: null,
+          directPublish: null
+        };
       }
 
       const resumeResult = await resumeDirectPublishFlow({

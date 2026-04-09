@@ -1567,6 +1567,106 @@ function isMissingTabConnectionError(error) {
   return /Could not establish connection|Receiving end does not exist/i.test(error?.message || '');
 }
 
+async function recoverPublishedResponseAfterSendMessageFailure(preparation, requestData = {}, options = {}) {
+  if (!preparation?.tabId) {
+    return null;
+  }
+
+  const waitMs = Math.max(0, Number(options.waitMs) || 3000);
+  if (waitMs > 0) {
+    await delay(waitMs);
+  }
+
+  let tabAfter;
+  try {
+    tabAfter = await chrome.tabs.get(preparation.tabId);
+  } catch (_error) {
+    return null;
+  }
+
+  const urlAfter = tabAfter?.url || '';
+  const recoveryBlogName = options.blogName || requestData.blogName || preparation.blogName || getTabBlogName(urlAfter);
+  const recoveryBase = {
+    tabId: preparation.tabId,
+    url: urlAfter,
+    blogName: recoveryBlogName,
+    diagnostics: preparation.diagnostics
+  };
+
+  const buildRecoveredResponse = (recoveryVerification, note) => ({
+    ...makePreparationResponse({
+      success: true,
+      status: 'published',
+      tab: tabAfter,
+      url: recoveryVerification.permalink || urlAfter,
+      blogName: recoveryBlogName,
+      diagnostics: preparation.diagnostics
+    }),
+    recoveryVerification,
+    note
+  });
+
+  const buildRecoveryFailure = (recoveryVerification) => ({
+    ...makePreparationResponse({
+      success: false,
+      status: recoveryVerification.status || 'persistence_unverified',
+      error: recoveryVerification.error || '발행 후 저장된 글 검증에 실패했습니다.',
+      ...recoveryBase
+    }),
+    recoveryVerification
+  });
+
+  if (!isNewPostTab(urlAfter) && urlAfter.includes('/manage/')) {
+    const recoveryVerification = await verifyPublishedPostRecovery(preparation.tabId, recoveryBlogName, requestData || {});
+    return recoveryVerification.success
+      ? buildRecoveredResponse(recoveryVerification, '발행 후 페이지 이동 감지 + 저장된 글 본문/이미지 검증 완료')
+      : buildRecoveryFailure(recoveryVerification);
+  }
+
+  if (!isNewPostTab(urlAfter)) {
+    return null;
+  }
+
+  let liveness = null;
+  try {
+    liveness = await probeContentScriptLiveness(tabAfter.id);
+  } catch (_error) {
+    return null;
+  }
+
+  if (!liveness?.success) {
+    return null;
+  }
+
+  let snapshot = null;
+  try {
+    snapshot = await sendEditorMessage(tabAfter.id, 'GET_DRAFT_SNAPSHOT');
+  } catch (_error) {
+    snapshot = null;
+  }
+
+  const titlePresent = !!(snapshot?.title && String(snapshot.title).trim());
+  const textLength = Number(snapshot?.contentTextLength || 0);
+  const imageCount = Number(snapshot?.imageCount || 0);
+  const hasMeaningfulContent = titlePresent || textLength > 0 || imageCount > 0;
+  const looksLikeSavedEditUrl = /\/manage\/newpost\/\d+/.test(urlAfter);
+  const shouldVerifySavedPost = !hasMeaningfulContent || looksLikeSavedEditUrl;
+
+  if (!shouldVerifySavedPost) {
+    return null;
+  }
+
+  const recoveryVerification = await verifyPublishedPostRecovery(preparation.tabId, recoveryBlogName, requestData || {});
+  if (recoveryVerification.success) {
+    const note = looksLikeSavedEditUrl
+      ? '발행 후 편집 화면 유지 감지 + 저장된 글 본문/이미지 검증 완료'
+      : '발행 후 에디터 초기화 감지 + 저장된 글 본문/이미지 검증 완료';
+    return buildRecoveredResponse(recoveryVerification, note);
+  }
+
+  return buildRecoveryFailure(recoveryVerification);
+}
+
 async function injectTistoryContentScripts(tabId) {
   const tab = await chrome.tabs.get(tabId);
   const url = tab?.url || '';
@@ -2662,6 +2762,36 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
 
     return attachCaptchaWait(attachDirectPublishState(responseWithPreparation), captchaWait);
   } catch (e) {
+    preparation.diagnostics?.attempts?.push({
+      step: 'resume_direct_publish_catch_recovery',
+      tabId: preparation.tabId,
+      originalError: e?.message || String(e),
+      at: new Date().toISOString()
+    });
+
+    const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(preparation, mergedRequestData, {
+      blogName: mergedRequestData.blogName || directPublishState?.blogName || preparation.blogName || null
+    });
+
+    if (recoveredResponse?.success) {
+      await clearDirectPublishState();
+      return attachCaptchaWait(recoveredResponse, captchaWait);
+    }
+
+    if (recoveredResponse) {
+      await updateDirectPublishState({
+        ...buildTransitionPatch(directPublishState || {}, 'resume_publish_recovery_failed', {
+          phase: 'resume_publish',
+          status: recoveredResponse.status || 'persistence_unverified',
+          tabId: preparation.tabId
+        }),
+        tabId: preparation.tabId,
+        url: recoveredResponse.url || preparation.url,
+        requestData: normalizeDirectPublishRequestData(mergedRequestData)
+      });
+      return attachCaptchaWait(attachDirectPublishState(recoveredResponse), captchaWait);
+    }
+
     return attachCaptchaWait(attachDirectPublishState(makePreparationResponse({
       success: false,
       status: 'editor_not_ready',
@@ -3268,8 +3398,25 @@ async function processNextInQueue() {
       currentTabId = preparation.tabId;
       await ensurePageWorldVisibilityInterceptor(preparation.tabId);
 
-      const response = await sendEditorMessage(preparation.tabId, 'WRITE_POST', { ...item.data, autoPublish: true });
-      const responseWithPreparation = normalizePublishResponse(withPreparationDetails(response, preparation));
+      let responseWithPreparation;
+      try {
+        const response = await sendEditorMessage(preparation.tabId, 'WRITE_POST', { ...item.data, autoPublish: true });
+        responseWithPreparation = normalizePublishResponse(withPreparationDetails(response, preparation));
+      } catch (error) {
+        preparation.diagnostics.attempts.push({
+          step: 'queue_write_post_catch_recovery',
+          tabId: preparation.tabId,
+          originalError: error?.message || String(error),
+          at: new Date().toISOString()
+        });
+
+        const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(preparation, item.data || {});
+        if (!recoveredResponse) {
+          throw error;
+        }
+
+        responseWithPreparation = normalizePublishResponse(recoveredResponse);
+      }
 
       if (responseWithPreparation.success) {
         item.status = 'completed';
@@ -4323,11 +4470,6 @@ async function handleMessage(message, sender) {
 
         return responseWithPreparation;
       } catch (err) {
-        // ── Post-publish communication recovery ──
-        // The content script may have successfully published but the message
-        // channel closed before the response arrived (e.g., page navigation,
-        // content script re-injection, or long async publish flow timeout).
-        // Strategy: wait briefly, then check tab state and try PING.
         console.warn('[TistoryAuto BG] WRITE_POST sendEditorMessage error:', err?.message || err);
         preparation.diagnostics.attempts.push({
           step: 'write_post_catch_recovery',
@@ -4335,96 +4477,9 @@ async function handleMessage(message, sender) {
           originalError: err?.message || String(err)
         });
 
-        try {
-          // Wait for any ongoing publish to complete
-          await new Promise(r => setTimeout(r, 3000));
-          const tabAfter = await chrome.tabs.get(preparation.tabId);
-          const urlAfter = tabAfter?.url || '';
-
-          const recoveryBlogName = message.data?.blogName || preparation.blogName || getTabBlogName(urlAfter);
-
-          // Case 1: Tab navigated away from newpost (publish redirected to /manage/posts/)
-          if (!isNewPostTab(urlAfter) && urlAfter.includes('/manage/')) {
-            console.log('[TistoryAuto BG] WRITE_POST recovery: tab navigated to', urlAfter);
-            const recoveryVerification = await verifyPublishedPostRecovery(preparation.tabId, recoveryBlogName, message.data || {});
-            if (recoveryVerification.success) {
-              return {
-                ...makePreparationResponse({
-                  success: true,
-                  status: 'published',
-                  tab: tabAfter,
-                  url: recoveryVerification.permalink || urlAfter,
-                  blogName: recoveryBlogName,
-                  diagnostics: preparation.diagnostics
-                }),
-                recoveryVerification,
-                note: '발행 후 페이지 이동 감지 + 저장된 글 본문/이미지 검증 완료'
-              };
-            }
-
-            return {
-              ...makePreparationResponse({
-                success: false,
-                status: recoveryVerification.status || 'persistence_unverified',
-                error: recoveryVerification.error || '발행 후 저장된 글 검증에 실패했습니다.',
-                tabId: preparation.tabId,
-                url: urlAfter,
-                blogName: recoveryBlogName,
-                diagnostics: preparation.diagnostics
-              }),
-              recoveryVerification
-            };
-          }
-
-          // Case 2: Tab still on newpost — probe content script for live status
-          if (isNewPostTab(urlAfter)) {
-            const liveness = await probeContentScriptLiveness(tabAfter.id);
-            if (liveness.success) {
-              // Content script is alive. Try sendEditorMessage one more time with a simple check.
-              try {
-                const snapshot = await sendEditorMessage(tabAfter.id, 'GET_DRAFT_SNAPSHOT');
-                const titlePresent = !!(snapshot?.title && String(snapshot.title).trim());
-                const textLength = Number(snapshot?.contentTextLength || 0);
-                const imageCount = Number(snapshot?.imageCount || 0);
-                const hasMeaningfulContent = titlePresent || textLength > 0 || imageCount > 0;
-                if (!hasMeaningfulContent) {
-                  console.log('[TistoryAuto BG] WRITE_POST recovery: editor empty, verifying latest saved post');
-                  const recoveryVerification = await verifyPublishedPostRecovery(preparation.tabId, recoveryBlogName, message.data || {});
-                  if (recoveryVerification.success) {
-                    return {
-                      ...makePreparationResponse({
-                        success: true,
-                        status: 'published',
-                        tab: tabAfter,
-                        url: recoveryVerification.permalink || urlAfter,
-                        blogName: recoveryBlogName,
-                        diagnostics: preparation.diagnostics
-                      }),
-                      recoveryVerification,
-                      note: '발행 후 에디터 초기화 감지 + 저장된 글 본문/이미지 검증 완료'
-                    };
-                  }
-
-                  return {
-                    ...makePreparationResponse({
-                      success: false,
-                      status: recoveryVerification.status || 'persistence_unverified',
-                      error: recoveryVerification.error || '발행 후 저장된 글 검증에 실패했습니다.',
-                      tabId: preparation.tabId,
-                      url: urlAfter,
-                      blogName: recoveryBlogName,
-                      diagnostics: preparation.diagnostics
-                    }),
-                    recoveryVerification
-                  };
-                }
-              } catch (_snapshotErr) {
-                // ignore, fall through
-              }
-            }
-          }
-        } catch (_tabErr) {
-          // tab might be closed, fall through to original error
+        const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(preparation, message.data || {});
+        if (recoveredResponse) {
+          return recoveredResponse;
         }
 
         return makePreparationResponse({
@@ -4715,10 +4770,38 @@ async function handleMessage(message, sender) {
           return draftRestore;
         }
 
-        const response = await sendEditorMessage(tabId, 'RESUME_PUBLISH', {
-          visibility: item.data?.visibility || 'public'
-        });
-        const normalizedResponse = normalizePublishResponse(response);
+        let normalizedResponse;
+        try {
+          const response = await sendEditorMessage(tabId, 'RESUME_PUBLISH', {
+            visibility: item.data?.visibility || 'public'
+          });
+          normalizedResponse = normalizePublishResponse(response);
+        } catch (e) {
+          resumeDiagnostics.attempts.push({
+            step: 'resume_after_captcha_catch_recovery',
+            tabId,
+            originalError: e?.message || String(e),
+            at: new Date().toISOString()
+          });
+
+          const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(makePreparationResponse({
+            success: true,
+            status: 'editor_ready',
+            tabId,
+            url: null,
+            blogName: item.data?.blogName || null,
+            diagnostics: resumeDiagnostics
+          }), item.data || {}, {
+            blogName: item.data?.blogName || null
+          });
+
+          if (!recoveredResponse) {
+            throw e;
+          }
+
+          normalizedResponse = normalizePublishResponse(recoveredResponse);
+        }
+
         if (normalizedResponse.success) {
           item.status = 'completed';
           item.error = null;

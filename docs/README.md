@@ -19,6 +19,7 @@
 > - **`SUBMIT_CAPTCHA*`는 merged `captchaContext.preferredSolveMode === "extension_frame_dom"`일 때 frame submit을 먼저 시도하고, 실제 frame solve가 막힌 예외에서만 browser handoff로 내려감**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`로 same-tab CAPTCHA 제출 + 즉시 발행 재개 일원화**
 > - **`RESUME_DIRECT_PUBLISH(waitForCaptcha)`로 saved blocked tab을 유지한 채 extension-frame/browser fallback same-tab solve 완료까지 대기 후 즉시 재개**
+> - **발행 직후 탭 navigation 때문에 content-script 응답 채널이 닫혀도 `WRITE_POST`뿐 아니라 queue / `RESUME_AFTER_CAPTCHA` / `RESUME_DIRECT_PUBLISH`까지 recovery verification로 성공 여부를 다시 확정**
 > - **stale tab 회피 + 실제 editor body readiness gate**
 > - **`WRITE_POST` 시작 전 final preflight로 title-only draft fail-closed**
 > - 자동저장 복구 팝업 자동 dismiss
@@ -40,6 +41,7 @@
 - **CAPTCHA submit API**: 에이전트가 blocked tab의 main DOM뿐 아니라 cross-origin iframe에도 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음
 - **frame-first submit routing**: merged `captchaContext`가 `extension_frame_dom`을 가리키면 `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`가 content DOM 실패 응답을 기다리지 않고 frame submit을 먼저 시도함
 - **CAPTCHA submit+resume API**: `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭 답안 제출과 직접 발행 재개를 한 번에 처리
+- **post-publish channel-close recovery 공통화**: 발행 직후 탭 이동으로 content-script 응답 채널이 닫혀도 `WRITE_POST`, queue auto-publish, `RESUME_AFTER_CAPTCHA`, `RESUME_DIRECT_PUBLISH`가 최신 saved post를 다시 검증해 false fail을 줄임
 - **solve wait-resume**: `RESUME_DIRECT_PUBLISH`가 `editorProbe.reason === "captcha_present"`인 blocked tab도 그대로 wait target으로 유지하고, same-tab extension-frame/browser fallback 풀이가 끝난 뒤 같은 탭 기준으로만 재개를 이어감. handoff 중 일시적인 `editor_not_ready` / frame-scan miss는 clear로 취급하지 않음
 - **실제 에디터 준비 probe**: `PREPARE_EDITOR`가 content script alive만 보지 않고 TinyMCE body / contenteditable / publish layer / CAPTCHA 상태까지 확인
 - **fail-closed 쓰기 preflight**: `WRITE_POST`는 title/category 쓰기 전에 실제 editor body를 다시 확인하고, 미준비면 `editor_not_ready` + `preflight`로 즉시 중단

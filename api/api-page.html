@@ -231,9 +231,12 @@
             </div>
             <label>CAPTCHA Answer</label>
             <input type="text" id="captcha-answer" placeholder="보안문자 답안">
+            <label>OCR Candidate Texts (줄바꿈 구분, 선택)</label>
+            <textarea id="captcha-ocr-texts" rows="3" placeholder="백촌오피스텔&#10;용진유리"></textarea>
             <label>CAPTCHA Tab ID (선택)</label>
             <input type="text" id="captcha-tab-id" placeholder="비우면 저장된 directPublishState tab 사용">
             <div class="actions">
+                <button class="btn btn-secondary" id="btn-infer-captcha-answer">🧠 INFER_CAPTCHA_ANSWER</button>
                 <button class="btn btn-secondary" id="btn-submit-captcha">✍️ SUBMIT_CAPTCHA</button>
                 <button class="btn btn-primary" id="btn-submit-captcha-resume">⚡ SUBMIT_CAPTCHA_AND_RESUME</button>
             </div>
@@ -242,7 +245,7 @@
                 `PREPARE_EDITOR`는 이제 content script alive만 보지 않고 <strong>실제 editor body/TinyMCE/contenteditable</strong>까지 확인합니다. fresh 진입은 기본적으로 <strong>`manage → newpost`</strong> 경로를 탑니다.
                 `editor_not_ready`가 오면 <strong>`diagnostics.attempts[].editorProbe`</strong>, <strong>`diagnostics.entryPath`</strong>, <strong>`contentScriptAlive`</strong>, 그리고 `WRITE_POST` 실패 시 <strong>`preflight.reason`</strong>을 먼저 확인하세요.<br>
                 `captcha_required`가 오면 먼저 응답의 <strong>`captchaArtifacts`</strong>와 <strong>`stage` / `phase` / `publishTrace`</strong>를 확인하고, 필요하면 <strong>DIRECT STATE / CAPTCHA ARTIFACTS</strong>로 막힌 탭과 캡차 이미지를 다시 가져오세요. 응답의 <strong>`captchaContext.preferredSolveMode`</strong>와 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)`의 값은 서비스워커가 frame scan까지 merge한 최종 힌트입니다. solve 뒤 iframe 껍데기만 남아 있으면 wait/resume은 이 merged context 기준으로 unblock 됩니다.
-                OCR/비전으로 답안을 구하고 <strong>`SUBMIT_CAPTCHA_AND_RESUME`를 우선</strong> 호출하세요. v1.8.0부터는 iframe-only / cross-origin CAPTCHA도 확장이 same-tab frame solve를 먼저 시도합니다. 정말 <code>captcha_browser_handoff_required</code>가 남을 때만 browser/CDP fallback + <strong>`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`</strong>를 사용하세요. 이 wait 모드는 저장된 blocked tab이 아직 <code>captcha_present</code>여도 같은 탭을 그대로 잡고 대기한 뒤, CAPTCHA 해제 후 same-tab probe를 거쳐 재개합니다. handoff 중 일시적인 <code>editor_not_ready</code> / frame scan miss는 clear로 치지 않고 saved tab polling을 계속합니다.
+                OCR/비전으로 전체 단어 후보를 읽었으면 <strong>`INFER_CAPTCHA_ANSWER`</strong>로 빈칸 답안을 먼저 추론하고, 바로 <strong>`SUBMIT_CAPTCHA_AND_RESUME`</strong>를 호출하세요. v1.8.1부터는 `challengeText / challengeSlotCount`가 같이 내려와서 `백촌오피스□ + 백촌오피스텔 → 텔` 같은 패턴을 자동으로 줄일 수 있습니다. iframe-only / cross-origin CAPTCHA도 확장이 same-tab frame solve를 먼저 시도합니다. 정말 <code>captcha_browser_handoff_required</code>가 남을 때만 browser/CDP fallback + <strong>`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`</strong>를 사용하세요. 이 wait 모드는 저장된 blocked tab이 아직 <code>captcha_present</code>여도 같은 탭을 그대로 잡고 대기한 뒤, CAPTCHA 해제 후 same-tab probe를 거쳐 재개합니다. handoff 중 일시적인 <code>editor_not_ready</code> / frame scan miss는 clear로 치지 않고 saved tab polling을 계속합니다.
                 구버전 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH`를 따로 사용하세요.
             </div>
             <div class="result" id="connect-result"></div>
@@ -250,6 +253,7 @@
             <div class="result" id="direct-state-result"></div>
             <div class="result" id="captcha-context-result"></div>
             <div class="result" id="captcha-artifacts-result"></div>
+            <div class="result" id="captcha-infer-result"></div>
             <div class="result" id="captcha-submit-result"></div>
             <div class="artifact-preview" id="captcha-artifact-preview">
                 <div class="artifact-preview-meta" id="captcha-artifact-meta"></div>
@@ -487,14 +491,16 @@
             const sourceLabel = artifact.kind === 'viewport_crop'
                 ? 'viewport_crop'
                 : (artifact.sourceTagName || 'direct_image');
+            const challengeText = artifactResult?.captureContext?.challengeText || artifactResult?.captureContext?.challengeMasked || null;
 
             const meta = [
                 `preference: ${artifactResult.artifactPreference || 'unknown'}`,
                 `kind: ${artifact.kind || 'unknown'}`,
                 `size: ${artifact.width || '?'}x${artifact.height || '?'}`,
                 `tabId: ${artifactResult.tabId || result?.tabId || '?'}`,
-                `source: ${sourceLabel}`
-            ];
+                `source: ${sourceLabel}`,
+                challengeText ? `challenge: ${challengeText}` : null
+            ].filter(Boolean);
 
             $('#captcha-artifact-meta').textContent = meta.join(' | ');
             $('#captcha-artifact-image').src = artifact.dataUrl;
@@ -581,6 +587,11 @@
             }
         });
 
+        function getCaptchaOcrTexts() {
+            const raw = $('#captcha-ocr-texts').value || '';
+            return raw.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+        }
+
         async function refreshCaptchaDiagnostics(result, fallbackTabId = null) {
             const directState = await sendToExtension('GET_DIRECT_PUBLISH_STATE', { includeCaptchaContext: true });
             showResult('#direct-state-result', directState, !directState.success);
@@ -591,11 +602,29 @@
             showResult('#captcha-context-result', context, !context.success);
         }
 
+        $('#btn-infer-captcha-answer').addEventListener('click', async () => {
+            try {
+                const fallbackTabId = getOptionalTabId('#captcha-tab-id');
+                const result = await sendToExtension('INFER_CAPTCHA_ANSWER', {
+                    tabId: fallbackTabId,
+                    ocrTexts: getCaptchaOcrTexts()
+                });
+                showResult('#captcha-infer-result', result, !result.success);
+                if (result?.answer) {
+                    $('#captcha-answer').value = result.answer;
+                }
+                await refreshCaptchaDiagnostics(result, fallbackTabId);
+            } catch (err) {
+                showResult('#captcha-infer-result', err.message, true);
+            }
+        });
+
         $('#btn-submit-captcha').addEventListener('click', async () => {
             try {
                 const fallbackTabId = getOptionalTabId('#captcha-tab-id');
                 const result = await sendToExtension('SUBMIT_CAPTCHA', {
                     answer: $('#captcha-answer').value.trim(),
+                    ocrTexts: getCaptchaOcrTexts(),
                     tabId: fallbackTabId,
                     waitMs: 1200
                 });
@@ -612,6 +641,7 @@
                 const fallbackTabId = getOptionalTabId('#captcha-tab-id');
                 const result = await sendToExtension('SUBMIT_CAPTCHA_AND_RESUME', {
                     answer: $('#captcha-answer').value.trim(),
+                    ocrTexts: getCaptchaOcrTexts(),
                     tabId: fallbackTabId,
                     waitMs: 1200
                 });

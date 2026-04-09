@@ -5,6 +5,8 @@
  * - 발행 큐 관리
  */
 
+import { inferCaptchaAnswer } from '../utils/captcha-inference.js';
+
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
 let isProcessing = false;
@@ -400,6 +402,11 @@ function summarizeCaptchaFrameEntry(entry = {}) {
     reasons: Array.isArray(frameContext.reasons) ? frameContext.reasons : [],
     candidateCount: Number(frameContext.candidateCount) || 0,
     captchaLike: !!frameContext.captchaLike,
+    challengeText: frameContext.challengeText || frameContext.challengeMasked || null,
+    challengeMasked: frameContext.challengeMasked || frameContext.challengeText || null,
+    challengeSlotCount: Number(frameContext.challengeSlotCount) || null,
+    challengeCandidates: Array.isArray(frameContext.challengeCandidates) ? cloneJsonValue(frameContext.challengeCandidates) || [] : [],
+    answerLengthHint: Number(frameContext.answerLengthHint) || Number(frameContext.challengeSlotCount) || null,
     activeAnswerInput: withFrameMetadata(frameContext.activeAnswerInput, entry.frameId),
     activeSubmitButton: withFrameMetadata(frameContext.activeSubmitButton, entry.frameId),
     activeCaptureCandidate: withFrameMetadata(frameContext.activeCaptureCandidate, entry.frameId)
@@ -442,6 +449,23 @@ function mergeCaptchaContexts(baseContext = null, frameContextResult = null) {
 
   if (frameContextResult.activeCaptureCandidate) {
     next.activeCaptureCandidate = cloneJsonValue(frameContextResult.activeCaptureCandidate);
+  }
+
+  if (frameContextResult.challengeText || frameContextResult.challengeMasked) {
+    next.challengeText = frameContextResult.challengeText || frameContextResult.challengeMasked || next.challengeText || null;
+    next.challengeMasked = frameContextResult.challengeMasked || frameContextResult.challengeText || next.challengeMasked || null;
+  }
+
+  if (Number(frameContextResult.challengeSlotCount) > 0) {
+    next.challengeSlotCount = Number(frameContextResult.challengeSlotCount);
+  }
+
+  if (Array.isArray(frameContextResult.challengeCandidates) && frameContextResult.challengeCandidates.length > 0) {
+    next.challengeCandidates = cloneJsonValue(frameContextResult.challengeCandidates) || [];
+  }
+
+  if (Number(frameContextResult.answerLengthHint) > 0) {
+    next.answerLengthHint = Number(frameContextResult.answerLengthHint);
   }
 
   return next;
@@ -706,12 +730,76 @@ async function captchaFrameAction(action, options = {}) {
         summary: summarizeElement(element, 'captcha_capture_candidate', score, {
           sourceUrl: element.tagName?.toLowerCase?.() === 'img'
             ? (element.currentSrc || element.getAttribute('src') || null)
-            : null
+            : null,
+          associatedText: getAssociatedText(element)
         })
       };
     })
     .filter(Boolean)
     .sort((a, b) => b.score - a.score);
+
+  const MASK_CHAR_RE = /[□▢◻◼⬜⬛◯○●◎◇◆_＿]/u;
+  const MASK_RUN_RE = /[□▢◻◼⬜⬛◯○●◎◇◆_＿]+/gu;
+
+  const countMaskSlots = (value = '') => {
+    const matches = String(value ?? '').match(MASK_RUN_RE);
+    return matches ? matches.reduce((sum, token) => sum + token.length, 0) : 0;
+  };
+
+  const extractChallengeSnippet = (value = '') => {
+    const normalized = normalizeText(value);
+    if (!normalized || !MASK_CHAR_RE.test(normalized)) return null;
+    const snippetMatch = normalized.match(/([가-힣A-Za-z0-9]{0,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2}\s*[□▢◻◼⬜⬛◯○●◎◇◆_＿]+\s*(?:[가-힣A-Za-z0-9]{1,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2})?)/u);
+    const snippet = snippetMatch?.[1] ? normalizeText(snippetMatch[1]) : normalized;
+    return snippet.length <= 48 ? snippet : snippet.slice(0, 48);
+  };
+
+  const buildChallenge = (runtime) => {
+    const entries = [];
+    const pushEntry = (value, source, score) => {
+      const snippet = extractChallengeSnippet(value);
+      if (!snippet) return;
+      entries.push({
+        text: normalizeText(value),
+        maskedText: snippet,
+        slotCount: countMaskSlots(snippet),
+        source,
+        score
+      });
+    };
+
+    const bodyLines = (document.body?.innerText || '')
+      .split(/\n+/)
+      .map((line) => normalizeText(line))
+      .filter((line) => line && MASK_CHAR_RE.test(line));
+    bodyLines.forEach((line) => pushEntry(line, 'frame_body_line_mask', 36));
+
+    const descriptorTexts = [
+      runtime.bodyHint,
+      ...runtime.answerInputs.map((entry) => entry.summary?.associatedText || ''),
+      ...runtime.submitButtons.map((entry) => entry.summary?.text || ''),
+      ...runtime.captureCandidates.map((entry) => entry.summary?.associatedText || ''),
+      ...runtime.captureCandidates.map((entry) => entry.summary?.text || '')
+    ];
+    descriptorTexts.forEach((value) => pushEntry(value, 'frame_descriptor', 20));
+
+    const deduped = [];
+    const seen = new Set();
+    entries.forEach((entry) => {
+      const key = `${entry.maskedText}::${entry.slotCount}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      deduped.push(entry);
+    });
+    deduped.sort((a, b) => b.score - a.score || a.maskedText.length - b.maskedText.length);
+
+    return {
+      challengeText: deduped[0]?.maskedText || null,
+      challengeMasked: deduped[0]?.maskedText || null,
+      challengeSlotCount: Number.isFinite(deduped[0]?.slotCount) ? deduped[0].slotCount : null,
+      challengeCandidates: deduped.slice(0, 5)
+    };
+  };
 
   const collectRuntime = () => {
     const answerInputs = collectInputs();
@@ -767,27 +855,37 @@ async function captchaFrameAction(action, options = {}) {
     };
   };
 
-  const toSerializableContext = (runtime) => ({
-    success: true,
-    url: runtime.url,
-    origin: runtime.origin,
-    title: runtime.title,
-    bodyHint: runtime.bodyHint,
-    reasons: runtime.reasons,
-    score: runtime.score,
-    captchaLike: runtime.captchaLike,
-    candidateCount: runtime.candidateCount,
-    answerInputCandidateCount: runtime.answerInputs.length,
-    answerInputCandidates: runtime.answerInputs.map((entry) => entry.summary),
-    activeAnswerInput: runtime.answerInputs[0]?.summary || null,
-    submitButtonCandidateCount: runtime.submitButtons.length,
-    submitButtonCandidates: runtime.submitButtons.map((entry) => entry.summary),
-    activeSubmitButton: runtime.submitButtons[0]?.summary || null,
-    captureCandidateCount: runtime.captureCandidates.length,
-    captureCandidates: runtime.captureCandidates.map((entry) => entry.summary),
-    activeCaptureCandidate: runtime.captureCandidates[0]?.summary || null,
-    viewport: runtime.viewport
-  });
+  const toSerializableContext = (runtime) => {
+    const challenge = buildChallenge(runtime);
+    const answerLengthHint = Number(runtime.answerInputs[0]?.summary?.maxLength) || challenge.challengeSlotCount || null;
+
+    return {
+      success: true,
+      url: runtime.url,
+      origin: runtime.origin,
+      title: runtime.title,
+      bodyHint: runtime.bodyHint,
+      reasons: runtime.reasons,
+      score: runtime.score,
+      captchaLike: runtime.captchaLike,
+      candidateCount: runtime.candidateCount,
+      answerInputCandidateCount: runtime.answerInputs.length,
+      answerInputCandidates: runtime.answerInputs.map((entry) => entry.summary),
+      activeAnswerInput: runtime.answerInputs[0]?.summary || null,
+      submitButtonCandidateCount: runtime.submitButtons.length,
+      submitButtonCandidates: runtime.submitButtons.map((entry) => entry.summary),
+      activeSubmitButton: runtime.submitButtons[0]?.summary || null,
+      captureCandidateCount: runtime.captureCandidates.length,
+      captureCandidates: runtime.captureCandidates.map((entry) => entry.summary),
+      activeCaptureCandidate: runtime.captureCandidates[0]?.summary || null,
+      challengeText: challenge.challengeText,
+      challengeMasked: challenge.challengeMasked,
+      challengeSlotCount: challenge.challengeSlotCount,
+      challengeCandidates: challenge.challengeCandidates,
+      answerLengthHint,
+      viewport: runtime.viewport
+    };
+  };
 
   const blobToDataUrl = (blob) => new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1083,6 +1181,11 @@ async function getCrossFrameCaptchaContextForTab(tabId) {
     activeAnswerInput: activeSummary.activeAnswerInput,
     activeSubmitButton: activeSummary.activeSubmitButton,
     activeCaptureCandidate: activeSummary.activeCaptureCandidate,
+    challengeText: activeSummary.challengeText || activeSummary.challengeMasked || null,
+    challengeMasked: activeSummary.challengeMasked || activeSummary.challengeText || null,
+    challengeSlotCount: Number(activeSummary.challengeSlotCount) || null,
+    challengeCandidates: cloneJsonValue(activeSummary.challengeCandidates) || [],
+    answerLengthHint: Number(activeSummary.answerLengthHint) || Number(activeSummary.challengeSlotCount) || null,
     preferredSolveMode: activeSummary.activeAnswerInput && activeSummary.activeSubmitButton
       ? 'extension_frame_dom'
       : 'browser_handoff',
@@ -1103,6 +1206,11 @@ async function getCrossFrameCaptchaContextForTab(tabId) {
       activeAnswerInput: activeSummary.activeAnswerInput,
       activeSubmitButton: activeSummary.activeSubmitButton,
       activeCaptureCandidate: activeSummary.activeCaptureCandidate,
+      challengeText: activeSummary.challengeText || activeSummary.challengeMasked || null,
+      challengeMasked: activeSummary.challengeMasked || activeSummary.challengeText || null,
+      challengeSlotCount: Number(activeSummary.challengeSlotCount) || null,
+      challengeCandidates: cloneJsonValue(activeSummary.challengeCandidates) || [],
+      answerLengthHint: Number(activeSummary.answerLengthHint) || Number(activeSummary.challengeSlotCount) || null,
       preferredSolveMode: activeSummary.activeAnswerInput && activeSummary.activeSubmitButton
         ? 'extension_frame_dom'
         : 'browser_handoff'
@@ -2080,6 +2188,172 @@ function normalizeCaptchaAnswer(answer) {
   return {
     value,
     summary
+  };
+}
+
+function collectOcrTextCandidates(data = {}) {
+  const rawCandidates = [];
+  const pushValue = (value) => {
+    if (typeof value !== 'string') return;
+    const trimmed = value.trim();
+    if (trimmed) rawCandidates.push(trimmed);
+  };
+
+  pushValue(data.ocrText);
+  pushValue(data.ocrCandidate);
+  pushValue(data.ocrResult);
+
+  if (Array.isArray(data.ocrTexts)) {
+    data.ocrTexts.forEach(pushValue);
+  }
+
+  if (Array.isArray(data.ocrCandidates)) {
+    data.ocrCandidates.forEach(pushValue);
+  }
+
+  const deduped = [];
+  const seen = new Set();
+  rawCandidates.forEach((candidate) => {
+    const key = candidate.replace(/\s+/g, '');
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    deduped.push(candidate);
+  });
+
+  return deduped;
+}
+
+function getChallengeFromCaptchaContext(captchaContext = null) {
+  if (!captchaContext || typeof captchaContext !== 'object') {
+    return {
+      challengeText: null,
+      challengeSlotCount: null,
+      answerLengthHint: null,
+      challengeCandidates: []
+    };
+  }
+
+  const challengeCandidates = [];
+  const pushCandidate = (entry) => {
+    if (!entry) return;
+    if (typeof entry === 'string') {
+      const trimmed = entry.trim();
+      if (!trimmed) return;
+      challengeCandidates.push({ text: trimmed, maskedText: trimmed });
+      return;
+    }
+
+    const text = String(entry.maskedText || entry.text || '').trim();
+    if (!text) return;
+    challengeCandidates.push({
+      text,
+      maskedText: String(entry.maskedText || entry.text || '').trim(),
+      slotCount: Number(entry.slotCount) || null,
+      source: entry.source || null,
+      score: Number(entry.score) || null
+    });
+  };
+
+  pushCandidate(captchaContext.challengeText);
+  pushCandidate(captchaContext.challengeMasked);
+  if (Array.isArray(captchaContext.challengeCandidates)) {
+    captchaContext.challengeCandidates.forEach(pushCandidate);
+  }
+
+  const uniqueCandidates = [];
+  const seen = new Set();
+  challengeCandidates.forEach((entry) => {
+    const key = `${entry.maskedText || entry.text}::${Number(entry.slotCount) || 0}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    uniqueCandidates.push(entry);
+  });
+
+  return {
+    challengeText: uniqueCandidates[0]?.maskedText || uniqueCandidates[0]?.text || null,
+    challengeSlotCount: Number(captchaContext.challengeSlotCount) || Number(uniqueCandidates[0]?.slotCount) || null,
+    answerLengthHint: Number(captchaContext.answerLengthHint) || Number(captchaContext.challengeSlotCount) || Number(uniqueCandidates[0]?.slotCount) || null,
+    challengeCandidates: uniqueCandidates
+  };
+}
+
+async function resolveCaptchaAnswerInput(tabId, data = {}, savedState = null) {
+  const explicitAnswer = normalizeCaptchaAnswer(data.answer || data.captchaAnswer || '');
+  if (explicitAnswer.value) {
+    return {
+      success: true,
+      source: 'explicit_answer',
+      answer: explicitAnswer.value,
+      answerNormalization: explicitAnswer.summary,
+      inference: null,
+      ocrCandidates: []
+    };
+  }
+
+  const ocrCandidates = collectOcrTextCandidates(data);
+  if (ocrCandidates.length === 0) {
+    return {
+      success: false,
+      status: 'captcha_answer_required',
+      error: 'CAPTCHA 답안 또는 OCR 후보 텍스트가 필요합니다.',
+      ocrCandidates: []
+    };
+  }
+
+  let captchaContext = savedState?.captchaContext || null;
+  if (typeof data.challengeText === 'string' && data.challengeText.trim()) {
+    captchaContext = {
+      ...(captchaContext && typeof captchaContext === 'object' ? cloneJsonValue(captchaContext) || captchaContext : {}),
+      challengeText: data.challengeText.trim(),
+      challengeMasked: data.challengeMasked?.trim?.() || data.challengeText.trim(),
+      challengeSlotCount: Number(data.challengeSlotCount) || Number(data.answerLengthHint) || null,
+      answerLengthHint: Number(data.answerLengthHint) || Number(data.challengeSlotCount) || null
+    };
+  }
+
+  const shouldRefreshContext = !captchaContext?.challengeText && !captchaContext?.challengeMasked;
+  if (tabId && shouldRefreshContext) {
+    const contextResult = await getCaptchaContextForTab(tabId);
+    if (contextResult.success) {
+      captchaContext = contextResult.captchaContext || captchaContext;
+    }
+  }
+
+  const challenge = getChallengeFromCaptchaContext(captchaContext);
+  if (!challenge.challengeText) {
+    return {
+      success: false,
+      status: 'captcha_challenge_context_missing',
+      error: '빈칸이 포함된 CAPTCHA 문제 문구를 읽지 못했습니다.',
+      captchaContext,
+      ocrCandidates
+    };
+  }
+
+  const inference = inferCaptchaAnswer({
+    challengeText: challenge.challengeText,
+    ocrTexts: ocrCandidates,
+    answerLengthHint: Number(data.answerLengthHint) || challenge.answerLengthHint || challenge.challengeSlotCount || null
+  });
+
+  if (!inference.success) {
+    return {
+      success: false,
+      ...inference,
+      captchaContext,
+      ocrCandidates
+    };
+  }
+
+  const inferredAnswer = normalizeCaptchaAnswer(inference.answer || '');
+  return {
+    success: true,
+    source: 'ocr_inference',
+    answer: inferredAnswer.value,
+    answerNormalization: inferredAnswer.summary,
+    inference,
+    captchaContext,
+    ocrCandidates
   };
 }
 
@@ -4630,11 +4904,33 @@ async function handleMessage(message, sender) {
       };
     }
 
+    case 'INFER_CAPTCHA_ANSWER': {
+      const explicitTabId = message.data?.tabId || null;
+      const savedState = explicitTabId ? null : await getLiveDirectPublishState({ includeCaptchaContext: true });
+      const tabId = explicitTabId || savedState?.tabId || currentTabId;
+      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, savedState);
+
+      return {
+        ...answerResolution,
+        tabId,
+        directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
+      };
+    }
+
     case 'SUBMIT_CAPTCHA': {
       const explicitTabId = message.data?.tabId || null;
-      const savedState = explicitTabId ? null : await getLiveDirectPublishState();
+      const savedState = explicitTabId ? null : await getLiveDirectPublishState({ includeCaptchaContext: true });
       const tabId = explicitTabId || savedState?.tabId || currentTabId;
-      const submitResult = await submitCaptchaForTab(tabId, message.data?.answer, { waitMs: message.data?.waitMs });
+      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, savedState);
+      if (!answerResolution.success) {
+        return {
+          ...answerResolution,
+          tabId,
+          directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
+        };
+      }
+
+      const submitResult = await submitCaptchaForTab(tabId, answerResolution.answer, { waitMs: message.data?.waitMs });
       const refreshedContext = await refreshDirectPublishCaptchaState(tabId, submitResult);
       const captchaStillAppears = refreshedContext?.success
         ? !!refreshedContext.captchaContext?.captchaPresent
@@ -4653,6 +4949,7 @@ async function handleMessage(message, sender) {
 
         return attachCaptchaHandoff({
           ...submitResult,
+          answerResolution,
           captchaStillAppears,
           directPublish: directPublishState?.tabId === tabId ? { ...directPublishState } : null
         }, handoff);
@@ -4660,6 +4957,7 @@ async function handleMessage(message, sender) {
 
       return {
         ...submitResult,
+        answerResolution,
         captchaStillAppears,
         directPublish: directPublishState?.tabId === tabId ? { ...directPublishState } : null
       };
@@ -4667,15 +4965,28 @@ async function handleMessage(message, sender) {
 
     case 'SUBMIT_CAPTCHA_AND_RESUME': {
       const explicitTabId = message.data?.tabId || null;
-      const savedState = explicitTabId ? null : await getLiveDirectPublishState();
+      const savedState = explicitTabId ? null : await getLiveDirectPublishState({ includeCaptchaContext: true });
       const tabId = explicitTabId || savedState?.tabId || currentTabId;
-      const initialSubmitResult = await submitCaptchaForTab(tabId, message.data?.answer, { waitMs: message.data?.waitMs });
+      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, savedState);
+      if (!answerResolution.success) {
+        return {
+          ...answerResolution,
+          tabId,
+          resumed: false,
+          submitResult: null,
+          resumeResult: null,
+          directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
+        };
+      }
+
+      const initialSubmitResult = await submitCaptchaForTab(tabId, answerResolution.answer, { waitMs: message.data?.waitMs });
       const refreshedContext = await refreshDirectPublishCaptchaState(tabId, initialSubmitResult);
       const captchaStillAppears = refreshedContext?.success
         ? !!refreshedContext.captchaContext?.captchaPresent
         : !!initialSubmitResult.captchaStillAppears;
       const submitResult = {
         ...initialSubmitResult,
+        answerResolution,
         captchaStillAppears
       };
 

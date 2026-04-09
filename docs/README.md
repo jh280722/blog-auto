@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.0 (2026-04-09 same-tab frame-first patch 포함)**
+> 현재 운영 기준: **v1.8.1 (2026-04-09 CAPTCHA challenge extraction + OCR answer inference patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -17,7 +17,9 @@
 > - **CAPTCHA answer submit API (same blocked tab main DOM + cross-origin iframe 답안 입력 + 확인 버튼 클릭)**
 > - **raw `preferredSolveMode`도 iframe-only CAPTCHA에서 `extension_frame_dom`을 우선 반환해 초기 trace/힌트가 same-tab frame solve 기본값과 일치**
 > - **`SUBMIT_CAPTCHA*`는 merged `captchaContext.preferredSolveMode === "extension_frame_dom"`일 때 frame submit을 먼저 시도하고, 실제 frame solve가 막힌 예외에서만 browser handoff로 내려감**
-> - **`SUBMIT_CAPTCHA_AND_RESUME`로 same-tab CAPTCHA 제출 + 즉시 발행 재개 일원화**
+> - **`challengeText` / `challengeSlotCount` / `challengeCandidates`를 same-tab CAPTCHA context와 artifact handoff에 함께 포함**
+> - **`INFER_CAPTCHA_ANSWER`로 OCR 후보 텍스트를 빈칸 답안으로 바로 줄이는 helper 추가**
+> - **`SUBMIT_CAPTCHA_AND_RESUME`가 explicit answer뿐 아니라 OCR 후보 텍스트 기반 답안 추론도 바로 수용**
 > - **`RESUME_DIRECT_PUBLISH(waitForCaptcha)`로 saved blocked tab을 유지한 채 extension-frame/browser fallback same-tab solve 완료까지 대기 후 즉시 재개**
 > - **발행 직후 탭 navigation 때문에 content-script 응답 채널이 닫혀도 `WRITE_POST`뿐 아니라 queue / `RESUME_AFTER_CAPTCHA` / `RESUME_DIRECT_PUBLISH`까지 recovery verification로 성공 여부를 다시 확정**
 > - **stale tab 회피 + 실제 editor body readiness gate**
@@ -38,8 +40,10 @@
 - **resume blocking 판정 개선**: `RESUME_DIRECT_PUBLISH(waitForCaptcha)`와 queue resume은 top DOM iframe 껍데기만 보지 않고 merged frame context 기준으로 실제 blocking CAPTCHA만 기다림
 - **CAPTCHA artifact API**: 에이전트가 같은 blocked tab에서 main DOM/iframe 양쪽 CAPTCHA 이미지를 직접 받아 OCR/비전 입력으로 넘길 수 있음
 - **직접 응답 handoff**: `WRITE_POST` / `RESUME_DIRECT_PUBLISH` / `SUBMIT_CAPTCHA*`가 CAPTCHA로 막히면 응답에 `captchaArtifacts`를 같이 붙여 크론이 추가 왕복 없이 바로 OCR/비전으로 넘어갈 수 있음
+- **CAPTCHA challenge extraction**: context/artifact 응답에 빈칸 문제 문구(`challengeText`)와 칸 수(`challengeSlotCount`)를 포함해 OCR 결과를 답안으로 줄이기 쉬움
 - **CAPTCHA submit API**: 에이전트가 blocked tab의 main DOM뿐 아니라 cross-origin iframe에도 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음
 - **frame-first submit routing**: merged `captchaContext`가 `extension_frame_dom`을 가리키면 `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`가 content DOM 실패 응답을 기다리지 않고 frame submit을 먼저 시도함
+- **CAPTCHA inference API**: `INFER_CAPTCHA_ANSWER`로 `백촌오피스□ + 백촌오피스텔 → 텔` 같은 빈칸 답안을 안정적으로 추론
 - **CAPTCHA submit+resume API**: `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭 답안 제출과 직접 발행 재개를 한 번에 처리
 - **post-publish channel-close recovery 공통화**: 발행 직후 탭 이동으로 content-script 응답 채널이 닫혀도 `WRITE_POST`, queue auto-publish, `RESUME_AFTER_CAPTCHA`, `RESUME_DIRECT_PUBLISH`가 최신 saved post를 다시 검증해 false fail을 줄임
 - **solve wait-resume**: `RESUME_DIRECT_PUBLISH`가 `editorProbe.reason === "captcha_present"`인 blocked tab도 그대로 wait target으로 유지하고, same-tab extension-frame/browser fallback 풀이가 끝난 뒤 같은 탭 기준으로만 재개를 이어감. handoff 중 일시적인 `editor_not_ready` / frame-scan miss는 clear로 취급하지 않음
@@ -87,7 +91,8 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 ```
 [발행] 클릭 → CAPTCHA 감지 → directPublishState 저장(tabId/blog/url/visibility)
 → 응답의 captchaArtifacts 확인 (없거나 재시도가 필요하면 GET_DIRECT_PUBLISH_STATE / GET_CAPTCHA_ARTIFACTS 호출)
-→ OCR/비전으로 답안 추출
+→ OCR/비전으로 전체 후보 텍스트 추출
+→ `challengeText` / `challengeSlotCount`가 있으면 `INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`로 빈칸 답안 축약
 → `preferredSolveMode`가 `extension_dom` / `extension_frame_dom`이면 SUBMIT_CAPTCHA_AND_RESUME로 같은 탭 답안 입력 + 즉시 재개 (`extension_frame_dom`이면 frame submit 우선)
 → iframe-only / cross-origin CAPTCHA도 우선 `extension_frame_dom`으로 처리되며, frame solve가 막힐 때만 `captcha_browser_handoff_required` + `preferredSolveMode=browser_handoff` 기준 browser/CDP fallback 사용
 → fallback이 필요할 때 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`를 걸어두면 blocked tab이 아직 `captcha_present` 상태여도 새 탭으로 갈아타지 않고, CAPTCHA 해제 감지 직후 같은 탭에서 자동 재개
@@ -145,7 +150,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 - 실제 발행: `visibility: "public"`
 - 테스트 발행: `visibility: "private"`
 - DKAPTCHA 발생 시: 먼저 응답의 `captchaArtifacts`를 확인하고, 필요하면 `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_ARTIFACTS`로 blocked tab과 캡차 이미지를 다시 확보합니다.
-- 일반 DOM형 CAPTCHA면 OCR/비전으로 답안을 구한 뒤 **`SUBMIT_CAPTCHA_AND_RESUME`를 우선 사용**
+- 일반 DOM형 CAPTCHA면 OCR/비전으로 전체 후보 텍스트를 구한 뒤 **`INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`를 우선 사용**
 - `captcha_browser_handoff_required` 또는 `preferredSolveMode: "browser_handoff"`면 cross-origin iframe이므로 같은 탭에서 browser/CDP로 직접 풀이하고 **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`** 로 자동 재개 대기를 거는 것이 권장
 - 구버전/디버그 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH` 분리 호출
 - 브라우저 시작 직후/오래된 티스토리 탭 사용 시: 먼저 `PREPARE_EDITOR`
@@ -199,13 +204,20 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
   action: "GET_CAPTCHA_ARTIFACTS"
 }, (response) => {
   console.log('captcha artifact', response.artifact);
-  // response.artifact.dataUrl -> OCR/vision input
+  // response.artifact.dataUrl + response.captureContext.challengeText -> OCR/vision input
 });
+
+chrome.runtime.sendMessage(EXTENSION_ID, {
+  action: "INFER_CAPTCHA_ANSWER",
+  data: {
+    ocrTexts: ["백촌오피스텔"]
+  }
+}, console.log);
 
 chrome.runtime.sendMessage(EXTENSION_ID, {
   action: "SUBMIT_CAPTCHA_AND_RESUME",
   data: {
-    answer: "1234"
+    ocrTexts: ["백촌오피스텔"]
     // tabId: 321 // 선택: 기본값은 저장된 directPublishState tab
   }
 }, (response) => {
@@ -231,12 +243,13 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 2. `success: true`, `status: "editor_ready"` 확인
 3. `WRITE_POST` 호출
 4. `captcha_required`면 우선 응답의 `captchaArtifacts`를 확인하고, 필요하면 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` 또는 `GET_CAPTCHA_ARTIFACTS`로 막힌 탭/캡차 이미지를 다시 확보
-5. `response.captchaArtifacts.artifact.dataUrl`를 OCR/비전 입력으로 사용해 답안을 구함
-6. `response.captchaContext` 또는 refreshed direct state의 `preferredSolveMode !== "browser_handoff"`면 `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭에 답안을 제출하고 즉시 재개
-7. `preferredSolveMode === "browser_handoff"` 또는 `captcha_browser_handoff_required`면 same-tab browser/CDP 풀이와 함께 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`를 호출해 CAPTCHA 해제 직후 자동 재개
-8. 재개 단계는 저장된 `requestData`를 기준으로 draft snapshot을 검사하고, 제목/본문/이미지가 비어 있으면 먼저 복구합니다. 복구가 충분하지 않으면 `draft_restore_failed`로 fail-closed 합니다.
-9. 응답이 `captcha_still_present`면 새 답안/새 artifact로 같은 액션 재시도
-10. `editor_not_ready`면 `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight.reason`을 보고 `PREPARE_EDITOR` 재호출
+5. `response.captchaArtifacts.artifact.dataUrl`와 `response.captchaArtifacts.captureContext.challengeText`를 OCR/비전 입력으로 사용해 전체 후보 텍스트를 구함
+6. `challengeText`가 있으면 `INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`로 빈칸 답안을 먼저 줄임
+7. `response.captchaContext` 또는 refreshed direct state의 `preferredSolveMode !== "browser_handoff"`면 `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭에 답안을 제출하고 즉시 재개
+8. `preferredSolveMode === "browser_handoff"` 또는 `captcha_browser_handoff_required`면 same-tab browser/CDP 풀이와 함께 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`를 호출해 CAPTCHA 해제 직후 자동 재개
+9. 재개 단계는 저장된 `requestData`를 기준으로 draft snapshot을 검사하고, 제목/본문/이미지가 비어 있으면 먼저 복구합니다. 복구가 충분하지 않으면 `draft_restore_failed`로 fail-closed 합니다.
+10. 응답이 `captcha_still_present`면 새 답안/새 artifact로 같은 액션 재시도
+11. `editor_not_ready`면 `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight.reason`을 보고 `PREPARE_EDITOR` 재호출
 
 ---
 
@@ -428,12 +441,13 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 
 ### CAPTCHA Context / Submit 응답 포인트
 
-- `GET_CAPTCHA_CONTEXT`는 `answerInputCandidates[]`, `submitButtonCandidates[]`, `activeAnswerInput`, `activeSubmitButton`, `captureCandidates[]`, `activeCaptureCandidate`, `rect`, `matchedSelectors`, `iframeCaptchaPresent`, `preferredSolveMode`를 포함합니다.
-- `GET_CAPTCHA_ARTIFACTS`는 기본적으로 저장된 `directPublishState.tabId`를 대상으로 `artifact.dataUrl`, `artifact.kind`, `artifacts.directImage`, `artifacts.viewportCrop`, `selectedCandidate`, `captureContext`를 반환합니다.
+- `GET_CAPTCHA_CONTEXT`는 `answerInputCandidates[]`, `submitButtonCandidates[]`, `activeAnswerInput`, `activeSubmitButton`, `captureCandidates[]`, `activeCaptureCandidate`, `challengeText`, `challengeSlotCount`, `challengeCandidates[]`, `answerLengthHint`, `rect`, `matchedSelectors`, `iframeCaptchaPresent`, `preferredSolveMode`를 포함합니다.
+- `GET_CAPTCHA_ARTIFACTS`는 기본적으로 저장된 `directPublishState.tabId`를 대상으로 `artifact.dataUrl`, `artifact.kind`, `artifacts.directImage`, `artifacts.viewportCrop`, `selectedCandidate`, `captureContext`를 반환하며, 이 `captureContext`에도 `challengeText` / `challengeSlotCount`가 포함될 수 있습니다.
 - `GET_CAPTCHA_ARTIFACTS.artifactPreference`는 외부 에이전트가 우선 사용할 이미지(`viewportCrop` 또는 `directImage`)를 알려줍니다.
+- `INFER_CAPTCHA_ANSWER`는 `challengeText` + `ocrTexts[]`를 받아 빈칸 답안을 추론하고, `chosenCandidate` / `candidates[]`로 어떤 OCR 후보가 채택됐는지 돌려줍니다.
 - `SUBMIT_CAPTCHA`는 `selectedInput`, `selectedButton`, `buttonText`, `captchaPresentAfterWait`, `captchaStillAppears`, `diagnostics.before/after`, `answerNormalization`을 반환합니다. v1.8.0부터는 cross-origin iframe도 우선 frame submit을 시도하고, 그래도 막히면 `captcha_browser_handoff_required`와 `handoff` 힌트를 반환합니다.
 - `SUBMIT_CAPTCHA` 기본 대상 탭은 저장된 `directPublishState.tabId`이며, 필요하면 `data.tabId`로 override할 수 있습니다.
-- `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`는 답안을 `trim`하고 내부 공백을 제거해 OCR 공백 노이즈를 줄입니다.
+- `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`는 답안을 `trim`하고 내부 공백을 제거해 OCR 공백 노이즈를 줄입니다. `answer` 없이 `ocrTexts[]`만 넘겨도 saved `captchaContext.challengeText` 기준으로 답안을 먼저 추론할 수 있습니다.
 - `SUBMIT_CAPTCHA_AND_RESUME`는 `submitResult` + `resumeResult`를 함께 반환하고, CAPTCHA가 사라졌으면 top-level `success` / `status` / `url`이 재개 결과를 반영합니다. `resumeResult.draftRestore`로 재개 전 self-heal 결과를 확인할 수 있습니다.
 - `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`는 iframe-only CAPTCHA에서도 우선 same-tab frame submit을 시도하고, 막히면 응답에 `captchaArtifacts`를 함께 실어 browser/CDP fallback으로 바로 이어지게 합니다.
 - `RESUME_DIRECT_PUBLISH`는 `data.waitForCaptcha`, `data.waitTimeoutMs`, `data.pollIntervalMs`를 지원하며, wait 모드일 때 응답의 `captchaWait`에 대기 결과를 포함합니다. 이 wait는 저장된 blocked tab을 우선 유지하고, CAPTCHA 해제 뒤 same-tab post-clear probe를 거쳐 재개합니다. handoff 중 일시적인 `editor_not_ready` / frame scan miss는 clear로 취급하지 않습니다.
@@ -459,8 +473,9 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 | `GET_DIRECT_PUBLISH_STATE` | 저장된 direct publish CAPTCHA state 조회 (`includeCaptchaContext` 옵션 지원) |
 | `GET_CAPTCHA_CONTEXT` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)의 CAPTCHA context 조회 |
 | `GET_CAPTCHA_ARTIFACTS` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)의 CAPTCHA 이미지 아티팩트 조회 |
-| `SUBMIT_CAPTCHA_AND_RESUME` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)에 CAPTCHA 답안을 제출하고 같은 탭에서 즉시 직접 발행 재개 |
-| `SUBMIT_CAPTCHA` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)에 CAPTCHA 답안 입력 + 확인 버튼 클릭 |
+| `INFER_CAPTCHA_ANSWER` | `challengeText` + `ocrTexts[]` 또는 saved `captchaContext` 기준으로 CAPTCHA 빈칸 답안 추론 |
+| `SUBMIT_CAPTCHA_AND_RESUME` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)에 CAPTCHA 답안을 제출하고 같은 탭에서 즉시 직접 발행 재개 (`answer` 또는 `ocrTexts[]`) |
+| `SUBMIT_CAPTCHA` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)에 CAPTCHA 답안 입력 + 확인 버튼 클릭 (`answer` 또는 `ocrTexts[]`) |
 | `RESUME_DIRECT_PUBLISH` | CAPTCHA 해결 후 직접 발행 재개 (saved blocked tab 우선, `waitForCaptcha`/`waitTimeoutMs`/`pollIntervalMs` 지원) |
 | `RESUME_AFTER_CAPTCHA` | CAPTCHA 해결 후 큐 항목 재개 (`data.id` 필요) |
 | `RETRY_ITEM` | 큐 항목 처음부터 재시도 (`data.id` 필요) |
@@ -480,6 +495,6 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - **verification_failed 오탐**: Tistory가 발행 후 URL을 변경하지 않는 경우 발행이 성공했음에도 실패로 기록될 수 있습니다. 관리자 페이지(`/manage/posts`)에서 직접 확인하세요.
 - **CAPTCHA 중 탭 닫힘**: 같은 탭이 살아 있으면 재개 전에 draft self-heal을 시도하지만, 탭을 닫아버리면 저장되지 않은 내용은 복구 불가합니다.
 - **셀렉터 변경**: 티스토리 에디터 업데이트 시 `content/selectors.js` 수정이 필요할 수 있습니다.
-- **자동 판독은 외부 책임**: 확장 프로그램은 `GET_CAPTCHA_ARTIFACTS`/`captchaArtifacts`로 이미지 아티팩트를 제공하고 same-tab 재개까지 맡지만, 실제 OCR/비전 판독은 외부 에이전트/서비스가 수행해야 합니다.
+- **OCR 자체는 외부 책임**: 확장 프로그램은 `GET_CAPTCHA_ARTIFACTS`/`captchaArtifacts`로 이미지 아티팩트를 제공하고, `challengeText` / `challengeSlotCount` / `INFER_CAPTCHA_ANSWER`로 빈칸 답안 축약까지 도와주지만, 원본 이미지에서 전체 후보 텍스트를 읽는 OCR/비전 단계 자체는 외부 에이전트/서비스가 수행해야 합니다.
 - **cross-origin iframe 입력도 기본은 확장 same-tab solve**: v1.8.0부터는 `chrome.scripting.executeScript(allFrames)`로 iframe 내부 이미지/입력창/버튼을 직접 다루고, 이 경로가 막힌 예외 케이스에서만 `captcha_browser_handoff_required` + `preferredSolveMode: "browser_handoff"` fallback을 사용합니다.
 - **viewport crop는 Chrome capture 권한 상태에 영향받을 수 있음**: 이 경우에도 Tistory DKAPTCHA가 실제 이미지 요소면 `artifacts.directImage`가 남을 수 있습니다.

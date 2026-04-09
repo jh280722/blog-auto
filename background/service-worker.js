@@ -2285,6 +2285,12 @@ async function resolveCaptchaAnswerInput(tabId, data = {}, savedState = null) {
       source: 'explicit_answer',
       answer: explicitAnswer.value,
       answerNormalization: explicitAnswer.summary,
+      answerCandidates: [{
+        answer: explicitAnswer.value,
+        normalizedAnswer: explicitAnswer.value,
+        score: null,
+        reasons: ['explicit_answer']
+      }],
       inference: null,
       ocrCandidates: []
     };
@@ -2346,14 +2352,189 @@ async function resolveCaptchaAnswerInput(tabId, data = {}, savedState = null) {
   }
 
   const inferredAnswer = normalizeCaptchaAnswer(inference.answer || '');
+  const answerCandidates = (Array.isArray(inference.answerCandidates) ? inference.answerCandidates : []).map((candidate) => {
+    const normalized = normalizeCaptchaAnswer(candidate.answer || '');
+    return {
+      ...candidate,
+      answer: normalized.value,
+      normalizedAnswer: normalized.value,
+      answerNormalization: normalized.summary
+    };
+  }).filter((candidate) => candidate.answer);
+
   return {
     success: true,
     source: 'ocr_inference',
     answer: inferredAnswer.value,
     answerNormalization: inferredAnswer.summary,
+    answerCandidates,
     inference,
     captchaContext,
     ocrCandidates
+  };
+}
+
+function buildCaptchaAnswerAttemptCandidates(answerResolution, options = {}) {
+  const defaultMaxAttempts = answerResolution?.source === 'ocr_inference' ? 3 : 1;
+  const maxAttempts = clamp(Number(options.maxAnswerAttempts) || defaultMaxAttempts, 1, 5);
+  const allowExplicitAnswerRetries = options.allowExplicitAnswerRetries === true || options.retryExplicitAnswer === true;
+  const candidates = [];
+  const seenAnswers = new Set();
+
+  const pushCandidate = (candidate = {}, sourceFallback = null) => {
+    const normalized = normalizeCaptchaAnswer(candidate.answer || '');
+    if (!normalized.value || seenAnswers.has(normalized.value)) return;
+    seenAnswers.add(normalized.value);
+    candidates.push({
+      answer: normalized.value,
+      answerNormalization: candidate.answerNormalization || normalized.summary,
+      source: candidate.source || sourceFallback || answerResolution?.source || null,
+      sourceText: candidate.sourceText || null,
+      normalizedSourceText: candidate.normalizedSourceText || null,
+      score: Number.isFinite(candidate.score) ? candidate.score : null,
+      reasons: Array.isArray(candidate.reasons) ? candidate.reasons : []
+    });
+  };
+
+  pushCandidate({
+    answer: answerResolution?.answer,
+    answerNormalization: answerResolution?.answerNormalization,
+    source: answerResolution?.source,
+    reasons: [answerResolution?.source || 'primary_answer']
+  }, 'primary_answer');
+
+  const shouldAppendRankedCandidates = answerResolution?.source === 'ocr_inference' || allowExplicitAnswerRetries;
+  if (shouldAppendRankedCandidates) {
+    const rankedCandidates = Array.isArray(answerResolution?.answerCandidates) && answerResolution.answerCandidates.length > 0
+      ? answerResolution.answerCandidates
+      : (Array.isArray(answerResolution?.inference?.answerCandidates) ? answerResolution.inference.answerCandidates : []);
+    rankedCandidates.forEach((candidate) => pushCandidate(candidate, 'ocr_inference_candidate'));
+  }
+
+  return candidates.slice(0, maxAttempts);
+}
+
+function getCaptchaChallengeSignature(captchaContext = null) {
+  const challenge = getChallengeFromCaptchaContext(captchaContext);
+  const challengeText = String(challenge.challengeText || '').trim();
+  if (!challengeText) return null;
+
+  return [
+    challengeText,
+    Number(challenge.challengeSlotCount) || Number(challenge.answerLengthHint) || 0,
+    String(captchaContext?.preferredSolveMode || ''),
+    String(captchaContext?.activeCaptureCandidate?.frameId ?? '')
+  ].join('::');
+}
+
+async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}) {
+  const answerAttemptPlan = buildCaptchaAnswerAttemptCandidates(answerResolution, options);
+  if (answerAttemptPlan.length === 0) {
+    return {
+      success: false,
+      status: 'captcha_answer_required',
+      error: 'CAPTCHA 답안 후보를 준비하지 못했습니다.',
+      answerResolution,
+      answerAttemptPlan: [],
+      answerAttemptHistory: [],
+      answerRetrySummary: {
+        candidateCount: 0,
+        attemptedCount: 0,
+        retryEnabled: false,
+        stoppedReason: 'answer_candidates_missing',
+        initialChallengeSignature: null
+      }
+    };
+  }
+
+  const initialChallengeSignature = getCaptchaChallengeSignature(answerResolution?.captchaContext);
+  const retryEnabled = answerResolution?.source === 'ocr_inference' && answerAttemptPlan.length > 1;
+  const answerAttemptHistory = [];
+  let lastSubmitResult = null;
+  let lastRefreshedContext = null;
+  let stoppedReason = retryEnabled ? 'answer_candidates_exhausted' : 'retry_not_enabled';
+
+  for (let index = 0; index < answerAttemptPlan.length; index += 1) {
+    const candidate = answerAttemptPlan[index];
+    const submitResult = await submitCaptchaForTab(tabId, candidate.answer, options);
+    const refreshedContext = await refreshDirectPublishCaptchaState(tabId, submitResult);
+    const captchaStillAppears = refreshedContext?.success
+      ? !!refreshedContext.captchaContext?.captchaPresent
+      : !!submitResult.captchaStillAppears;
+    const refreshedChallengeSignature = refreshedContext?.success
+      ? getCaptchaChallengeSignature(refreshedContext.captchaContext)
+      : null;
+    const challengeStable = !captchaStillAppears
+      ? true
+      : (!!initialChallengeSignature && !!refreshedChallengeSignature && refreshedChallengeSignature === initialChallengeSignature);
+
+    lastSubmitResult = submitResult;
+    lastRefreshedContext = refreshedContext;
+    answerAttemptHistory.push({
+      attempt: index + 1,
+      answer: candidate.answer,
+      source: candidate.source,
+      sourceText: candidate.sourceText,
+      score: candidate.score,
+      success: !!submitResult.success,
+      status: submitResult.status || null,
+      captchaStillAppears,
+      challengeStable,
+      challengeChanged: !!(captchaStillAppears && initialChallengeSignature && refreshedChallengeSignature && refreshedChallengeSignature !== initialChallengeSignature),
+      challengeSignature: refreshedChallengeSignature || null
+    });
+
+    if (!submitResult.success) {
+      stoppedReason = 'submit_failed';
+      break;
+    }
+
+    if (!captchaStillAppears) {
+      stoppedReason = index === 0 ? 'captcha_cleared' : 'captcha_cleared_after_retry';
+      break;
+    }
+
+    if (!retryEnabled) {
+      stoppedReason = 'retry_not_enabled';
+      break;
+    }
+
+    if (index >= answerAttemptPlan.length - 1) {
+      stoppedReason = 'answer_candidates_exhausted';
+      break;
+    }
+
+    if (!challengeStable) {
+      stoppedReason = 'challenge_changed';
+      break;
+    }
+  }
+
+  const fallbackResult = lastSubmitResult || {
+    success: false,
+    status: 'captcha_answer_required',
+    error: 'CAPTCHA 답안을 제출하지 못했습니다.',
+    tabId
+  };
+  const captchaStillAppears = lastRefreshedContext?.success
+    ? !!lastRefreshedContext.captchaContext?.captchaPresent
+    : !!fallbackResult.captchaStillAppears;
+
+  return {
+    ...fallbackResult,
+    tabId,
+    answerResolution,
+    answerAttemptPlan,
+    answerAttemptHistory,
+    answerRetrySummary: {
+      candidateCount: answerAttemptPlan.length,
+      attemptedCount: answerAttemptHistory.length,
+      retryEnabled,
+      stoppedReason,
+      initialChallengeSignature
+    },
+    refreshedCaptchaContext: lastRefreshedContext?.success ? lastRefreshedContext.captchaContext || null : null,
+    captchaStillAppears
   };
 }
 
@@ -4930,11 +5111,11 @@ async function handleMessage(message, sender) {
         };
       }
 
-      const submitResult = await submitCaptchaForTab(tabId, answerResolution.answer, { waitMs: message.data?.waitMs });
-      const refreshedContext = await refreshDirectPublishCaptchaState(tabId, submitResult);
-      const captchaStillAppears = refreshedContext?.success
-        ? !!refreshedContext.captchaContext?.captchaPresent
-        : !!submitResult.captchaStillAppears;
+      const submitResult = await submitResolvedCaptchaForTab(tabId, answerResolution, {
+        waitMs: message.data?.waitMs,
+        maxAnswerAttempts: message.data?.maxAnswerAttempts
+      });
+      const captchaStillAppears = !!submitResult.captchaStillAppears;
 
       if (!submitResult.success || captchaStillAppears) {
         const handoff = await captureCaptchaHandoffForTab(tabId);
@@ -4979,16 +5160,11 @@ async function handleMessage(message, sender) {
         };
       }
 
-      const initialSubmitResult = await submitCaptchaForTab(tabId, answerResolution.answer, { waitMs: message.data?.waitMs });
-      const refreshedContext = await refreshDirectPublishCaptchaState(tabId, initialSubmitResult);
-      const captchaStillAppears = refreshedContext?.success
-        ? !!refreshedContext.captchaContext?.captchaPresent
-        : !!initialSubmitResult.captchaStillAppears;
-      const submitResult = {
-        ...initialSubmitResult,
-        answerResolution,
-        captchaStillAppears
-      };
+      const submitResult = await submitResolvedCaptchaForTab(tabId, answerResolution, {
+        waitMs: message.data?.waitMs,
+        maxAnswerAttempts: message.data?.maxAnswerAttempts
+      });
+      const captchaStillAppears = !!submitResult.captchaStillAppears;
 
       if (!submitResult.success || captchaStillAppears) {
         const handoff = await captureCaptchaHandoffForTab(tabId);

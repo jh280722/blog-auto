@@ -179,6 +179,35 @@ function scoreResolvedAnswer(parsedChallenge, resolution, options = {}) {
   return { score, reasons };
 }
 
+function buildUniqueAnswerCandidates(evaluatedCandidates = [], limit = null) {
+  const uniqueAnswers = [];
+  const seenAnswers = new Set();
+
+  evaluatedCandidates.forEach((candidate) => {
+    if (!candidate?.success || !candidate?.inferredAnswer) return;
+
+    const normalizedAnswer = normalizeComparableCaptchaText(candidate.inferredAnswer);
+    if (!normalizedAnswer || seenAnswers.has(normalizedAnswer)) return;
+    seenAnswers.add(normalizedAnswer);
+
+    uniqueAnswers.push({
+      answer: candidate.inferredAnswer,
+      normalizedAnswer,
+      sourceText: candidate.sourceText,
+      normalizedSourceText: candidate.normalizedSourceText,
+      inferredAnswerParts: candidate.inferredAnswerParts || [],
+      score: candidate.score,
+      reasons: candidate.reasons || []
+    });
+  });
+
+  if (Number.isFinite(limit) && limit > 0) {
+    return uniqueAnswers.slice(0, limit);
+  }
+
+  return uniqueAnswers;
+}
+
 export function inferCaptchaAnswer({ challengeText = '', ocrText = '', ocrTexts = [], answerLengthHint = null } = {}) {
   const parsedChallenge = parseCaptchaChallengeText(challengeText);
   if (!parsedChallenge.hasMask) {
@@ -187,7 +216,8 @@ export function inferCaptchaAnswer({ challengeText = '', ocrText = '', ocrTexts 
       status: 'captcha_challenge_mask_missing',
       error: '빈칸이 포함된 CAPTCHA 문제 문구를 찾지 못했습니다.',
       challenge: parsedChallenge,
-      candidates: []
+      candidates: [],
+      answerCandidates: []
     };
   }
 
@@ -208,7 +238,8 @@ export function inferCaptchaAnswer({ challengeText = '', ocrText = '', ocrTexts 
       status: 'captcha_ocr_candidate_missing',
       error: 'OCR 후보 텍스트가 비어 있습니다.',
       challenge: parsedChallenge,
-      candidates: []
+      candidates: [],
+      answerCandidates: []
     };
   }
 
@@ -228,6 +259,7 @@ export function inferCaptchaAnswer({ challengeText = '', ocrText = '', ocrTexts 
     };
   }).sort((a, b) => b.score - a.score);
 
+  const answerCandidates = buildUniqueAnswerCandidates(evaluated);
   const best = evaluated[0] || null;
   if (!best || !best.success || !best.inferredAnswer) {
     return {
@@ -235,7 +267,8 @@ export function inferCaptchaAnswer({ challengeText = '', ocrText = '', ocrTexts 
       status: 'captcha_answer_inference_failed',
       error: 'OCR 후보에서 CAPTCHA 답안을 안정적으로 추론하지 못했습니다.',
       challenge: parsedChallenge,
-      candidates: evaluated
+      candidates: evaluated,
+      answerCandidates
     };
   }
 
@@ -246,6 +279,7 @@ export function inferCaptchaAnswer({ challengeText = '', ocrText = '', ocrTexts 
     challenge: parsedChallenge,
     chosenCandidate: best,
     candidates: evaluated,
+    answerCandidates,
     answerLength: best.inferredAnswer.length,
     answerLengthHint: Number(answerLengthHint) || null
   };

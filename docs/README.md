@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.2 (2026-04-09 CAPTCHA ranked retry patch 포함)**
+> 현재 운영 기준: **v1.8.3 (2026-04-09 visual retry + live-newpost recovery patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -20,7 +20,9 @@
 > - **`challengeText` / `challengeSlotCount` / `challengeCandidates`를 same-tab CAPTCHA context와 artifact handoff에 함께 포함**
 > - **`INFER_CAPTCHA_ANSWER`로 OCR 후보 텍스트를 빈칸 답안으로 바로 줄이는 helper 추가**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`가 explicit answer뿐 아니라 OCR 후보 텍스트 기반 답안 추론도 바로 수용**
-- **OCR 후보가 여러 개면 `SUBMIT_CAPTCHA*`가 상위 답안 후보를 같은 challenge에서 순차 재시도하고, challenge가 바뀌면 즉시 중단 후 새 handoff로 전환**
+> - **OCR 후보가 여러 개면 `SUBMIT_CAPTCHA*`가 상위 답안 후보를 같은 challenge에서 순차 재시도하고, challenge가 바뀌면 즉시 중단 후 새 handoff로 전환**
+> - **challenge 문구를 다시 못 읽는 경우에도 same challenge 동일성을 visual signature fallback으로 계속 비교**
+> - **live `/manage/newpost` 탭에서 content script가 살아 있어도 probe가 실패하면 곧바로 `editor_ready`로 간주하지 않고 `manage → newpost` 회복 경로를 다시 태움**
 > - **`RESUME_DIRECT_PUBLISH(waitForCaptcha)`로 saved blocked tab을 유지한 채 extension-frame/browser fallback same-tab solve 완료까지 대기 후 즉시 재개**
 > - **발행 직후 탭 navigation 때문에 content-script 응답 채널이 닫혀도 `WRITE_POST`뿐 아니라 queue / `RESUME_AFTER_CAPTCHA` / `RESUME_DIRECT_PUBLISH`까지 recovery verification로 성공 여부를 다시 확정**
 > - **stale tab 회피 + 실제 editor body readiness gate**
@@ -47,9 +49,10 @@
 - **CAPTCHA inference API**: `INFER_CAPTCHA_ANSWER`로 `백촌오피스□ + 백촌오피스텔 → 텔` 같은 빈칸 답안을 안정적으로 추론
 - **CAPTCHA submit+resume API**: `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭 답안 제출과 직접 발행 재개를 한 번에 처리
 - **ranked answer retry**: OCR 후보가 여러 개면 `INFER_CAPTCHA_ANSWER` 응답의 `answerCandidates`를 기준으로 `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`가 같은 challenge 안에서 상위 답안을 자동 재시도
+- **visual challenge fallback**: `challengeText`가 비는 iframe/canvas CAPTCHA에서도 visual signature를 같이 비교해 같은 challenge 재시도를 너무 빨리 끊지 않음
 - **post-publish channel-close recovery 공통화**: 발행 직후 탭 이동으로 content-script 응답 채널이 닫혀도 `WRITE_POST`, queue auto-publish, `RESUME_AFTER_CAPTCHA`, `RESUME_DIRECT_PUBLISH`가 최신 saved post를 다시 검증해 false fail을 줄임
 - **solve wait-resume**: `RESUME_DIRECT_PUBLISH`가 `editorProbe.reason === "captcha_present"`인 blocked tab도 그대로 wait target으로 유지하고, same-tab extension-frame/browser fallback 풀이가 끝난 뒤 같은 탭 기준으로만 재개를 이어감. handoff 중 일시적인 `editor_not_ready` / frame-scan miss는 clear로 취급하지 않음
-- **실제 에디터 준비 probe**: `PREPARE_EDITOR`가 content script alive만 보지 않고 TinyMCE body / contenteditable / publish layer / CAPTCHA 상태까지 확인
+- **실제 에디터 준비 probe**: `PREPARE_EDITOR`가 content script alive만 보지 않고 TinyMCE body / contenteditable / publish layer / CAPTCHA 상태까지 확인하며, live `/manage/newpost` 탭 probe가 실패하면 blind reuse 대신 회복 navigation으로 넘김
 - **fail-closed 쓰기 preflight**: `WRITE_POST`는 title/category 쓰기 전에 실제 editor body를 다시 확인하고, 미준비면 `editor_not_ready` + `preflight`로 즉시 중단
 - **재개 전 draft self-heal**: CAPTCHA 후 재개 전에 제목/본문/카테고리/이미지/태그 스냅샷을 확인하고, 비어 있으면 같은 탭에서 자동 복구 후 발행
 - **CAPTCHA 핸드오프**: DKAPTCHA 감지 시 자동 일시정지 → 같은 탭에서 해결 → 원클릭 재개
@@ -503,5 +506,6 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 - **CAPTCHA 중 탭 닫힘**: 같은 탭이 살아 있으면 재개 전에 draft self-heal을 시도하지만, 탭을 닫아버리면 저장되지 않은 내용은 복구 불가합니다.
 - **셀렉터 변경**: 티스토리 에디터 업데이트 시 `content/selectors.js` 수정이 필요할 수 있습니다.
 - **OCR 자체는 외부 책임**: 확장 프로그램은 `GET_CAPTCHA_ARTIFACTS`/`captchaArtifacts`로 이미지 아티팩트를 제공하고, `challengeText` / `challengeSlotCount` / `INFER_CAPTCHA_ANSWER`로 빈칸 답안 축약까지 도와주지만, 원본 이미지에서 전체 후보 텍스트를 읽는 OCR/비전 단계 자체는 외부 에이전트/서비스가 수행해야 합니다.
+- **tainted canvas iframe은 여전히 challengeText가 비어 있을 수 있음**: 이번 패치로 same challenge retry는 visual signature로 더 안정화됐지만, `frame_direct_image`가 tainted canvas로 막히고 `challengeText`/`answerCandidates`까지 비면 전체 단어 OCR 단계는 여전히 외부 보강이 필요합니다.
 - **cross-origin iframe 입력도 기본은 확장 same-tab solve**: v1.8.0부터는 `chrome.scripting.executeScript(allFrames)`로 iframe 내부 이미지/입력창/버튼을 직접 다루고, 이 경로가 막힌 예외 케이스에서만 `captcha_browser_handoff_required` + `preferredSolveMode: "browser_handoff"` fallback을 사용합니다.
 - **viewport crop는 Chrome capture 권한 상태에 영향받을 수 있음**: 이 경우에도 Tistory DKAPTCHA가 실제 이미지 요소면 `artifacts.directImage`가 남을 수 있습니다.

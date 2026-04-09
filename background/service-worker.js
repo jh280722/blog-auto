@@ -6,6 +6,11 @@
  */
 
 import { inferCaptchaAnswer } from '../utils/captcha-inference.js';
+import {
+  buildCaptchaChallengeSignature,
+  compareCaptchaChallengeSignatures,
+  getChallengeFromCaptchaContext
+} from '../utils/captcha-retry.js';
 
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
@@ -2223,60 +2228,6 @@ function collectOcrTextCandidates(data = {}) {
   return deduped;
 }
 
-function getChallengeFromCaptchaContext(captchaContext = null) {
-  if (!captchaContext || typeof captchaContext !== 'object') {
-    return {
-      challengeText: null,
-      challengeSlotCount: null,
-      answerLengthHint: null,
-      challengeCandidates: []
-    };
-  }
-
-  const challengeCandidates = [];
-  const pushCandidate = (entry) => {
-    if (!entry) return;
-    if (typeof entry === 'string') {
-      const trimmed = entry.trim();
-      if (!trimmed) return;
-      challengeCandidates.push({ text: trimmed, maskedText: trimmed });
-      return;
-    }
-
-    const text = String(entry.maskedText || entry.text || '').trim();
-    if (!text) return;
-    challengeCandidates.push({
-      text,
-      maskedText: String(entry.maskedText || entry.text || '').trim(),
-      slotCount: Number(entry.slotCount) || null,
-      source: entry.source || null,
-      score: Number(entry.score) || null
-    });
-  };
-
-  pushCandidate(captchaContext.challengeText);
-  pushCandidate(captchaContext.challengeMasked);
-  if (Array.isArray(captchaContext.challengeCandidates)) {
-    captchaContext.challengeCandidates.forEach(pushCandidate);
-  }
-
-  const uniqueCandidates = [];
-  const seen = new Set();
-  challengeCandidates.forEach((entry) => {
-    const key = `${entry.maskedText || entry.text}::${Number(entry.slotCount) || 0}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    uniqueCandidates.push(entry);
-  });
-
-  return {
-    challengeText: uniqueCandidates[0]?.maskedText || uniqueCandidates[0]?.text || null,
-    challengeSlotCount: Number(captchaContext.challengeSlotCount) || Number(uniqueCandidates[0]?.slotCount) || null,
-    answerLengthHint: Number(captchaContext.answerLengthHint) || Number(captchaContext.challengeSlotCount) || Number(uniqueCandidates[0]?.slotCount) || null,
-    challengeCandidates: uniqueCandidates
-  };
-}
-
 async function resolveCaptchaAnswerInput(tabId, data = {}, savedState = null) {
   const explicitAnswer = normalizeCaptchaAnswer(data.answer || data.captchaAnswer || '');
   if (explicitAnswer.value) {
@@ -2414,17 +2365,84 @@ function buildCaptchaAnswerAttemptCandidates(answerResolution, options = {}) {
   return candidates.slice(0, maxAttempts);
 }
 
-function getCaptchaChallengeSignature(captchaContext = null) {
-  const challenge = getChallengeFromCaptchaContext(captchaContext);
-  const challengeText = String(challenge.challengeText || '').trim();
-  if (!challengeText) return null;
+async function hashCaptchaArtifactDataUrl(dataUrl = '') {
+  const normalized = typeof dataUrl === 'string' ? dataUrl.trim() : '';
+  if (!normalized) return null;
+
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(normalized));
+  return Array.from(new Uint8Array(digest))
+    .slice(0, 12)
+    .map((value) => value.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function buildCaptchaVisualSignature(artifactResult = null, captchaContext = null) {
+  const artifact = artifactResult?.artifact || null;
+  const normalizedHash = typeof artifactResult?.visualHash === 'string' ? artifactResult.visualHash.trim() : '';
+  if (!artifact?.dataUrl || !normalizedHash) return null;
 
   return [
-    challengeText,
-    Number(challenge.challengeSlotCount) || Number(challenge.answerLengthHint) || 0,
-    String(captchaContext?.preferredSolveMode || ''),
-    String(captchaContext?.activeCaptureCandidate?.frameId ?? '')
+    artifact.kind || 'artifact',
+    `${Number(artifact.width) || 0}x${Number(artifact.height) || 0}`,
+    String(artifactResult?.frameId ?? captchaContext?.activeCaptureCandidate?.frameId ?? ''),
+    normalizedHash
   ].join('::');
+}
+
+async function getCaptchaVisualSignatureForTab(tabId, captchaContext = null) {
+  if (!tabId) return null;
+
+  const shouldPreferFrame = captchaContext?.preferredSolveMode === 'extension_frame_dom'
+    || !!captchaContext?.iframeCaptchaPresent;
+
+  const attemptFrameArtifact = async () => {
+    const frameArtifactResult = await getCrossFrameCaptchaArtifactForTab(tabId);
+    if (!frameArtifactResult?.success || !frameArtifactResult.artifact?.dataUrl) return null;
+
+    const visualHash = await hashCaptchaArtifactDataUrl(frameArtifactResult.artifact.dataUrl);
+    if (!visualHash) return null;
+
+    return buildCaptchaVisualSignature({
+      ...frameArtifactResult,
+      visualHash,
+      frameId: frameArtifactResult.frameId ?? frameArtifactResult.activeFrame?.frameId ?? null
+    }, captchaContext);
+  };
+
+  const attemptDirectArtifact = async () => {
+    const directImageResult = await getCaptchaImageArtifactForTab(tabId);
+    if (!directImageResult?.success || !directImageResult.artifact?.dataUrl) return null;
+
+    const visualHash = await hashCaptchaArtifactDataUrl(directImageResult.artifact.dataUrl);
+    if (!visualHash) return null;
+
+    return buildCaptchaVisualSignature({
+      ...directImageResult,
+      visualHash
+    }, captchaContext);
+  };
+
+  if (shouldPreferFrame) {
+    return await attemptFrameArtifact() || await attemptDirectArtifact();
+  }
+
+  return await attemptDirectArtifact() || await attemptFrameArtifact();
+}
+
+async function getCaptchaChallengeSignature(tabId, captchaContext = null, options = {}) {
+  const signature = buildCaptchaChallengeSignature(captchaContext);
+  const needsVisualFallback = options.includeVisualFallback === true
+    || (!signature.textSignature && options.allowVisualWhenTextMissing !== false);
+  if (!tabId || !needsVisualFallback) {
+    return signature;
+  }
+
+  const visualSignature = await getCaptchaVisualSignatureForTab(tabId, captchaContext);
+  if (!visualSignature) {
+    return signature;
+  }
+
+  return buildCaptchaChallengeSignature(captchaContext, { visualSignature });
 }
 
 async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}) {
@@ -2442,13 +2460,16 @@ async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}
         attemptedCount: 0,
         retryEnabled: false,
         stoppedReason: 'answer_candidates_missing',
-        initialChallengeSignature: null
+        initialChallengeSignature: null,
+        initialChallengeSignatureDetails: null
       }
     };
   }
 
-  const initialChallengeSignature = getCaptchaChallengeSignature(answerResolution?.captchaContext);
   const retryEnabled = answerResolution?.source === 'ocr_inference' && answerAttemptPlan.length > 1;
+  const initialChallengeSignature = await getCaptchaChallengeSignature(tabId, answerResolution?.captchaContext, {
+    includeVisualFallback: retryEnabled
+  });
   const answerAttemptHistory = [];
   let lastSubmitResult = null;
   let lastRefreshedContext = null;
@@ -2461,12 +2482,27 @@ async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}
     const captchaStillAppears = refreshedContext?.success
       ? !!refreshedContext.captchaContext?.captchaPresent
       : !!submitResult.captchaStillAppears;
-    const refreshedChallengeSignature = refreshedContext?.success
-      ? getCaptchaChallengeSignature(refreshedContext.captchaContext)
+    const refreshedChallengeSignature = captchaStillAppears
+      ? await getCaptchaChallengeSignature(
+        tabId,
+        refreshedContext?.success ? refreshedContext.captchaContext : (submitResult?.preSubmitCaptchaContext || null),
+        { includeVisualFallback: retryEnabled }
+      )
       : null;
+    const challengeComparison = captchaStillAppears
+      ? compareCaptchaChallengeSignatures(initialChallengeSignature, refreshedChallengeSignature)
+      : {
+        stable: true,
+        changed: false,
+        confidence: 'none',
+        comparableKinds: [],
+        weakComparableKinds: [],
+        matchedKinds: [],
+        mismatchedKinds: []
+      };
     const challengeStable = !captchaStillAppears
       ? true
-      : (!!initialChallengeSignature && !!refreshedChallengeSignature && refreshedChallengeSignature === initialChallengeSignature);
+      : challengeComparison.stable !== false;
 
     lastSubmitResult = submitResult;
     lastRefreshedContext = refreshedContext;
@@ -2480,8 +2516,10 @@ async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}
       status: submitResult.status || null,
       captchaStillAppears,
       challengeStable,
-      challengeChanged: !!(captchaStillAppears && initialChallengeSignature && refreshedChallengeSignature && refreshedChallengeSignature !== initialChallengeSignature),
-      challengeSignature: refreshedChallengeSignature || null
+      challengeChanged: !!(captchaStillAppears && challengeComparison.changed),
+      challengeSignature: refreshedChallengeSignature?.primary || null,
+      challengeSignatureDetails: refreshedChallengeSignature || null,
+      challengeComparison
     });
 
     if (!submitResult.success) {
@@ -2531,7 +2569,8 @@ async function submitResolvedCaptchaForTab(tabId, answerResolution, options = {}
       attemptedCount: answerAttemptHistory.length,
       retryEnabled,
       stoppedReason,
-      initialChallengeSignature
+      initialChallengeSignature: initialChallengeSignature?.primary || null,
+      initialChallengeSignatureDetails: initialChallengeSignature || null
     },
     refreshedCaptchaContext: lastRefreshedContext?.success ? lastRefreshedContext.captchaContext || null : null,
     captchaStillAppears
@@ -4707,31 +4746,27 @@ async function tryPrepareCandidateTab(tab, diagnostics, targetBlogName = null) {
     return { success: false, error: initialProbe.error, tab };
   }
 
-  // ── Fast-path: tab is already on /manage/newpost with a live content script ──
-  // probeTabReady sends PROBE_EDITOR_READY which requires full editor init,
-  // but the content script may already be alive (responds to PING).
-  // If so, skip the heavy navigation that would destroy the running content script.
+  // 탭이 이미 /manage/newpost 에 있고 content script 가 살아 있더라도,
+  // PROBE_EDITOR_READY 가 실패했다면 곧바로 editor_ready 로 간주하면 안 된다.
+  // (예: CAPTCHA 잔존, publish layer 잔류, stale TinyMCE state)
+  // 이 경우에는 같은 탭을 manage → newpost 로 다시 태워 실제 회복을 시도한다.
   if (isNewPostTab(tab.url)) {
     const liveness = await probeContentScriptLiveness(tab.id);
     diagnostics.attempts.push({
       step: 'liveness_check_before_navigation',
       tabId: tab.id,
       url: tab.url,
-      alive: liveness.success
+      alive: liveness.success,
+      probeFailedReason: initialProbe.reason || null
     });
     if (liveness.success) {
-      diagnostics.entryStrategy = diagnostics.entryStrategy || 'reuse_live_newpost_tab';
       diagnostics.entryPath = diagnostics.entryPath?.length
         ? diagnostics.entryPath
-        : [{ step: 'skip_navigation_content_script_alive', url: tab.url }];
-      currentTabId = tab.id;
-      return makePreparationResponse({
-        success: true,
-        status: 'editor_ready',
-        tab,
-        blogName: targetBlogName,
-        diagnostics
-      });
+        : [{
+            step: 'live_newpost_probe_failed_continue_recovery',
+            url: tab.url,
+            reason: initialProbe.reason || null
+          }];
     }
   }
 

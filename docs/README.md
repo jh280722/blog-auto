@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.0**
+> 현재 운영 기준: **v1.8.0 (2026-04-09 same-tab frame-first patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -15,6 +15,8 @@
 > - **viewport crop용 `<all_urls>` host permission 포함 (captureVisibleTab 안정화)**
 > - **`captcha_required` / `captcha_browser_handoff_required` 응답에 same-tab artifact handoff 정보 즉시 포함**
 > - **CAPTCHA answer submit API (same blocked tab main DOM + cross-origin iframe 답안 입력 + 확인 버튼 클릭)**
+> - **raw `preferredSolveMode`도 iframe-only CAPTCHA에서 `extension_frame_dom`을 우선 반환해 초기 trace/힌트가 same-tab frame solve 기본값과 일치**
+> - **`SUBMIT_CAPTCHA*`는 merged `captchaContext.preferredSolveMode === "extension_frame_dom"`일 때 frame submit을 먼저 시도하고, 실제 frame solve가 막힌 예외에서만 browser handoff로 내려감**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`로 same-tab CAPTCHA 제출 + 즉시 발행 재개 일원화**
 > - **`RESUME_DIRECT_PUBLISH(waitForCaptcha)`로 saved blocked tab을 유지한 채 extension-frame/browser fallback same-tab solve 완료까지 대기 후 즉시 재개**
 > - **stale tab 회피 + 실제 editor body readiness gate**
@@ -31,10 +33,12 @@
 - **직접 발행 상태 추적**: `captcha_required` 시 blocked tab / blog / visibility / diagnostics / requestData와 `publishTrace` / `stage`를 저장
 - **CAPTCHA context API**: 에이전트가 iframe/레이어/입력창/버튼 위치를 읽어 같은 탭에서 해결할 수 있도록 컨텍스트 제공 (`preferredSolveMode`, `iframeCaptchaPresent`, `frameCaptchaCandidates` 포함)
 - **정규화된 same-tab solve 힌트**: 초기 `captcha_required` 응답과 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` 모두 서비스워커가 merge한 `captchaContext`를 돌려줘 raw iframe 감지보다 정확한 `preferredSolveMode`를 바로 사용할 수 있음
+- **raw solve hint 정렬**: content-side `GET_CAPTCHA_CONTEXT` / 초기 publish trace도 iframe-only CAPTCHA에서 `extension_frame_dom`을 먼저 가리켜, 초기 로그가 browser handoff로 과하게 기울지 않음
 - **resume blocking 판정 개선**: `RESUME_DIRECT_PUBLISH(waitForCaptcha)`와 queue resume은 top DOM iframe 껍데기만 보지 않고 merged frame context 기준으로 실제 blocking CAPTCHA만 기다림
 - **CAPTCHA artifact API**: 에이전트가 같은 blocked tab에서 main DOM/iframe 양쪽 CAPTCHA 이미지를 직접 받아 OCR/비전 입력으로 넘길 수 있음
 - **직접 응답 handoff**: `WRITE_POST` / `RESUME_DIRECT_PUBLISH` / `SUBMIT_CAPTCHA*`가 CAPTCHA로 막히면 응답에 `captchaArtifacts`를 같이 붙여 크론이 추가 왕복 없이 바로 OCR/비전으로 넘어갈 수 있음
 - **CAPTCHA submit API**: 에이전트가 blocked tab의 main DOM뿐 아니라 cross-origin iframe에도 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음
+- **frame-first submit routing**: merged `captchaContext`가 `extension_frame_dom`을 가리키면 `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`가 content DOM 실패 응답을 기다리지 않고 frame submit을 먼저 시도함
 - **CAPTCHA submit+resume API**: `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭 답안 제출과 직접 발행 재개를 한 번에 처리
 - **solve wait-resume**: `RESUME_DIRECT_PUBLISH`가 `editorProbe.reason === "captcha_present"`인 blocked tab도 그대로 wait target으로 유지하고, same-tab extension-frame/browser fallback 풀이가 끝난 뒤 같은 탭 기준으로만 재개를 이어감. handoff 중 일시적인 `editor_not_ready` / frame-scan miss는 clear로 취급하지 않음
 - **실제 에디터 준비 probe**: `PREPARE_EDITOR`가 content script alive만 보지 않고 TinyMCE body / contenteditable / publish layer / CAPTCHA 상태까지 확인
@@ -82,7 +86,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 [발행] 클릭 → CAPTCHA 감지 → directPublishState 저장(tabId/blog/url/visibility)
 → 응답의 captchaArtifacts 확인 (없거나 재시도가 필요하면 GET_DIRECT_PUBLISH_STATE / GET_CAPTCHA_ARTIFACTS 호출)
 → OCR/비전으로 답안 추출
-→ `preferredSolveMode`가 `extension_dom` / `extension_frame_dom`이면 SUBMIT_CAPTCHA_AND_RESUME로 같은 탭 답안 입력 + 즉시 재개
+→ `preferredSolveMode`가 `extension_dom` / `extension_frame_dom`이면 SUBMIT_CAPTCHA_AND_RESUME로 같은 탭 답안 입력 + 즉시 재개 (`extension_frame_dom`이면 frame submit 우선)
 → iframe-only / cross-origin CAPTCHA도 우선 `extension_frame_dom`으로 처리되며, frame solve가 막힐 때만 `captcha_browser_handoff_required` + `preferredSolveMode=browser_handoff` 기준 browser/CDP fallback 사용
 → fallback이 필요할 때 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`를 걸어두면 blocked tab이 아직 `captcha_present` 상태여도 새 탭으로 갈아타지 않고, CAPTCHA 해제 감지 직후 같은 탭에서 자동 재개
 → CAPTCHA가 계속 보이면 새 답안/새 artifact로 재시도, 사라지면 발행 완료

@@ -1993,6 +1993,26 @@ async function submitCaptchaForTab(tabId, answer, options = {}) {
     return { success: false, status: 'captcha_answer_required', error: 'CAPTCHA 답안을 입력하세요.', tabId, answerNormalization: normalization.summary };
   }
 
+  const preSubmitContextResult = await getCaptchaContextForTab(tabId);
+  const preSubmitCaptchaContext = preSubmitContextResult.success ? preSubmitContextResult.captchaContext || null : null;
+  const shouldPreferFrameSubmit = preSubmitContextResult.success
+    && preSubmitCaptchaContext?.preferredSolveMode === 'extension_frame_dom'
+    && !hasActionableMainDomCaptcha(preSubmitCaptchaContext);
+
+  let preferredFrameResult = null;
+  if (shouldPreferFrameSubmit) {
+    preferredFrameResult = await submitCaptchaViaFrameForTab(tabId, normalization.value, options);
+    if (preferredFrameResult.success) {
+      return {
+        ...preferredFrameResult,
+        tabId,
+        answerNormalization: normalization.summary,
+        preSubmitCaptchaContext,
+        previousSubmitResult: null
+      };
+    }
+  }
+
   let primaryResult = null;
   try {
     const result = await sendTabMessageWithRecovery(tabId, {
@@ -2005,7 +2025,8 @@ async function submitCaptchaForTab(tabId, answer, options = {}) {
     primaryResult = {
       ...result,
       tabId,
-      answerNormalization: normalization.summary
+      answerNormalization: normalization.summary,
+      preSubmitCaptchaContext
     };
   } catch (error) {
     primaryResult = {
@@ -2013,11 +2034,13 @@ async function submitCaptchaForTab(tabId, answer, options = {}) {
       status: 'editor_not_ready',
       error: error.message,
       tabId,
-      answerNormalization: normalization.summary
+      answerNormalization: normalization.summary,
+      preSubmitCaptchaContext
     };
   }
 
-  const shouldTryFrameFallback = primaryResult.status === 'captcha_browser_handoff_required'
+  const shouldTryFrameFallback = shouldPreferFrameSubmit
+    || primaryResult.status === 'captcha_browser_handoff_required'
     || primaryResult.status === 'captcha_input_not_found'
     || primaryResult.status === 'captcha_submit_not_found'
     || (!!primaryResult.diagnostics?.before?.iframeCaptchaPresent && !primaryResult.success);
@@ -2026,7 +2049,7 @@ async function submitCaptchaForTab(tabId, answer, options = {}) {
     return primaryResult;
   }
 
-  const frameFallback = await submitCaptchaViaFrameForTab(tabId, normalization.value, options);
+  const frameFallback = preferredFrameResult || await submitCaptchaViaFrameForTab(tabId, normalization.value, options);
   if (!frameFallback.success) {
     return {
       ...primaryResult,
@@ -2038,6 +2061,7 @@ async function submitCaptchaForTab(tabId, answer, options = {}) {
     ...frameFallback,
     tabId,
     answerNormalization: normalization.summary,
+    preSubmitCaptchaContext,
     previousSubmitResult: primaryResult
   };
 }

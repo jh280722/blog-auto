@@ -2111,12 +2111,24 @@
     };
   }
 
+  function resolvePreferredCaptchaSolveMode(diagnostics) {
+    const iframeCandidates = diagnostics.captchaRoots.filter((match) => match.element?.tagName?.toLowerCase?.() === 'iframe');
+    const hasMainDomAnswerPath = diagnostics.answerInputs.length > 0 && diagnostics.submitButtons.length > 0;
+
+    return {
+      iframeCandidates,
+      preferredSolveMode: hasMainDomAnswerPath
+        ? 'extension_dom'
+        : (iframeCandidates.length > 0 ? 'extension_frame_dom' : 'extension_dom')
+    };
+  }
+
   function getCaptchaContext() {
     const diagnostics = collectCaptchaDiagnostics();
     const publishLayer = getVisiblePublishLayer();
     const confirmBtn = getConfirmButton();
     const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
-    const iframeCandidates = diagnostics.captchaRoots.filter((match) => match.element?.tagName?.toLowerCase?.() === 'iframe');
+    const { iframeCandidates, preferredSolveMode } = resolvePreferredCaptchaSolveMode(diagnostics);
 
     return {
       success: true,
@@ -2128,7 +2140,7 @@
       iframeCaptchaPresent: iframeCandidates.length > 0,
       iframeCaptchaCandidateCount: iframeCandidates.length,
       iframeCaptchaCandidates: iframeCandidates.map((match) => match.summary),
-      preferredSolveMode: iframeCandidates.length > 0 ? 'browser_handoff' : 'extension_dom',
+      preferredSolveMode,
       answerInputCandidateCount: diagnostics.answerInputs.length,
       answerInputCandidates: diagnostics.answerInputs.map((match) => match.summary),
       activeAnswerInput: diagnostics.answerInputs[0]?.summary || null,
@@ -2450,7 +2462,7 @@
         console.warn('[TistoryAuto] CAPTCHA 감지됨 — same-tab handoff 필요');
         return respond({
           success: false,
-          error: 'CAPTCHA가 감지되었습니다. 같은 탭에서 browser/CDP handoff로 풀이를 진행하세요.',
+          error: 'CAPTCHA가 감지되었습니다. 같은 탭에서 same-tab solve를 진행하세요.',
           status: 'captcha_required',
           captchaContext,
           captchaStage: 'before_publish'

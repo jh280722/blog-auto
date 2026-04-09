@@ -22,6 +22,14 @@
   const MANAGE_POST_DIAG_KEY = '__blog_auto_last_manage_post_diag';
   const MANAGE_POST_DIAG_ATTR = 'data-blog-auto-last-manage-post-diag';
   const MANAGE_POST_SEQ_ATTR = 'data-blog-auto-last-manage-post-seq';
+  const CAPTCHA_CHALLENGE_UTILS = window.__BLOG_AUTO_CAPTCHA_CHALLENGE__ || {};
+  const buildCaptchaChallengeFromTexts = CAPTCHA_CHALLENGE_UTILS.buildCaptchaChallengeFromTexts
+    || (() => ({
+      challengeText: null,
+      challengeMasked: null,
+      challengeSlotCount: null,
+      challengeCandidates: []
+    }));
   const STAGE_JITTER_DEFAULTS = {
     enabled: true,
     extraRatio: 0.18,
@@ -1432,7 +1440,7 @@
   ];
 
   const CAPTCHA_INPUT_HINT_RE = /(captcha|dkaptcha|보안|인증|문자|코드|정답|answer|response|challenge)/i;
-  const CAPTCHA_BUTTON_HINT_RE = /(확인|인증|제출|전송|완료|ok|submit|confirm|verify)/i;
+  const CAPTCHA_BUTTON_HINT_RE = /(확인|인증|제출|전송|ok|submit|confirm|verify)/i;
   const PUBLISH_BUTTON_HINT_RE = /(발행|저장|공개\s*발행|비공개\s*발행|publish|save)/i;
   const EDITOR_FIELD_HINT_RE = /(title|subject|제목|tag|태그|category|카테고리|search|검색)/i;
   const CAPTCHA_MASK_CHAR_RE = /[□▢◻◼⬜⬛◯○●◎◇◆_＿]/u;
@@ -1450,73 +1458,36 @@
       || reasons.includes('same_form');
   }
 
-  function extractCaptchaMaskedSnippet(text) {
-    const normalized = normalizeText(text);
-    if (!normalized || !CAPTCHA_MASK_CHAR_RE.test(normalized)) return null;
-
-    const snippetMatch = normalized.match(/([가-힣A-Za-z0-9]{0,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2}\s*[□▢◻◼⬜⬛◯○●◎◇◆_＿]+\s*(?:[가-힣A-Za-z0-9]{1,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2})?)/u);
-    const snippet = snippetMatch?.[1] ? normalizeText(snippetMatch[1]) : normalized;
-    return snippet.length <= 48 ? snippet : snippet.slice(0, 48);
-  }
-
-  function countCaptchaMaskSlots(text = '') {
-    const matches = String(text || '').match(CAPTCHA_MASK_RUN_RE);
-    return matches ? matches.reduce((sum, match) => sum + match.length, 0) : 0;
-  }
-
-  function collectBodyCaptchaMaskLines() {
-    const bodyText = document.body?.innerText || '';
-    return bodyText
-      .split(/\n+/)
-      .map((line) => normalizeText(line))
-      .filter((line) => line && CAPTCHA_MASK_CHAR_RE.test(line));
+  function normalizeCaptchaAnswerLengthHint(value = null) {
+    const normalized = Number(value);
+    if (!Number.isFinite(normalized) || normalized <= 0 || normalized > 12) {
+      return null;
+    }
+    return Math.floor(normalized);
   }
 
   function buildCaptchaChallenge(diagnostics) {
-    const challengeEntries = [];
-    const pushEntry = (text, source, score) => {
-      const snippet = extractCaptchaMaskedSnippet(text);
-      if (!snippet) return;
+    const challengeEntries = (document.body?.innerText || '')
+      .split(/\n+/)
+      .map((line) => normalizeText(line))
+      .filter(Boolean)
+      .map((line) => ({ text: line, source: 'body_line', score: 36 }));
 
-      challengeEntries.push({
-        text: normalizeText(text),
-        maskedText: snippet,
-        slotCount: countCaptchaMaskSlots(snippet),
-        source,
-        score
-      });
-    };
-
-    collectBodyCaptchaMaskLines().forEach((line) => pushEntry(line, 'body_line_mask', 36));
-
-    const captureTexts = [
-      ...diagnostics.captchaRoots.map((match) => match.summary?.text || ''),
-      ...diagnostics.captchaRoots.map((match) => match.summary?.associatedText || ''),
-      ...diagnostics.answerInputs.map((match) => match.summary?.associatedText || ''),
-      ...diagnostics.submitButtons.map((match) => match.summary?.associatedText || ''),
-      ...diagnostics.captureCandidates.map((match) => match.summary?.associatedText || ''),
-      ...diagnostics.captureCandidates.map((match) => match.summary?.text || '')
+    const descriptorEntries = [
+      ...diagnostics.captchaRoots.map((match) => ({ text: match.summary?.text || '', source: 'captcha_root_text', score: 24 })),
+      ...diagnostics.captchaRoots.map((match) => ({ text: match.summary?.associatedText || '', source: 'captcha_root_associated', score: 24 })),
+      ...diagnostics.answerInputs.map((match) => ({ text: match.summary?.associatedText || '', source: 'answer_input_associated', score: 20 })),
+      ...diagnostics.submitButtons.map((match) => ({ text: match.summary?.associatedText || '', source: 'submit_button_associated', score: 26 })),
+      ...diagnostics.submitButtons.map((match) => ({ text: match.summary?.text || '', source: 'submit_button_text', score: 32 })),
+      ...diagnostics.captureCandidates.map((match) => ({ text: match.summary?.associatedText || '', source: 'capture_candidate_associated', score: 20 })),
+      ...diagnostics.captureCandidates.map((match) => ({ text: match.summary?.text || '', source: 'capture_candidate_text', score: 20 }))
     ];
 
-    captureTexts.forEach((text) => pushEntry(text, 'captcha_descriptor', 20));
-
-    const deduped = [];
-    const seen = new Set();
-    challengeEntries.forEach((entry) => {
-      const key = `${entry.maskedText}::${entry.slotCount}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      deduped.push(entry);
+    descriptorEntries.forEach((entry) => {
+      challengeEntries.push(entry);
     });
 
-    deduped.sort((a, b) => b.score - a.score || a.maskedText.length - b.maskedText.length);
-
-    return {
-      challengeText: deduped[0]?.maskedText || null,
-      challengeMasked: deduped[0]?.maskedText || null,
-      challengeSlotCount: Number.isFinite(deduped[0]?.slotCount) ? deduped[0].slotCount : null,
-      challengeCandidates: deduped.slice(0, 5)
-    };
+    return buildCaptchaChallengeFromTexts(challengeEntries);
   }
 
   function detectCaptcha() {
@@ -2201,7 +2172,9 @@
     const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
     const { iframeCandidates, preferredSolveMode } = resolvePreferredCaptchaSolveMode(diagnostics);
     const challenge = buildCaptchaChallenge(diagnostics);
-    const answerLengthHint = Number(diagnostics.answerInputs[0]?.summary?.maxLength) || challenge.challengeSlotCount || null;
+    const answerLengthHint = normalizeCaptchaAnswerLengthHint(diagnostics.answerInputs[0]?.summary?.maxLength)
+      || challenge.challengeSlotCount
+      || null;
 
     return {
       success: true,

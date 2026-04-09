@@ -22,6 +22,15 @@ test('parseCaptchaChallengeText extracts mask runs and slots', () => {
   assert.equal(countCaptchaMaskSlots('□□빌네오'), 2);
 });
 
+test('parseCaptchaChallengeText keeps word-based blanks as variable-length masks', () => {
+  const parsed = parseCaptchaChallengeText('관양2동 빈칸 복지센터');
+  assert.equal(parsed.hasMask, true);
+  assert.equal(parsed.hasVariableMask, true);
+  assert.equal(parsed.slotCount, 0);
+  assert.equal(parsed.maskRunCount, 1);
+  assert.deepEqual(parsed.segments, ['관양2동', '복지센터']);
+});
+
 test('inferCaptchaAnswer handles a trailing missing character', () => {
   const result = inferCaptchaAnswer({
     challengeText: '백촌오피스□',
@@ -66,6 +75,29 @@ test('inferCaptchaAnswer chooses the best OCR candidate by slot alignment', () =
   assert.deepEqual(result.answerCandidates.map((candidate) => candidate.answer), ['산', '진']);
 });
 
+test('inferCaptchaAnswer handles word-based blanks with fuzzy OCR on anchored text', () => {
+  const result = inferCaptchaAnswer({
+    challengeText: '관양2동 빈칸 복지센터',
+    ocrTexts: ['관양동행정복지센터'],
+    answerLengthHint: 50
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.answer, '행정');
+  assert.equal(result.chosenCandidate.matchStrategy, 'fuzzy_single_mask_suffix_anchor');
+  assert.equal(result.answerLengthHint, null);
+});
+
+test('inferCaptchaAnswer handles trailing word-based blanks with fuzzy OCR', () => {
+  const result = inferCaptchaAnswer({
+    challengeText: '신세대빌 빈칸',
+    ocrTexts: ['신재대빌라']
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.answer, '라');
+  assert.equal(result.chosenCandidate.matchStrategy, 'fuzzy_single_mask_trailing_blank');
+});
 
 test('inferCaptchaAnswer dedupes ranked answer candidates that resolve to the same answer', () => {
   const result = inferCaptchaAnswer({

@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.3 (2026-04-09 visual retry + live-newpost recovery patch 포함)**
+> 현재 운영 기준: **v1.8.4 (2026-04-09 live challenge extraction patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -18,6 +18,7 @@
 > - **raw `preferredSolveMode`도 iframe-only CAPTCHA에서 `extension_frame_dom`을 우선 반환해 초기 trace/힌트가 same-tab frame solve 기본값과 일치**
 > - **`SUBMIT_CAPTCHA*`는 merged `captchaContext.preferredSolveMode === "extension_frame_dom"`일 때 frame submit을 먼저 시도하고, 실제 frame solve가 막힌 예외에서만 browser handoff로 내려감**
 > - **`challengeText` / `challengeSlotCount` / `challengeCandidates`를 same-tab CAPTCHA context와 artifact handoff에 함께 포함**
+> - **live DKAPTCHA frame summary가 frame body line + submit button text까지 다시 합쳐 instruction-style / masked challenge를 재구성하므로 `challengeText: null` 회차를 줄임**
 > - **`INFER_CAPTCHA_ANSWER`로 OCR 후보 텍스트를 빈칸 답안으로 바로 줄이는 helper 추가**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`가 explicit answer뿐 아니라 OCR 후보 텍스트 기반 답안 추론도 바로 수용**
 > - **OCR 후보가 여러 개면 `SUBMIT_CAPTCHA*`가 상위 답안 후보를 같은 challenge에서 순차 재시도하고, challenge가 바뀌면 즉시 중단 후 새 handoff로 전환**
@@ -44,6 +45,7 @@
 - **CAPTCHA artifact API**: 에이전트가 같은 blocked tab에서 main DOM/iframe 양쪽 CAPTCHA 이미지를 직접 받아 OCR/비전 입력으로 넘길 수 있음
 - **직접 응답 handoff**: `WRITE_POST` / `RESUME_DIRECT_PUBLISH` / `SUBMIT_CAPTCHA*`가 CAPTCHA로 막히면 응답에 `captchaArtifacts`를 같이 붙여 크론이 추가 왕복 없이 바로 OCR/비전으로 넘어갈 수 있음
 - **CAPTCHA challenge extraction**: context/artifact 응답에 빈칸 문제 문구(`challengeText`)와 칸 수(`challengeSlotCount`)를 포함해 OCR 결과를 답안으로 줄이기 쉬움
+- **live frame fallback extraction**: DKAPTCHA가 문구를 직접 안 내려줘도 frame body line, submit button text, capture candidate 주변 텍스트를 다시 합쳐 `challengeText`를 복원함
 - **CAPTCHA submit API**: 에이전트가 blocked tab의 main DOM뿐 아니라 cross-origin iframe에도 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음
 - **frame-first submit routing**: merged `captchaContext`가 `extension_frame_dom`을 가리키면 `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`가 content DOM 실패 응답을 기다리지 않고 frame submit을 먼저 시도함
 - **CAPTCHA inference API**: `INFER_CAPTCHA_ANSWER`로 `백촌오피스□ + 백촌오피스텔 → 텔` 같은 빈칸 답안을 안정적으로 추론
@@ -98,6 +100,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 → 응답의 captchaArtifacts 확인 (없거나 재시도가 필요하면 GET_DIRECT_PUBLISH_STATE / GET_CAPTCHA_ARTIFACTS 호출)
 → OCR/비전으로 전체 후보 텍스트 추출
 → `challengeText` / `challengeSlotCount`가 있으면 `INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`로 빈칸 답안 축약
+→ v1.8.4 기준 live DKAPTCHA에서도 `challengeText`가 비면 frame body line + submit button text fallback으로 다시 복원되는지 먼저 확인
 → OCR 후보가 여러 개면 `SUBMIT_CAPTCHA*`가 `answerCandidates` 상위 답안을 같은 challenge에서 자동 재시도하고, CAPTCHA 문구가 바뀌면 바로 멈춘 뒤 새 artifact/handoff를 돌려줌
 → `preferredSolveMode`가 `extension_dom` / `extension_frame_dom`이면 SUBMIT_CAPTCHA_AND_RESUME로 같은 탭 답안 입력 + 즉시 재개 (`extension_frame_dom`이면 frame submit 우선)
 → iframe-only / cross-origin CAPTCHA도 우선 `extension_frame_dom`으로 처리되며, frame solve가 막힐 때만 `captcha_browser_handoff_required` + `preferredSolveMode=browser_handoff` 기준 browser/CDP fallback 사용

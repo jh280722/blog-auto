@@ -5,7 +5,7 @@
  * - 발행 큐 관리
  */
 
-import { inferCaptchaAnswer } from '../utils/captcha-inference.js';
+import { inferCaptchaAnswer, normalizeCaptchaAnswerLengthHint, parseCaptchaChallengeText } from '../utils/captcha-inference.js';
 import {
   buildCaptchaChallengeSignature,
   compareCaptchaChallengeSignatures,
@@ -17,6 +17,8 @@ let publishQueue = [];
 let isProcessing = false;
 let currentTabId = null;
 let directPublishState = null;
+let runtimeStateLoaded = false;
+let runtimeStateLoadPromise = null;
 
 const DIRECT_PUBLISH_STATE_KEY = 'directPublishState';
 
@@ -75,6 +77,23 @@ async function loadQueueState() {
 async function loadDirectPublishState() {
   const result = await chrome.storage.local.get(DIRECT_PUBLISH_STATE_KEY);
   directPublishState = result[DIRECT_PUBLISH_STATE_KEY] || null;
+}
+
+async function ensureRuntimeStateLoaded() {
+  if (runtimeStateLoaded) return;
+
+  if (!runtimeStateLoadPromise) {
+    runtimeStateLoadPromise = Promise.all([loadQueueState(), loadDirectPublishState()])
+      .then(() => {
+        runtimeStateLoaded = true;
+      })
+      .catch((error) => {
+        runtimeStateLoadPromise = null;
+        throw error;
+      });
+  }
+
+  await runtimeStateLoadPromise;
 }
 
 async function persistDirectPublishState() {
@@ -347,6 +366,210 @@ function compactFallbackText(value = '', maxLength = 160) {
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
 }
 
+const CAPTCHA_MASK_CHAR_RE = /[□▢◻◼⬜⬛◯○●◎◇◆_＿]/u;
+const CAPTCHA_MASK_RUN_RE = /[□▢◻◼⬜⬛◯○●◎◇◆_＿]+/gu;
+const CAPTCHA_WORD_MASK_RE = /(?:빈\s*칸|공\s*란)/u;
+const CAPTCHA_WORD_MASK_GLOBAL_RE = /(?:빈\s*칸|공\s*란)/gu;
+const CAPTCHA_INSTRUCTION_ACTION_RE = /(?:입력|선택|클릭|고르|찾|맞추|완성)(?:해\s*주|해주)?세요/u;
+const CAPTCHA_INSTRUCTION_ACTION_GLOBAL_RE = /([가-힣A-Za-z0-9][^.!?\n]{0,120}?(?:입력|선택|클릭|고르|찾|맞추|완성)(?:해\s*주|해주)?세요)/gu;
+const CAPTCHA_INSTRUCTION_KEYWORD_RE = /(지도|사진|이미지|화면|캡차|captcha|dkaptcha|있는|보이는|다음|아래|위|간판|명칭|상호|업체|장소|문구|텍스트|번호|주소|이름|병원|약국|한의원|학교|건물|매장|기관|단어|숫자)/iu;
+const CAPTCHA_INSTRUCTION_EXACT_IGNORE_RE = /^(?:정답(?:을)?\s*입력해주세요|답(?:을)?\s*입력해주세요|답변\s*제출|새로\s*풀기|음성\s*문제(?:\s*재생)?|dkaptcha(?:\s*\(captcha\s*서비스\))?|captcha\s*서비스)$/iu;
+const CAPTCHA_INSTRUCTION_TRAILING_NOISE_RE = /\s*(?:정답(?:을)?\s*입력해주세요|답(?:을)?\s*입력해주세요|새로\s*풀기|음성\s*문제(?:\s*재생)?|답변\s*제출|DKAPTCHA(?:\s*\(CAPTCHA\s*서비스\))?|CAPTCHA\s*서비스).*$/iu;
+const CAPTCHA_INSTRUCTION_LEADING_NOISE_RE = /^(?:DKAPTCHA(?:\s*\(CAPTCHA\s*서비스\))?|CAPTCHA(?:\s*서비스)?|보안문자|자동등록방지)\s*/iu;
+
+function normalizeCaptchaChallengeText(value = '') {
+  return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeCaptchaChallengeMaskText(value = '') {
+  return normalizeCaptchaChallengeText(value).replace(CAPTCHA_WORD_MASK_GLOBAL_RE, '□');
+}
+
+function countCaptchaChallengeSlots(value = '') {
+  const normalized = normalizeCaptchaChallengeText(value);
+  const explicitMatches = normalized.match(CAPTCHA_MASK_RUN_RE);
+  const explicitSlotCount = explicitMatches ? explicitMatches.reduce((sum, token) => sum + token.length, 0) : 0;
+  if (explicitSlotCount > 0) return explicitSlotCount;
+  return CAPTCHA_WORD_MASK_RE.test(normalized) ? null : 0;
+}
+
+function boundCaptchaChallengeText(value = '', maxLength = 80) {
+  const normalized = normalizeCaptchaChallengeText(value);
+  return normalized.length <= maxLength ? normalized : normalized.slice(0, maxLength);
+}
+
+function extractMaskedCaptchaChallenge(value = '') {
+  const normalized = normalizeCaptchaChallengeText(value);
+  const normalizedMaskText = normalizeCaptchaChallengeMaskText(value);
+  if (!normalizedMaskText || (!CAPTCHA_MASK_CHAR_RE.test(normalizedMaskText) && !CAPTCHA_WORD_MASK_RE.test(normalized))) {
+    return null;
+  }
+
+  const snippetMatch = normalizedMaskText.match(/([가-힣A-Za-z0-9]{0,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2}\s*[□▢◻◼⬜⬛◯○●◎◇◆_＿]+\s*(?:[가-힣A-Za-z0-9]{1,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2})?)/u);
+  const rawSnippetMatch = normalized.match(/([가-힣A-Za-z0-9]{0,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2}\s*(?:[□▢◻◼⬜⬛◯○●◎◇◆_＿]+|빈\s*칸|공\s*란)\s*(?:[가-힣A-Za-z0-9]{1,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2})?)/u);
+  const maskedSnippet = snippetMatch?.[1] ? normalizeCaptchaChallengeText(snippetMatch[1]) : normalizedMaskText;
+  const rawSnippet = rawSnippetMatch?.[1] ? normalizeCaptchaChallengeText(rawSnippetMatch[1]) : normalized;
+
+  return {
+    text: boundCaptchaChallengeText(rawSnippet, 48),
+    maskedText: boundCaptchaChallengeText(maskedSnippet, 48),
+    slotCount: countCaptchaChallengeSlots(normalized),
+    kind: 'masked',
+    matchScore: 24
+  };
+}
+
+function normalizeCaptchaInstructionCandidate(value = '') {
+  let normalized = normalizeCaptchaChallengeText(value);
+  if (!normalized) return '';
+
+  normalized = normalized.replace(CAPTCHA_INSTRUCTION_LEADING_NOISE_RE, '').trim();
+  normalized = normalized.replace(CAPTCHA_INSTRUCTION_TRAILING_NOISE_RE, '').trim();
+  normalized = normalized.replace(/^[-:|]\s*/, '').trim();
+
+  return normalizeCaptchaChallengeText(normalized);
+}
+
+function extractInstructionCaptchaChallenge(value = '') {
+  const normalized = normalizeCaptchaChallengeText(value);
+  if (!normalized) return null;
+
+  const candidates = new Set();
+  candidates.add(normalized);
+  normalized.split(/\n+/).map(normalizeCaptchaChallengeText).filter(Boolean).forEach((line) => candidates.add(line));
+  Array.from(normalized.matchAll(CAPTCHA_INSTRUCTION_ACTION_GLOBAL_RE)).forEach((match) => {
+    if (match?.[1]) candidates.add(match[1]);
+  });
+
+  let best = null;
+  candidates.forEach((candidate) => {
+    const cleaned = normalizeCaptchaInstructionCandidate(candidate);
+    if (!cleaned || CAPTCHA_INSTRUCTION_EXACT_IGNORE_RE.test(cleaned) || !CAPTCHA_INSTRUCTION_ACTION_RE.test(cleaned)) {
+      return;
+    }
+
+    let score = 10;
+    if (CAPTCHA_INSTRUCTION_KEYWORD_RE.test(cleaned)) score += 10;
+    if (/(?:전체|정확한|일치하는|해당|같은)/u.test(cleaned)) score += 4;
+    if (/(?:있는|보이는|다음|아래|위)/u.test(cleaned)) score += 4;
+    if (cleaned.length >= 12 && cleaned.length <= 56) score += 3;
+    if (/^(?:정답|답변)/u.test(cleaned)) score -= 12;
+    if (/(?:새로\s*풀기|음성\s*문제|답변\s*제출|captcha\s*서비스|dkaptcha)/iu.test(cleaned)) score -= 18;
+    if (score < 16) return;
+
+    const snippet = {
+      text: boundCaptchaChallengeText(cleaned, 80),
+      maskedText: boundCaptchaChallengeText(cleaned, 80),
+      slotCount: null,
+      kind: 'instruction',
+      matchScore: score
+    };
+
+    if (!best || snippet.matchScore > best.matchScore || (snippet.matchScore == best.matchScore && snippet.text.length < best.text.length)) {
+      best = snippet;
+    }
+  });
+
+  return best;
+}
+
+function extractCaptchaChallengeEntry(value = '') {
+  return extractMaskedCaptchaChallenge(value) || extractInstructionCaptchaChallenge(value);
+}
+
+function buildCaptchaChallengeFromEntries(entries = []) {
+  const challengeEntries = [];
+
+  const pushValue = (entry) => {
+    if (entry == null) return;
+    const sourceText = typeof entry === 'string' ? entry : (entry.text ?? entry.value ?? '');
+    const source = typeof entry === 'string' ? null : (entry.source || null);
+    const baseScore = Number(typeof entry === 'string' ? 0 : entry.score) || 0;
+    const snippet = extractCaptchaChallengeEntry(sourceText);
+    if (!snippet) return;
+
+    challengeEntries.push({
+      text: snippet.text,
+      maskedText: snippet.maskedText || snippet.text,
+      slotCount: snippet.slotCount,
+      source,
+      kind: snippet.kind || 'masked',
+      score: baseScore + Number(snippet.matchScore || 0) + (snippet.kind === 'instruction' ? 8 : 18)
+    });
+  };
+
+  (Array.isArray(entries) ? entries : []).forEach(pushValue);
+
+  const deduped = [];
+  const seen = new Set();
+  challengeEntries.forEach((entry) => {
+    const key = `${entry.kind || 'masked'}::${entry.maskedText || entry.text || ''}::${entry.slotCount ?? 'var'}`;
+    if (!entry.text || seen.has(key)) return;
+    seen.add(key);
+    deduped.push(entry);
+  });
+
+  deduped.sort((a, b) => (
+    (b.score - a.score)
+    || ((b.kind === 'masked') - (a.kind === 'masked'))
+    || ((a.text || '').length - (b.text || '').length)
+  ));
+
+  return {
+    challengeText: deduped[0]?.text || null,
+    challengeMasked: deduped[0]?.maskedText || deduped[0]?.text || null,
+    challengeSlotCount: Number.isFinite(deduped[0]?.slotCount) ? deduped[0].slotCount : null,
+    challengeCandidates: deduped.slice(0, 5)
+  };
+}
+
+function buildCaptchaChallengeFromContext(context = null) {
+  if (!context || typeof context !== 'object') {
+    return {
+      challengeText: null,
+      challengeMasked: null,
+      challengeSlotCount: null,
+      challengeCandidates: []
+    };
+  }
+
+  const entries = [];
+  const pushValue = (value, source, score = 0) => {
+    if (!value) return;
+    entries.push({ text: value, source, score });
+  };
+  const pushCandidateText = (candidate, source, score = 0) => {
+    if (!candidate || typeof candidate !== 'object') return;
+    pushValue(candidate.text, `${source}:text`, score);
+    pushValue(candidate.maskedText, `${source}:masked`, score + 4);
+    pushValue(candidate.associatedText, `${source}:associated`, score + 2);
+  };
+
+  pushValue(context.challengeText, 'context_challenge_text', 48);
+  pushValue(context.challengeMasked, 'context_challenge_masked', 52);
+  pushValue(context.bodyHint, 'context_body_hint', 36);
+
+  (Array.isArray(context.challengeCandidates) ? context.challengeCandidates : []).forEach((candidate, index) => {
+    pushCandidateText(candidate, `context_challenge_candidate:${index}`, 44 - Math.min(index, 4));
+  });
+
+  pushCandidateText(context.activeSubmitButton, 'active_submit_button', 42);
+  pushCandidateText(context.activeAnswerInput, 'active_answer_input', 26);
+  pushCandidateText(context.activeCaptureCandidate, 'active_capture_candidate', 24);
+
+  (Array.isArray(context.submitButtonCandidates) ? context.submitButtonCandidates : []).forEach((candidate, index) => {
+    pushCandidateText(candidate, `submit_button_candidate:${index}`, 34 - Math.min(index, 4));
+  });
+  (Array.isArray(context.answerInputCandidates) ? context.answerInputCandidates : []).forEach((candidate, index) => {
+    pushCandidateText(candidate, `answer_input_candidate:${index}`, 18 - Math.min(index, 4));
+  });
+  (Array.isArray(context.captureCandidates) ? context.captureCandidates : []).forEach((candidate, index) => {
+    pushCandidateText(candidate, `capture_candidate:${index}`, 18 - Math.min(index, 4));
+  });
+
+  return buildCaptchaChallengeFromEntries(entries);
+}
+
 function withFrameMetadata(candidate, frameId) {
   if (!candidate || typeof candidate !== 'object') return candidate || null;
   return {
@@ -397,6 +620,24 @@ function normalizeCaptchaFrameEntries(injectionResults = []) {
 
 function summarizeCaptchaFrameEntry(entry = {}) {
   const frameContext = entry.frameContext || {};
+  const derivedChallenge = buildCaptchaChallengeFromContext(frameContext);
+  const resolvedChallengeText = frameContext.challengeText
+    || frameContext.challengeMasked
+    || derivedChallenge.challengeText
+    || derivedChallenge.challengeMasked
+    || null;
+  const resolvedChallengeMasked = frameContext.challengeMasked
+    || frameContext.challengeText
+    || derivedChallenge.challengeMasked
+    || derivedChallenge.challengeText
+    || null;
+  const resolvedChallengeSlotCount = Number(frameContext.challengeSlotCount)
+    || Number(derivedChallenge.challengeSlotCount)
+    || null;
+  const resolvedChallengeCandidates = Array.isArray(frameContext.challengeCandidates) && frameContext.challengeCandidates.length > 0
+    ? cloneJsonValue(frameContext.challengeCandidates) || []
+    : (cloneJsonValue(derivedChallenge.challengeCandidates) || []);
+
   return {
     frameId: entry.frameId,
     documentId: entry.documentId || null,
@@ -407,11 +648,13 @@ function summarizeCaptchaFrameEntry(entry = {}) {
     reasons: Array.isArray(frameContext.reasons) ? frameContext.reasons : [],
     candidateCount: Number(frameContext.candidateCount) || 0,
     captchaLike: !!frameContext.captchaLike,
-    challengeText: frameContext.challengeText || frameContext.challengeMasked || null,
-    challengeMasked: frameContext.challengeMasked || frameContext.challengeText || null,
-    challengeSlotCount: Number(frameContext.challengeSlotCount) || null,
-    challengeCandidates: Array.isArray(frameContext.challengeCandidates) ? cloneJsonValue(frameContext.challengeCandidates) || [] : [],
-    answerLengthHint: Number(frameContext.answerLengthHint) || Number(frameContext.challengeSlotCount) || null,
+    challengeText: resolvedChallengeText,
+    challengeMasked: resolvedChallengeMasked,
+    challengeSlotCount: resolvedChallengeSlotCount,
+    challengeCandidates: resolvedChallengeCandidates,
+    answerLengthHint: normalizeCaptchaAnswerLengthHint(frameContext.answerLengthHint)
+      || resolvedChallengeSlotCount
+      || null,
     activeAnswerInput: withFrameMetadata(frameContext.activeAnswerInput, entry.frameId),
     activeSubmitButton: withFrameMetadata(frameContext.activeSubmitButton, entry.frameId),
     activeCaptureCandidate: withFrameMetadata(frameContext.activeCaptureCandidate, entry.frameId)
@@ -469,8 +712,9 @@ function mergeCaptchaContexts(baseContext = null, frameContextResult = null) {
     next.challengeCandidates = cloneJsonValue(frameContextResult.challengeCandidates) || [];
   }
 
-  if (Number(frameContextResult.answerLengthHint) > 0) {
-    next.answerLengthHint = Number(frameContextResult.answerLengthHint);
+  const normalizedAnswerLengthHint = normalizeCaptchaAnswerLengthHint(frameContextResult.answerLengthHint);
+  if (normalizedAnswerLengthHint) {
+    next.answerLengthHint = normalizedAnswerLengthHint;
   }
 
   return next;
@@ -574,8 +818,8 @@ function finalizeResolvedCaptchaContext(baseContext = null, frameContextResult =
 }
 
 async function captchaFrameAction(action, options = {}) {
-  const INPUT_HINT_RE = /(captcha|dkaptcha|kcaptcha|보안문자|자동등록방지|문자|입력|인증|security|answer)/i;
-  const BUTTON_HINT_RE = /(확인|입력|완료|등록|전송|submit|verify|ok|done)/i;
+  const INPUT_HINT_RE = /(captcha|dkaptcha|kcaptcha|보안문자|자동등록방지|인증(?:번호)?|정답|security|answer|response|challenge|verification|code)/i;
+  const BUTTON_HINT_RE = /(확인|인증|제출|전송|submit|confirm|verify|ok)/i;
   const IMAGE_HINT_RE = /(captcha|dkaptcha|kcaptcha|security|verify|code|image)/i;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -587,6 +831,13 @@ async function captchaFrameAction(action, options = {}) {
   };
 
   const normalizeText = (value = '') => String(value ?? '').replace(/\s+/g, ' ').trim();
+  const normalizeCaptchaAnswerLengthHint = (value = null) => {
+    const normalized = Number(value);
+    if (!Number.isFinite(normalized) || normalized <= 0 || normalized > 12) {
+      return null;
+    }
+    return Math.floor(normalized);
+  };
 
   const serializeRect = (rect) => {
     if (!rect) return null;
@@ -674,6 +925,7 @@ async function captchaFrameAction(action, options = {}) {
       if (element.disabled) score -= 20;
       if (element.readOnly) score -= 8;
       if (score <= 0) return null;
+      if (score < 10) return null;
 
       return {
         element,
@@ -706,6 +958,7 @@ async function captchaFrameAction(action, options = {}) {
       if (element.tagName?.toLowerCase?.() === 'input') score += 6;
       if (element.disabled || element.getAttribute?.('aria-disabled') === 'true') score -= 18;
       if (score <= 0) return null;
+      if (score < 10) return null;
 
       return {
         element,
@@ -745,19 +998,96 @@ async function captchaFrameAction(action, options = {}) {
 
   const MASK_CHAR_RE = /[□▢◻◼⬜⬛◯○●◎◇◆_＿]/u;
   const MASK_RUN_RE = /[□▢◻◼⬜⬛◯○●◎◇◆_＿]+/gu;
+  const WORD_MASK_RE = /(?:빈\s*칸|공\s*란)/u;
+  const WORD_MASK_GLOBAL_RE = /(?:빈\s*칸|공\s*란)/gu;
+  const INSTRUCTION_ACTION_RE = /(?:입력|선택|클릭|고르|찾|맞추|완성)(?:해\s*주|해주)?세요/u;
+  const INSTRUCTION_ACTION_GLOBAL_RE = /([가-힣A-Za-z0-9][^.!?\n]{0,120}?(?:입력|선택|클릭|고르|찾|맞추|완성)(?:해\s*주|해주)?세요)/gu;
+  const INSTRUCTION_KEYWORD_RE = /(지도|사진|이미지|화면|캡차|captcha|dkaptcha|있는|보이는|다음|아래|위|간판|명칭|상호|업체|장소|문구|텍스트|번호|주소|이름|병원|약국|한의원|학교|건물|매장|기관|단어|숫자)/iu;
+  const INSTRUCTION_EXACT_IGNORE_RE = /^(?:정답(?:을)?\s*입력해주세요|답(?:을)?\s*입력해주세요|답변\s*제출|새로\s*풀기|음성\s*문제(?:\s*재생)?|dkaptcha(?:\s*\(captcha\s*서비스\))?|captcha\s*서비스)$/iu;
+  const INSTRUCTION_TRAILING_NOISE_RE = /\s*(?:정답(?:을)?\s*입력해주세요|답(?:을)?\s*입력해주세요|새로\s*풀기|음성\s*문제(?:\s*재생)?|답변\s*제출|DKAPTCHA(?:\s*\(CAPTCHA\s*서비스\))?|CAPTCHA\s*서비스).*$/iu;
+  const INSTRUCTION_LEADING_NOISE_RE = /^(?:DKAPTCHA(?:\s*\(CAPTCHA\s*서비스\))?|CAPTCHA(?:\s*서비스)?|보안문자|자동등록방지)\s*/iu;
+
+  const normalizeChallengeMaskText = (value = '') => normalizeText(value).replace(WORD_MASK_GLOBAL_RE, '□');
 
   const countMaskSlots = (value = '') => {
-    const matches = String(value ?? '').match(MASK_RUN_RE);
-    return matches ? matches.reduce((sum, token) => sum + token.length, 0) : 0;
+    const normalized = normalizeText(value);
+    const explicitMatches = normalized.match(MASK_RUN_RE);
+    const explicitSlotCount = explicitMatches ? explicitMatches.reduce((sum, token) => sum + token.length, 0) : 0;
+    if (explicitSlotCount > 0) return explicitSlotCount;
+    return WORD_MASK_RE.test(normalized) ? null : 0;
   };
 
-  const extractChallengeSnippet = (value = '') => {
+  const boundChallengeText = (value = '', maxLength = 72) => {
     const normalized = normalizeText(value);
-    if (!normalized || !MASK_CHAR_RE.test(normalized)) return null;
-    const snippetMatch = normalized.match(/([가-힣A-Za-z0-9]{0,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2}\s*[□▢◻◼⬜⬛◯○●◎◇◆_＿]+\s*(?:[가-힣A-Za-z0-9]{1,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2})?)/u);
-    const snippet = snippetMatch?.[1] ? normalizeText(snippetMatch[1]) : normalized;
-    return snippet.length <= 48 ? snippet : snippet.slice(0, 48);
+    return normalized.length <= maxLength ? normalized : normalized.slice(0, maxLength);
   };
+
+  const extractMaskedChallengeSnippet = (value = '') => {
+    const normalized = normalizeText(value);
+    const normalizedMaskText = normalizeChallengeMaskText(value);
+    if (!normalizedMaskText || (!MASK_CHAR_RE.test(normalizedMaskText) && !WORD_MASK_RE.test(normalized))) return null;
+    const snippetMatch = normalizedMaskText.match(/([가-힣A-Za-z0-9]{0,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2}\s*[□▢◻◼⬜⬛◯○●◎◇◆_＿]+\s*(?:[가-힣A-Za-z0-9]{1,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2})?)/u);
+    const rawSnippetMatch = normalized.match(/([가-힣A-Za-z0-9]{0,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2}\s*(?:[□▢◻◼⬜⬛◯○●◎◇◆_＿]+|빈\s*칸|공\s*란)\s*(?:[가-힣A-Za-z0-9]{1,20}(?:\s+[가-힣A-Za-z0-9]{1,20}){0,2})?)/u);
+    const maskedSnippet = snippetMatch?.[1] ? normalizeText(snippetMatch[1]) : normalizedMaskText;
+    const rawSnippet = rawSnippetMatch?.[1] ? normalizeText(rawSnippetMatch[1]) : normalized;
+    return {
+      text: boundChallengeText(rawSnippet, 48),
+      maskedText: boundChallengeText(maskedSnippet, 48),
+      slotCount: countMaskSlots(normalized),
+      kind: 'masked',
+      matchScore: 24
+    };
+  };
+
+  const normalizeInstructionCandidate = (value = '') => {
+    let normalized = normalizeText(value);
+    if (!normalized) return '';
+    normalized = normalized.replace(INSTRUCTION_LEADING_NOISE_RE, '').trim();
+    normalized = normalized.replace(INSTRUCTION_TRAILING_NOISE_RE, '').trim();
+    normalized = normalized.replace(/^[-:|]\s*/, '').trim();
+    return normalizeText(normalized);
+  };
+
+  const extractInstructionChallengeSnippet = (value = '') => {
+    const normalized = normalizeText(value);
+    if (!normalized) return null;
+
+    const candidates = new Set();
+    normalized.split(/\n+/).map((line) => normalizeText(line)).filter(Boolean).forEach((line) => candidates.add(line));
+    Array.from(normalized.matchAll(INSTRUCTION_ACTION_GLOBAL_RE)).forEach((match) => {
+      if (match?.[1]) candidates.add(match[1]);
+    });
+
+    let best = null;
+    candidates.forEach((candidate) => {
+      const cleaned = normalizeInstructionCandidate(candidate);
+      if (!cleaned || INSTRUCTION_EXACT_IGNORE_RE.test(cleaned) || !INSTRUCTION_ACTION_RE.test(cleaned)) return;
+
+      let score = 10;
+      if (INSTRUCTION_KEYWORD_RE.test(cleaned)) score += 10;
+      if (/(?:전체|정확한|일치하는|해당|같은)/u.test(cleaned)) score += 4;
+      if (/(?:있는|보이는|다음|아래|위)/u.test(cleaned)) score += 4;
+      if (cleaned.length >= 12 && cleaned.length <= 56) score += 3;
+      if (/^(?:정답|답변)/u.test(cleaned)) score -= 12;
+      if (/(?:새로\s*풀기|음성\s*문제|답변\s*제출|captcha\s*서비스|dkaptcha)/iu.test(cleaned)) score -= 18;
+      if (score < 16) return;
+
+      const snippet = {
+        text: boundChallengeText(cleaned, 80),
+        maskedText: boundChallengeText(cleaned, 80),
+        slotCount: null,
+        kind: 'instruction',
+        matchScore: score
+      };
+      if (!best || snippet.matchScore > best.matchScore || (snippet.matchScore === best.matchScore && snippet.text.length < best.text.length)) {
+        best = snippet;
+      }
+    });
+
+    return best;
+  };
+
+  const extractChallengeSnippet = (value = '') => extractMaskedChallengeSnippet(value) || extractInstructionChallengeSnippet(value);
 
   const buildChallenge = (runtime) => {
     const entries = [];
@@ -765,19 +1095,20 @@ async function captchaFrameAction(action, options = {}) {
       const snippet = extractChallengeSnippet(value);
       if (!snippet) return;
       entries.push({
-        text: normalizeText(value),
-        maskedText: snippet,
-        slotCount: countMaskSlots(snippet),
+        text: snippet.text,
+        maskedText: snippet.maskedText || snippet.text,
+        slotCount: snippet.slotCount,
         source,
-        score
+        kind: snippet.kind || 'masked',
+        score: Number(score || 0) + Number(snippet.matchScore || 0) + (snippet.kind === 'instruction' ? 8 : 18)
       });
     };
 
-    const bodyLines = (document.body?.innerText || '')
+    (document.body?.innerText || '')
       .split(/\n+/)
       .map((line) => normalizeText(line))
-      .filter((line) => line && MASK_CHAR_RE.test(line));
-    bodyLines.forEach((line) => pushEntry(line, 'frame_body_line_mask', 36));
+      .filter(Boolean)
+      .forEach((line) => pushEntry(line, 'frame_body_line', 36));
 
     const descriptorTexts = [
       runtime.bodyHint,
@@ -791,16 +1122,16 @@ async function captchaFrameAction(action, options = {}) {
     const deduped = [];
     const seen = new Set();
     entries.forEach((entry) => {
-      const key = `${entry.maskedText}::${entry.slotCount}`;
-      if (seen.has(key)) return;
+      const key = `${entry.kind || 'masked'}::${entry.maskedText || entry.text || ''}::${entry.slotCount ?? 'var'}`;
+      if (!entry.text || seen.has(key)) return;
       seen.add(key);
       deduped.push(entry);
     });
-    deduped.sort((a, b) => b.score - a.score || a.maskedText.length - b.maskedText.length);
+    deduped.sort((a, b) => b.score - a.score || ((b.kind === 'masked') - (a.kind === 'masked')) || a.text.length - b.text.length);
 
     return {
-      challengeText: deduped[0]?.maskedText || null,
-      challengeMasked: deduped[0]?.maskedText || null,
+      challengeText: deduped[0]?.text || deduped[0]?.maskedText || null,
+      challengeMasked: deduped[0]?.maskedText || deduped[0]?.text || null,
       challengeSlotCount: Number.isFinite(deduped[0]?.slotCount) ? deduped[0].slotCount : null,
       challengeCandidates: deduped.slice(0, 5)
     };
@@ -862,7 +1193,9 @@ async function captchaFrameAction(action, options = {}) {
 
   const toSerializableContext = (runtime) => {
     const challenge = buildChallenge(runtime);
-    const answerLengthHint = Number(runtime.answerInputs[0]?.summary?.maxLength) || challenge.challengeSlotCount || null;
+    const answerLengthHint = normalizeCaptchaAnswerLengthHint(runtime.answerInputs[0]?.summary?.maxLength)
+      || challenge.challengeSlotCount
+      || null;
 
     return {
       success: true,
@@ -1190,7 +1523,9 @@ async function getCrossFrameCaptchaContextForTab(tabId) {
     challengeMasked: activeSummary.challengeMasked || activeSummary.challengeText || null,
     challengeSlotCount: Number(activeSummary.challengeSlotCount) || null,
     challengeCandidates: cloneJsonValue(activeSummary.challengeCandidates) || [],
-    answerLengthHint: Number(activeSummary.answerLengthHint) || Number(activeSummary.challengeSlotCount) || null,
+    answerLengthHint: normalizeCaptchaAnswerLengthHint(activeSummary.answerLengthHint)
+      || Number(activeSummary.challengeSlotCount)
+      || null,
     preferredSolveMode: activeSummary.activeAnswerInput && activeSummary.activeSubmitButton
       ? 'extension_frame_dom'
       : 'browser_handoff',
@@ -1215,7 +1550,9 @@ async function getCrossFrameCaptchaContextForTab(tabId) {
       challengeMasked: activeSummary.challengeMasked || activeSummary.challengeText || null,
       challengeSlotCount: Number(activeSummary.challengeSlotCount) || null,
       challengeCandidates: cloneJsonValue(activeSummary.challengeCandidates) || [],
-      answerLengthHint: Number(activeSummary.answerLengthHint) || Number(activeSummary.challengeSlotCount) || null,
+      answerLengthHint: normalizeCaptchaAnswerLengthHint(activeSummary.answerLengthHint)
+        || Number(activeSummary.challengeSlotCount)
+        || null,
       preferredSolveMode: activeSummary.activeAnswerInput && activeSummary.activeSubmitButton
         ? 'extension_frame_dom'
         : 'browser_handoff'
@@ -1804,6 +2141,10 @@ async function injectTistoryContentScripts(tabId) {
   });
   await chrome.scripting.executeScript({
     target: { tabId },
+    files: ['utils/captcha-challenge.js']
+  });
+  await chrome.scripting.executeScript({
+    target: { tabId },
     files: ['content/tistory.js']
   });
 
@@ -1990,6 +2331,7 @@ function attachCaptchaWait(response, captchaWait = null) {
 }
 
 async function getLiveDirectPublishState(options = {}) {
+  await ensureRuntimeStateLoaded();
   if (!directPublishState) return null;
 
   const snapshot = { ...directPublishState };
@@ -2263,8 +2605,10 @@ async function resolveCaptchaAnswerInput(tabId, data = {}, savedState = null) {
       ...(captchaContext && typeof captchaContext === 'object' ? cloneJsonValue(captchaContext) || captchaContext : {}),
       challengeText: data.challengeText.trim(),
       challengeMasked: data.challengeMasked?.trim?.() || data.challengeText.trim(),
-      challengeSlotCount: Number(data.challengeSlotCount) || Number(data.answerLengthHint) || null,
-      answerLengthHint: Number(data.answerLengthHint) || Number(data.challengeSlotCount) || null
+      challengeSlotCount: Number(data.challengeSlotCount) || normalizeCaptchaAnswerLengthHint(data.answerLengthHint) || null,
+      answerLengthHint: normalizeCaptchaAnswerLengthHint(data.answerLengthHint)
+        || Number(data.challengeSlotCount)
+        || null
     };
   }
 
@@ -2281,16 +2625,63 @@ async function resolveCaptchaAnswerInput(tabId, data = {}, savedState = null) {
     return {
       success: false,
       status: 'captcha_challenge_context_missing',
-      error: '빈칸이 포함된 CAPTCHA 문제 문구를 읽지 못했습니다.',
+      error: 'CAPTCHA 문제 문구를 읽지 못했습니다.',
       captchaContext,
       ocrCandidates
+    };
+  }
+
+  const parsedChallenge = parseCaptchaChallengeText(challenge.challengeText);
+  if (!parsedChallenge?.hasMask) {
+    const normalizedDirectCandidates = ocrCandidates
+      .map((candidate) => {
+        const normalized = normalizeCaptchaAnswer(candidate || '');
+        return normalized.value
+          ? {
+              answer: normalized.value,
+              answerNormalization: normalized.summary,
+              sourceText: candidate,
+              normalizedSourceText: candidate.replace(/\s+/g, ''),
+              score: null,
+              reasons: ['ocr_direct_candidate']
+            }
+          : null;
+      })
+      .filter(Boolean);
+    const uniqueDirectCandidates = normalizedDirectCandidates.filter((candidate, index, list) => (
+      list.findIndex((entry) => entry.answer === candidate.answer) === index
+    ));
+
+    if (uniqueDirectCandidates.length === 1) {
+      return {
+        success: true,
+        source: 'ocr_direct',
+        answer: uniqueDirectCandidates[0].answer,
+        answerNormalization: uniqueDirectCandidates[0].answerNormalization,
+        answerCandidates: uniqueDirectCandidates,
+        inference: null,
+        captchaContext,
+        ocrCandidates
+      };
+    }
+
+    return {
+      success: false,
+      status: 'captcha_non_masked_challenge_requires_single_answer',
+      error: '빈칸형이 아닌 CAPTCHA라 명시적 answer 또는 단일 OCR 후보가 필요합니다.',
+      captchaContext,
+      ocrCandidates,
+      challenge
     };
   }
 
   const inference = inferCaptchaAnswer({
     challengeText: challenge.challengeText,
     ocrTexts: ocrCandidates,
-    answerLengthHint: Number(data.answerLengthHint) || challenge.answerLengthHint || challenge.challengeSlotCount || null
+    answerLengthHint: normalizeCaptchaAnswerLengthHint(data.answerLengthHint)
+      || challenge.answerLengthHint
+      || challenge.challengeSlotCount
+      || null
   });
 
   if (!inference.success) {
@@ -4914,6 +5305,8 @@ async function prepareEditorTab(options = {}) {
 
 // ── 공통 메시지 처리 함수 ──────────────────────────
 async function handleMessage(message, sender) {
+  await ensureRuntimeStateLoaded();
+
   switch (message.action) {
     // Content Script가 준비되었음을 알림
     case 'CONTENT_READY':
@@ -5440,6 +5833,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 // ── 초기화 ──────────────────────────────────
-Promise.all([loadQueueState(), loadDirectPublishState()]).then(() => {
+ensureRuntimeStateLoaded().then(() => {
   console.log('[TistoryAuto BG] Service Worker 시작 ✅, 큐 항목:', publishQueue.length, 'directPublishState:', !!directPublishState);
+}).catch((error) => {
+  console.warn('[TistoryAuto BG] 초기 상태 로드 실패:', error);
 });

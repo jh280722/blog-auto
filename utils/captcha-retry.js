@@ -1,3 +1,5 @@
+import { normalizeCaptchaAnswerLengthHint } from './captcha-inference.js';
+
 function normalizeOptionalText(value = '') {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -41,11 +43,12 @@ export function getChallengeFromCaptchaContext(captchaContext = null) {
       return;
     }
 
-    const text = String(entry.maskedText || entry.text || '').trim();
-    if (!text) return;
+    const text = String(entry.text || entry.maskedText || '').trim();
+    const maskedText = String(entry.maskedText || entry.text || '').trim();
+    if (!text && !maskedText) return;
     challengeCandidates.push({
-      text,
-      maskedText: String(entry.maskedText || entry.text || '').trim(),
+      text: text || maskedText,
+      maskedText: maskedText || text,
       slotCount: Number(entry.slotCount) || null,
       source: entry.source || null,
       score: Number(entry.score) || null
@@ -84,11 +87,16 @@ export function getChallengeFromCaptchaContext(captchaContext = null) {
   });
 
   const fallbackSlotCount = Number(uniqueCandidates.find((entry) => Number(entry?.slotCount) > 0)?.slotCount) || null;
+  const normalizedChallengeSlotCount = Number(captchaContext.challengeSlotCount) || fallbackSlotCount;
+  const normalizedAnswerLengthHint = normalizeCaptchaAnswerLengthHint(captchaContext.answerLengthHint)
+    || normalizeCaptchaAnswerLengthHint(captchaContext.challengeSlotCount)
+    || fallbackSlotCount;
 
   return {
-    challengeText: uniqueCandidates[0]?.maskedText || uniqueCandidates[0]?.text || null,
-    challengeSlotCount: Number(captchaContext.challengeSlotCount) || fallbackSlotCount,
-    answerLengthHint: Number(captchaContext.answerLengthHint) || Number(captchaContext.challengeSlotCount) || fallbackSlotCount,
+    challengeText: uniqueCandidates[0]?.text || uniqueCandidates[0]?.maskedText || null,
+    challengeMasked: uniqueCandidates[0]?.maskedText || uniqueCandidates[0]?.text || null,
+    challengeSlotCount: normalizedChallengeSlotCount || null,
+    answerLengthHint: normalizedAnswerLengthHint,
     challengeCandidates: uniqueCandidates
   };
 }
@@ -99,7 +107,7 @@ function buildTextSignature(challenge = {}, captchaContext = null) {
 
   return [
     challengeText,
-    Number(challenge.challengeSlotCount) || Number(challenge.answerLengthHint) || 0,
+    Number(challenge.challengeSlotCount) || normalizeCaptchaAnswerLengthHint(challenge.answerLengthHint) || 0,
     normalizeOptionalText(captchaContext?.preferredSolveMode || ''),
     String(captchaContext?.activeCaptureCandidate?.frameId ?? '')
   ].join('::');
@@ -138,7 +146,7 @@ export function buildCaptchaChallengeSignature(captchaContext = null, options = 
 
   return {
     challengeText: challenge.challengeText || null,
-    challengeSlotCount: Number(challenge.challengeSlotCount) || Number(challenge.answerLengthHint) || null,
+    challengeSlotCount: Number(challenge.challengeSlotCount) || normalizeCaptchaAnswerLengthHint(challenge.answerLengthHint) || null,
     textSignature,
     visualSignature,
     candidateSignature,

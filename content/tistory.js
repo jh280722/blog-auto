@@ -1443,6 +1443,7 @@
   const CAPTCHA_BUTTON_HINT_RE = /(확인|인증|제출|전송|ok|submit|confirm|verify)/i;
   const PUBLISH_BUTTON_HINT_RE = /(발행|저장|공개\s*발행|비공개\s*발행|publish|save)/i;
   const EDITOR_FIELD_HINT_RE = /(title|subject|제목|tag|태그|category|카테고리|search|검색)/i;
+  const CAPTCHA_EDITOR_SHELL_RE = /(post-editor-app|mce-|tinymce|toastui|codemirror|editor-body|editor-shell|tt[-_ ]?editor|se-[a-z-]*editor|se-toolbar)/i;
   const CAPTCHA_MASK_CHAR_RE = /[□▢◻◼⬜⬛◯○●◎◇◆_＿]/u;
   const CAPTCHA_MASK_RUN_RE = /[□▢◻◼⬜⬛◯○●◎◇◆_＿]+/gu;
 
@@ -1821,6 +1822,7 @@
           return null;
         }
 
+        const ancestorDescriptor = getAncestorDescriptors(el, 5);
         const descriptor = normalizeText([
           el.getAttribute('placeholder'),
           el.getAttribute('aria-label'),
@@ -1828,7 +1830,8 @@
           el.getAttribute('name'),
           el.id,
           el.className,
-          getAssociatedText(el)
+          getAssociatedText(el),
+          ancestorDescriptor
         ].filter(Boolean).join(' '));
 
         const reasons = [];
@@ -1864,8 +1867,21 @@
           reasons.push('editor_field_penalty');
         }
 
+        const rect = el.getBoundingClientRect();
+        const editorShellLike = CAPTCHA_EDITOR_SHELL_RE.test(descriptor) || CAPTCHA_EDITOR_SHELL_RE.test(buildDomPath(el) || '');
+        if (editorShellLike) {
+          score -= 18;
+          reasons.push('editor_shell_penalty');
+        }
+
+        if (el.isContentEditable && rect.width >= 280 && rect.height >= 80 && !CAPTCHA_INPUT_HINT_RE.test(descriptor)) {
+          score -= 18;
+          reasons.push('large_editor_surface_penalty');
+        }
+
         if (score <= 0) return null;
         if (!hasStrongCaptchaInputEvidence(reasons)) return null;
+        if (reasons.includes('editor_shell_penalty') || reasons.includes('large_editor_surface_penalty')) return null;
         if (score < 10) return null;
 
         return {
@@ -1894,11 +1910,13 @@
     return collectVisibleMatches(CAPTCHA_BUTTON_SELECTOR_SPECS)
       .map((match) => {
         const el = match.element;
+        const ancestorDescriptor = getAncestorDescriptors(el, 5);
         const descriptor = normalizeText([
           el.getAttribute('aria-label'),
           el.getAttribute('title'),
           el.getAttribute('value'),
-          getAssociatedText(el)
+          getAssociatedText(el),
+          ancestorDescriptor
         ].filter(Boolean).join(' '));
 
         const reasons = [];
@@ -1921,8 +1939,14 @@
         }
 
         if (PUBLISH_BUTTON_HINT_RE.test(descriptor) && !CAPTCHA_BUTTON_HINT_RE.test(descriptor)) {
-          score -= 8;
+          score -= 14;
           reasons.push('publish_button_penalty');
+        }
+
+        const editorShellLike = CAPTCHA_EDITOR_SHELL_RE.test(descriptor) || CAPTCHA_EDITOR_SHELL_RE.test(buildDomPath(el) || '');
+        if (editorShellLike && !CAPTCHA_BUTTON_HINT_RE.test(descriptor)) {
+          score -= 18;
+          reasons.push('editor_shell_penalty');
         }
 
         if (el.disabled) {
@@ -1932,6 +1956,7 @@
 
         if (score <= 0) return null;
         if (!hasStrongCaptchaButtonEvidence(reasons)) return null;
+        if (reasons.includes('editor_shell_penalty')) return null;
         if (score < 10) return null;
 
         return {
@@ -2381,6 +2406,27 @@
     return trimmed ? trimmed.replace(/\s+/g, '') : '';
   }
 
+  function submitCaptchaChallenge(button) {
+    const info = {
+      submitApiCalled: false,
+      submitApiError: null,
+      buttonClicked: false
+    };
+
+    if (typeof window.dkaptcha?.submit === 'function') {
+      try {
+        window.dkaptcha.submit();
+        info.submitApiCalled = true;
+        return info;
+      } catch (error) {
+        info.submitApiError = error?.message || String(error);
+      }
+    }
+
+    info.buttonClicked = simulateClick(button);
+    return info;
+  }
+
   async function submitCaptchaAnswer(answer, options = {}) {
     const normalizedAnswer = normalizeCaptchaAnswer(answer);
     if (!normalizedAnswer) {
@@ -2394,7 +2440,6 @@
     const before = collectCaptchaDiagnostics();
     const beforeContext = getCaptchaContext();
     const selectedInput = before.answerInputs[0] || null;
-    const selectedButton = before.submitButtons[0] || null;
     const iframeCaptchaPresent = before.captchaRoots.some((match) => match.element?.tagName?.toLowerCase?.() === 'iframe');
 
     if (!selectedInput) {
@@ -2413,22 +2458,6 @@
       };
     }
 
-    if (!selectedButton) {
-      return {
-        success: false,
-        status: iframeCaptchaPresent ? 'captcha_browser_handoff_required' : 'captcha_submit_not_found',
-        error: iframeCaptchaPresent
-          ? '현재 CAPTCHA 제출 버튼이 cross-origin iframe 안에 있어 확장 내부 DOM 제출 대신 browser/CDP handoff가 필요합니다. 같은 탭에서 풀이한 뒤 RESUME_DIRECT_PUBLISH를 호출하세요.'
-          : '보이는 CAPTCHA 제출 버튼을 찾지 못했습니다.',
-        handoff: iframeCaptchaPresent ? {
-          reason: 'cross_origin_iframe',
-          recommendedAction: 'solve_in_browser_then_resume',
-          sameTabRequired: true
-        } : null,
-        diagnostics: getCaptchaContext()
-      };
-    }
-
     selectedInput.element.focus?.();
     await delay(80);
     simulateInput(selectedInput.element, normalizedAnswer);
@@ -2436,6 +2465,8 @@
 
     const appliedValue = getElementInputValue(selectedInput.element);
     const inputApplied = normalizeCaptchaAnswer(appliedValue) === normalizedAnswer;
+    const afterInputDiagnostics = collectCaptchaDiagnostics();
+    const selectedButton = afterInputDiagnostics.submitButtons[0] || before.submitButtons[0] || null;
     if (!inputApplied) {
       return {
         success: false,
@@ -2449,7 +2480,26 @@
       };
     }
 
-    simulateClick(selectedButton.element);
+    if (!selectedButton) {
+      return {
+        success: false,
+        status: iframeCaptchaPresent ? 'captcha_browser_handoff_required' : 'captcha_submit_not_found',
+        error: iframeCaptchaPresent
+          ? '현재 CAPTCHA 제출 버튼이 cross-origin iframe 안에 있어 확장 내부 DOM 제출 대신 browser/CDP handoff가 필요합니다. 같은 탭에서 풀이한 뒤 RESUME_DIRECT_PUBLISH를 호출하세요.'
+          : '보이는 CAPTCHA 제출 버튼을 찾지 못했습니다.',
+        handoff: iframeCaptchaPresent ? {
+          reason: 'cross_origin_iframe',
+          recommendedAction: 'solve_in_browser_then_resume',
+          sameTabRequired: true
+        } : null,
+        diagnostics: {
+          before: beforeContext,
+          afterInput: getCaptchaContext()
+        }
+      };
+    }
+
+    const submitDispatch = submitCaptchaChallenge(selectedButton.element);
 
     const waitMs = Math.max(300, Number(options.waitMs) || 1200);
     await delay(waitMs);
@@ -2462,7 +2512,9 @@
       url: window.location.href,
       answerLength: normalizedAnswer.length,
       inputApplied,
-      clicked: true,
+      clicked: !!submitDispatch.buttonClicked || !!submitDispatch.submitApiCalled,
+      submitApiCalled: !!submitDispatch.submitApiCalled,
+      submitApiError: submitDispatch.submitApiError || null,
       selectedInput: selectedInput.summary,
       selectedButton: selectedButton.summary,
       buttonText: selectedButton.summary?.text || selectedButton.summary?.ariaLabel || selectedButton.summary?.title || null,
@@ -2472,6 +2524,7 @@
       diagnostics: {
         waitMs,
         before: beforeContext,
+        afterInput: getCaptchaContext(),
         after: afterContext
       }
     };

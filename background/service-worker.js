@@ -27,6 +27,7 @@ import {
   buildCaptchaAnswerAttemptCandidates,
   supportsRankedCaptchaAnswerRetries
 } from '../utils/captcha-answer-retry.js';
+import { isPostCaptchaPublishStillInFlight } from '../utils/captcha-post-submit-settle.js';
 
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
@@ -70,6 +71,11 @@ const DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS = {
 const CAPTCHA_RETRY_READY_DEFAULTS = {
   timeoutMs: 4000,
   pollIntervalMs: 250
+};
+
+const POST_CAPTCHA_COMPLETION_WAIT_DEFAULTS = {
+  timeoutMs: 8000,
+  pollIntervalMs: 750
 };
 
 /**
@@ -843,13 +849,22 @@ function isIframeCaptchaCandidate(candidate = null) {
 
 function hasActionableFrameCaptchaCandidate(candidate = null) {
   if (!candidate || typeof candidate !== 'object') return false;
-  return !!(
-    candidate.captchaLike
-    || candidate.activeAnswerInput
-    || candidate.activeSubmitButton
+
+  const frameUrl = String(candidate.url || candidate.origin || '').toLowerCase();
+  const hasChallengeSignals = !!(
+    candidate.activeSubmitButton
     || candidate.activeCaptureCandidate
-    || Number(candidate.candidateCount) > 0
+    || candidate.challengeText
+    || candidate.challengeMasked
+    || (Array.isArray(candidate.challengeCandidates) && candidate.challengeCandidates.length > 0)
+    || frameUrl.includes('dkaptcha')
   );
+
+  if (candidate.activeAnswerInput) {
+    return hasChallengeSignals;
+  }
+
+  return hasChallengeSignals;
 }
 
 function hasActionableMainDomCaptcha(context = null) {
@@ -1423,6 +1438,27 @@ async function captchaFrameAction(action, options = {}) {
     return true;
   };
 
+  const submitCaptchaChallenge = (button) => {
+    const info = {
+      submitApiCalled: false,
+      submitApiError: null,
+      buttonClicked: false
+    };
+
+    if (typeof window.dkaptcha?.submit === 'function') {
+      try {
+        window.dkaptcha.submit();
+        info.submitApiCalled = true;
+        return info;
+      } catch (error) {
+        info.submitApiError = error?.message || String(error);
+      }
+    }
+
+    info.buttonClicked = simulateClick(button);
+    return info;
+  };
+
   const applyTextValue = (element, value) => {
     if (!element) return false;
 
@@ -1447,6 +1483,7 @@ async function captchaFrameAction(action, options = {}) {
     element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
     element.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter' }));
     element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: 'Enter' }));
+    element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: 'Process' }));
     return true;
   };
 
@@ -1455,7 +1492,6 @@ async function captchaFrameAction(action, options = {}) {
   if (action === 'submit') {
     const runtimeBefore = collectRuntime();
     const selectedInput = runtimeBefore.answerInputs[0] || null;
-    const selectedButton = runtimeBefore.submitButtons[0] || null;
 
     if (!normalizedAnswer) {
       return {
@@ -1475,21 +1511,14 @@ async function captchaFrameAction(action, options = {}) {
       };
     }
 
-    if (!selectedButton) {
-      return {
-        success: false,
-        status: 'captcha_frame_submit_not_found',
-        error: 'cross-frame CAPTCHA 제출 버튼을 찾지 못했습니다.',
-        frameContext: toSerializableContext(runtimeBefore)
-      };
-    }
-
     applyTextValue(selectedInput.element, normalizedAnswer);
-    await sleep(80);
+    await sleep(120);
     const appliedValue = selectedInput.element.isContentEditable
       ? normalizeText(selectedInput.element.textContent || '')
       : normalizeText(selectedInput.element.value || selectedInput.element.textContent || '');
     const inputApplied = appliedValue.replace(/\s+/g, '') === normalizedAnswer;
+    const runtimeReadyToSubmit = collectRuntime();
+    const selectedButton = runtimeReadyToSubmit.submitButtons[0] || runtimeBefore.submitButtons[0] || null;
 
     if (!inputApplied) {
       return {
@@ -1497,11 +1526,21 @@ async function captchaFrameAction(action, options = {}) {
         status: 'captcha_frame_input_not_applied',
         error: 'cross-frame CAPTCHA 답안을 입력창에 적용하지 못했습니다.',
         selectedInput: selectedInput.summary,
-        frameContext: toSerializableContext(runtimeBefore)
+        frameContext: toSerializableContext(runtimeReadyToSubmit)
       };
     }
 
-    simulateClick(selectedButton.element);
+    if (!selectedButton) {
+      return {
+        success: false,
+        status: 'captcha_frame_submit_not_found',
+        error: 'cross-frame CAPTCHA 제출 버튼을 찾지 못했습니다.',
+        selectedInput: selectedInput.summary,
+        frameContext: toSerializableContext(runtimeReadyToSubmit)
+      };
+    }
+
+    const submitDispatch = submitCaptchaChallenge(selectedButton.element);
     await sleep(Math.max(300, Number(options.waitMs) || 1200));
 
     const runtimeAfter = collectRuntime();
@@ -1509,13 +1548,16 @@ async function captchaFrameAction(action, options = {}) {
       success: true,
       status: runtimeAfter.captchaLike ? 'captcha_still_present' : 'captcha_submitted',
       url: window.location.href || null,
-      clicked: true,
+      clicked: !!submitDispatch.buttonClicked || !!submitDispatch.submitApiCalled,
+      submitApiCalled: !!submitDispatch.submitApiCalled,
+      submitApiError: submitDispatch.submitApiError || null,
       inputApplied,
       answerLength: normalizedAnswer.length,
       captchaStillAppears: runtimeAfter.captchaLike,
       selectedInput: selectedInput.summary,
       selectedButton: selectedButton.summary,
       frameContextBefore: toSerializableContext(runtimeBefore),
+      frameContextReadyToSubmit: toSerializableContext(runtimeReadyToSubmit),
       frameContextAfter: toSerializableContext(runtimeAfter),
       frameContext: toSerializableContext(runtimeAfter)
     };
@@ -1573,12 +1615,7 @@ async function getCrossFrameCaptchaContextForTab(tabId) {
 
   const frameEntries = (frameScan.frames || []).filter((entry) => {
     const frameContext = entry.frameContext || {};
-    return !!(
-      frameContext.captchaLike
-      || frameContext.activeAnswerInput
-      || frameContext.activeSubmitButton
-      || frameContext.activeCaptureCandidate
-    );
+    return hasActionableFrameCaptchaCandidate(frameContext);
   });
 
   if (frameEntries.length === 0) {
@@ -3492,6 +3529,168 @@ async function waitForCaptchaResolutionOnTab(tabId, options = {}) {
   };
 }
 
+async function waitForPostCaptchaCompletionOrResume(preparation, requestData = {}, options = {}) {
+  if (!preparation?.tabId) {
+    return {
+      success: false,
+      status: 'editor_not_ready',
+      error: 'CAPTCHA 해제 후 상태를 확인할 탭 ID가 없습니다.',
+      completed: false,
+      waitedMs: 0,
+      attempts: 0,
+      publishStillInFlight: null,
+      lastCaptchaCheck: null,
+      lastDraftSnapshot: null
+    };
+  }
+
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || POST_CAPTCHA_COMPLETION_WAIT_DEFAULTS.timeoutMs);
+  const pollIntervalMs = Math.max(250, Number(options.pollIntervalMs) || POST_CAPTCHA_COMPLETION_WAIT_DEFAULTS.pollIntervalMs);
+  const startedAt = Date.now();
+  let attempts = 0;
+  let lastCaptchaCheck = null;
+  let lastDraftSnapshot = null;
+  let lastPublishStillInFlight = null;
+
+  while ((Date.now() - startedAt) <= timeoutMs) {
+    attempts += 1;
+
+    let liveTab = null;
+    try {
+      liveTab = await chrome.tabs.get(preparation.tabId);
+    } catch (error) {
+      return {
+        success: false,
+        status: 'editor_not_ready',
+        error: 'CAPTCHA 해제 후 대상 탭이 닫혔거나 더 이상 접근할 수 없습니다.',
+        completed: false,
+        waitedMs: Date.now() - startedAt,
+        attempts,
+        pollIntervalMs,
+        publishStillInFlight: lastPublishStillInFlight,
+        lastCaptchaCheck,
+        lastDraftSnapshot,
+        tabId: preparation.tabId
+      };
+    }
+
+    const liveUrl = liveTab?.url || preparation.url || null;
+    if (looksLikeDirectPublishCompletionUrl(liveUrl || '')) {
+      const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure({
+        ...preparation,
+        tabId: preparation.tabId,
+        url: liveUrl,
+        blogName: requestData.blogName || preparation.blogName || getTabBlogName(liveUrl) || null
+      }, requestData || {}, {
+        waitMs: 0,
+        blogName: requestData.blogName || preparation.blogName || getTabBlogName(liveUrl) || null
+      });
+
+      const fallbackResponse = makePreparationResponse({
+        success: true,
+        status: 'captcha_submit_tab_navigated',
+        tab: liveTab,
+        url: liveUrl,
+        blogName: requestData.blogName || preparation.blogName || getTabBlogName(liveUrl) || null,
+        diagnostics: preparation.diagnostics
+      });
+
+      return {
+        success: recoveredResponse?.success ?? true,
+        status: recoveredResponse?.status || 'captcha_submit_tab_navigated',
+        completed: true,
+        waitedMs: Date.now() - startedAt,
+        attempts,
+        pollIntervalMs,
+        publishStillInFlight: false,
+        lastCaptchaCheck,
+        lastDraftSnapshot,
+        response: recoveredResponse || fallbackResponse
+      };
+    }
+
+    try {
+      lastCaptchaCheck = await getBlockingCaptchaStateForTab(preparation.tabId);
+    } catch (error) {
+      lastCaptchaCheck = {
+        success: false,
+        status: 'editor_not_ready',
+        error: error.message,
+        tabId: preparation.tabId
+      };
+    }
+
+    if (lastCaptchaCheck?.success && lastCaptchaCheck.captchaPresent) {
+      return {
+        success: false,
+        status: 'captcha_required',
+        error: 'CAPTCHA가 다시 표시되어 자동 재개를 중단합니다.',
+        completed: false,
+        waitedMs: Date.now() - startedAt,
+        attempts,
+        pollIntervalMs,
+        publishStillInFlight: true,
+        lastCaptchaCheck,
+        lastDraftSnapshot,
+        tabId: preparation.tabId
+      };
+    }
+
+    if (lastCaptchaCheck?.success) {
+      lastPublishStillInFlight = isPostCaptchaPublishStillInFlight(lastCaptchaCheck.captchaContext || null);
+    }
+
+    const draftSnapshot = await getDraftSnapshotForTab(preparation.tabId);
+    if (draftSnapshot?.success) {
+      lastDraftSnapshot = draftSnapshot;
+    }
+
+    const draftHasContent = !!(
+      (Number(lastDraftSnapshot?.snapshot?.contentHtmlLength) || 0) > 0
+      || (Number(lastDraftSnapshot?.snapshot?.contentTextLength) || 0) > 0
+      || (Number(lastDraftSnapshot?.snapshot?.imageCount) || 0) > 0
+    );
+    const editorReady = !!lastDraftSnapshot?.snapshot?.editorReady;
+    const publishLayerOpen = !!lastDraftSnapshot?.snapshot?.editorProbe?.publishLayerPresent;
+
+    if (!lastPublishStillInFlight && (editorReady || publishLayerOpen || draftHasContent)) {
+      return {
+        success: true,
+        status: 'resume_ready',
+        completed: false,
+        waitedMs: Date.now() - startedAt,
+        attempts,
+        pollIntervalMs,
+        publishStillInFlight: false,
+        lastCaptchaCheck,
+        lastDraftSnapshot,
+        tabId: preparation.tabId
+      };
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    const remainingMs = timeoutMs - elapsedMs;
+    if (remainingMs <= 0) {
+      break;
+    }
+
+    await delay(Math.min(pollIntervalMs, remainingMs));
+  }
+
+  return {
+    success: true,
+    status: 'resume_ready_timeout',
+    completed: false,
+    waitedMs: Date.now() - startedAt,
+    attempts,
+    pollIntervalMs,
+    publishStillInFlight: lastPublishStillInFlight,
+    lastCaptchaCheck,
+    lastDraftSnapshot,
+    tabId: preparation.tabId
+  };
+}
+
 async function refreshDirectPublishCaptchaState(tabId, submitResult) {
   if (!tabId) {
     return null;
@@ -3798,6 +3997,54 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
         }, preparation)), handoff);
       }
     } catch (e) { /* 진행 */ }
+  }
+
+  const currentStage = liveState?.stage || directPublishState?.stage || null;
+  if (captchaWait?.success && currentStage === 'captcha_after_final_confirm') {
+    const postCaptchaSettle = await waitForPostCaptchaCompletionOrResume(preparation, mergedRequestData);
+
+    if (postCaptchaSettle.completed && postCaptchaSettle.response) {
+      if (postCaptchaSettle.response.success) {
+        await clearDirectPublishState();
+      } else {
+        await updateDirectPublishState({
+          ...buildTransitionPatch(directPublishState || {}, 'post_captcha_completion_detected_unverified', {
+            phase: 'captcha_handoff',
+            status: postCaptchaSettle.response.status || 'persistence_unverified',
+            tabId: preparation.tabId,
+            waitedMs: postCaptchaSettle.waitedMs,
+            attempts: postCaptchaSettle.attempts
+          }),
+          tabId: preparation.tabId,
+          url: postCaptchaSettle.response.url || preparation.url || null,
+          requestData: normalizeDirectPublishRequestData(mergedRequestData)
+        });
+      }
+
+      return attachCaptchaWait(postCaptchaSettle.response, captchaWait);
+    }
+
+    if (!postCaptchaSettle.success) {
+      const handoff = await captureCaptchaHandoffForTab(preparation.tabId);
+      const blockedResponse = withPreparationDetails({
+        success: false,
+        status: postCaptchaSettle.status || 'captcha_required',
+        error: postCaptchaSettle.error || 'CAPTCHA가 다시 표시되어 자동 재개를 중단합니다.'
+      }, preparation);
+      await setDirectPublishState({
+        ...buildDirectPublishState({
+          response: blockedResponse,
+          preparation,
+          requestData: mergedRequestData,
+          captchaContext: handoff.captchaContext || postCaptchaSettle.lastCaptchaCheck?.captchaContext || null
+        }),
+        lastCaptchaWait: captchaWait
+          ? summarizeCaptchaWaitResult(captchaWait, waitOptions)
+          : (directPublishState?.lastCaptchaWait || null),
+        lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
+      });
+      return attachCaptchaWait(attachCaptchaHandoff(attachDirectPublishState(blockedResponse), handoff), captchaWait);
+    }
   }
 
   preparation = await ensurePreparationReadyAfterCaptchaWait(preparation, mergedRequestData);

@@ -11,6 +11,9 @@ const OCR_CANDIDATE_META_RE = /(?:정답(?:을)?\s*입력해주세요|답(?:을)
 const INSTRUCTION_ACTION_RE = /(?:입력|선택|클릭|고르|찾|맞추|완성)(?:해\s*주|해주)?세요/u;
 const INSTRUCTION_TARGET_RE = /(?:지도|사진|이미지|화면)(?:에|에서)?\s*(?:있는|보이는)?\s*([^.,!?\n]{1,32}?)(?:의\s*(?:전체\s*)?(?:명칭|이름|상호|문구|텍스트|번호|주소)|을|를)\s*(?:정확한\s*)?(?:전체\s*)?(?:명칭|이름|상호|문구|텍스트|번호|주소)?\s*(?:을|를)?\s*(?:입력|선택|클릭|고르|찾|맞추|완성)/u;
 const INSTRUCTION_TRAILING_NOISE_RE = /\s*(?:정답(?:을)?\s*입력해주세요|답(?:을)?\s*입력해주세요|새로\s*풀기|음성\s*문제(?:\s*재생)?|답변\s*제출|DKAPTCHA(?:\s*\(CAPTCHA\s*서비스\))?|CAPTCHA\s*서비스).*$/iu;
+const CAPTCHA_TEXT_VARIANT_RULES = [
+  [/슈퍼/gu, '수퍼']
+];
 
 function normalizeChallengePlaceholders(value = '', options = {}) {
   const preserveVariableMask = !!options.preserveVariableMask;
@@ -19,8 +22,15 @@ function normalizeChallengePlaceholders(value = '', options = {}) {
   return String(value ?? '').replace(CAPTCHA_PLACEHOLDER_WORD_RE, replacement);
 }
 
+function applyComparableTextVariants(value = '') {
+  return CAPTCHA_TEXT_VARIANT_RULES.reduce(
+    (current, [pattern, replacement]) => current.replace(pattern, replacement),
+    String(value ?? '')
+  );
+}
+
 export function normalizeComparableCaptchaText(value = '', options = {}) {
-  return normalizeChallengePlaceholders(String(value ?? ''), options)
+  return applyComparableTextVariants(normalizeChallengePlaceholders(String(value ?? ''), options))
     .replace(/\s+/g, '')
     .replace(COMPARABLE_TEXT_RE, '')
     .trim();

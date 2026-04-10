@@ -61,6 +61,7 @@
 - **visual challenge fallback**: `challengeText`가 비는 iframe/canvas CAPTCHA에서도 visual signature를 같이 비교해 같은 challenge 재시도를 너무 빨리 끊지 않음
 - **post-publish channel-close recovery 공통화**: 발행 직후 탭 이동으로 content-script 응답 채널이 닫혀도 `WRITE_POST`, queue auto-publish, `RESUME_AFTER_CAPTCHA`, `RESUME_DIRECT_PUBLISH`가 최신 saved post를 다시 검증해 false fail을 줄임
 - **solve wait-resume**: `RESUME_DIRECT_PUBLISH`가 `editorProbe.reason === "captcha_present"`인 blocked tab도 그대로 wait target으로 유지하고, same-tab extension-frame/browser fallback 풀이가 끝난 뒤 같은 탭 기준으로만 재개를 이어감. handoff 중 일시적인 `editor_not_ready` / frame-scan miss는 clear로 취급하지 않음
+- **post-CAPTCHA settle**: CAPTCHA submit 직후 publish layer가 잠깐 `저장중/발행중` 상태로 남아 있으면 곧바로 `editor_not_ready`로 되감지하지 않고, same-tab completion URL 또는 publish-layer settle을 짧게 대기한 뒤 재개 여부를 판정함. editor shell(`post-editor-app`, TinyMCE/Toast UI surface) 같은 비-CAPTCHA DOM은 answer/button 후보에서 제외해 false `captcha_required`를 줄임
 - **실제 에디터 준비 probe**: `PREPARE_EDITOR`가 content script alive만 보지 않고 TinyMCE body / contenteditable / publish layer / CAPTCHA 상태까지 확인하며, live `/manage/newpost` 탭 probe가 실패하면 blind reuse 대신 회복 navigation으로 넘김
 - **fail-closed 쓰기 preflight**: `WRITE_POST`는 title/category 쓰기 전에 실제 editor body를 다시 확인하고, 미준비면 `editor_not_ready` + `preflight`로 즉시 중단
 - **재개 전 draft self-heal**: CAPTCHA 후 재개 전에 제목/본문/카테고리/이미지/태그 스냅샷을 확인하고, 비어 있으면 같은 탭에서 자동 복구 후 발행
@@ -470,6 +471,8 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 이 상태 덕분에 외부 에이전트/크론은 새 탭을 다시 고르지 않고, **막힌 동일 탭**을 기준으로 캡차 이미지를 가져오고 `SUBMIT_CAPTCHA_AND_RESUME`를 바로 호출할 수 있습니다. v1.8.0부터는 cross-origin iframe도 `frameDirectImage` + same-tab frame submit 경로를 우선 시도하며, frame solve가 막힌 예외 케이스에서만 `browser_handoff` + `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })` fallback을 사용합니다. 또한 초기 `captcha_required` 응답과 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)`는 서비스워커가 main DOM + frame scan 결과를 merge한 `captchaContext`를 반환하므로, 자동화는 raw iframe 감지값 대신 이 `preferredSolveMode`를 그대로 신뢰하면 됩니다. solve 뒤 iframe 껍데기만 남아 있는 경우에는 이 merged context가 `captchaPresent: false`로 정규화되어 불필요한 wait/resume timeout을 줄입니다. `waitForCaptcha` 모드는 저장된 blocked tab이 `captcha_present` 때문에 일반 editor-ready probe에 실패하더라도 같은 탭을 wait target으로 유지하고, CAPTCHA가 사라진 뒤에만 post-clear probe를 수행합니다. 이때 publish layer가 그대로 열려 있어도 `RESUME_PUBLISH`가 이어서 처리할 수 있는 상태로 간주합니다. handoff 중 일시적인 `editor_not_ready` / frame scan miss는 clear로 보지 않고 saved tab polling을 계속합니다.
 
 v1.8.5부터는 frame submit 직후 iframe reload/navigation 때문에 content-script 응답이 비는 회차도 tab URL과 refreshed `captchaContext`를 다시 읽어 `captcha_submit_tab_navigated` / `captcha_submitted` / `captcha_still_present`로 복구합니다. 특히 `SUBMIT_CAPTCHA_AND_RESUME`는 이 복구 결과가 완료 URL이면 추가 resume을 생략하고 곧바로 성공으로 종료하므로, 이미 발행이 끝난 회차에서 false `content_empty`가 다시 뜨지 않습니다.
+
+v1.8.9 follow-up부터는 same-tab CAPTCHA solve 직후 publish layer가 `저장중/발행중` 상태로 잠깐 남아 있는 회차를 별도 settle 구간으로 관찰합니다. 이 구간에서는 completion URL 감지와 publish-layer progress 텍스트를 함께 보고, TinyMCE/Toast UI/editor shell 같은 비-CAPTCHA DOM을 answer/button 후보에서 제외해 false `captcha_required` 또는 조기 `editor_not_ready` 재개 실패를 줄입니다.
 
 ### CAPTCHA Context / Submit 응답 포인트
 

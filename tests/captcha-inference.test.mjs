@@ -16,6 +16,10 @@ test('normalizeComparableCaptchaText removes whitespace and punctuation noise', 
   assert.equal(normalizeComparableCaptchaText('"백촌오피스□"'), '백촌오피스□');
 });
 
+test('normalizeComparableCaptchaText canonicalizes common OCR spelling variants', () => {
+  assert.equal(normalizeComparableCaptchaText('명선슈퍼'), '명선수퍼');
+});
+
 test('parseCaptchaChallengeText extracts mask runs and slots', () => {
   const parsed = parseCaptchaChallengeText('가인□네오');
   assert.equal(parsed.hasMask, true);
@@ -123,6 +127,18 @@ test('inferCaptchaAnswer fails cleanly when the OCR text does not match the chal
   assert.equal(result.success, false);
   assert.equal(result.status, 'captcha_answer_inference_failed');
   assert.deepEqual(result.answerCandidates, []);
+});
+
+test('inferCaptchaAnswer tolerates 슈퍼/수퍼 spelling variants in OCR candidates', () => {
+  const result = inferCaptchaAnswer({
+    challengeText: '명빈칸 수퍼',
+    ocrTexts: ['명선슈퍼'],
+    answerLengthHint: 1
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.answer, '선');
+  assert.equal(result.chosenCandidate.sourceText, '명선슈퍼');
 });
 
 

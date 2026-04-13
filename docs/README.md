@@ -11,13 +11,14 @@
 > - **`publishTrace` / `stage` / `phase` / `lastTransition` 진단 필드 추가**
 > - **CAPTCHA context inspection API (blocked tab / iframe rect / 입력창/버튼 후보 확인)**
 > - **iframe-only / cross-origin CAPTCHA도 `chrome.scripting.executeScript(allFrames)` 기반 same-tab 감지/입력/제출 지원**
-> - **CAPTCHA artifact API (같은 blocked tab 기준 frame direct image / direct image / viewport crop 반환)**
+> - **CAPTCHA artifact API (같은 blocked tab 기준 source image / frame direct image / direct image / viewport crop 반환)**
 > - **viewport crop용 `<all_urls>` host permission 포함 (captureVisibleTab 안정화)**
 > - **`captcha_required` / `captcha_browser_handoff_required` 응답에 same-tab artifact handoff 정보 즉시 포함**
 > - **CAPTCHA answer submit API (same blocked tab main DOM + cross-origin iframe 답안 입력 + 확인 버튼 클릭)**
 > - **raw `preferredSolveMode`도 iframe-only CAPTCHA에서 `extension_frame_dom`을 우선 반환해 초기 trace/힌트가 same-tab frame solve 기본값과 일치**
 > - **`SUBMIT_CAPTCHA*`는 merged `captchaContext.preferredSolveMode === "extension_frame_dom"`일 때 frame submit을 먼저 시도하고, 실제 frame solve가 막힌 예외에서만 browser handoff로 내려감**
 > - **iframe submit 직후 frame reload/navigation으로 응답이 비어도 tab URL + refreshed captcha context probe로 `captcha_submit_tab_navigated` / `captcha_submitted` / `captcha_still_present`를 복구**
+> - **post-CAPTCHA merged context는 실제 challenge/capture 신호 없이 제목/본문에 `captcha` 같은 문자열만 남은 회차를 blocking으로 유지하지 않음**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`는 submit 단계에서 이미 `/manage/posts` 또는 permalink로 이동한 회차를 terminal success로 처리해 false `content_empty` 재개를 막음**
 > - **`challengeText` / `challengeSlotCount` / `challengeCandidates`를 same-tab CAPTCHA context와 artifact handoff에 함께 포함**
 > - **`solveHints`를 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` / `captcha_required` handoff 응답에 함께 포함해, 크론이 비전 프롬프트를 추측하지 않고 바로 이미지 판독 → 제출로 이어질 수 있음**
@@ -61,7 +62,7 @@
 - **visual challenge fallback**: `challengeText`가 비는 iframe/canvas CAPTCHA에서도 visual signature를 같이 비교해 같은 challenge 재시도를 너무 빨리 끊지 않음
 - **post-publish channel-close recovery 공통화**: 발행 직후 탭 이동으로 content-script 응답 채널이 닫혀도 `WRITE_POST`, queue auto-publish, `RESUME_AFTER_CAPTCHA`, `RESUME_DIRECT_PUBLISH`가 최신 saved post를 다시 검증해 false fail을 줄임
 - **solve wait-resume**: `RESUME_DIRECT_PUBLISH`가 `editorProbe.reason === "captcha_present"`인 blocked tab도 그대로 wait target으로 유지하고, same-tab extension-frame/browser fallback 풀이가 끝난 뒤 같은 탭 기준으로만 재개를 이어감. handoff 중 일시적인 `editor_not_ready` / frame-scan miss는 clear로 취급하지 않음
-- **post-CAPTCHA settle**: CAPTCHA submit 직후 publish layer가 잠깐 `저장중/발행중` 상태로 남아 있으면 곧바로 `editor_not_ready`로 되감지하지 않고, same-tab completion URL 또는 publish-layer settle을 짧게 대기한 뒤 재개 여부를 판정함. editor shell(`post-editor-app`, TinyMCE/Toast UI surface) 같은 비-CAPTCHA DOM은 answer/button 후보에서 제외해 false `captcha_required`를 줄임
+- **post-CAPTCHA settle**: CAPTCHA submit 직후 publish layer가 잠깐 `저장중/발행중` 상태로 남아 있으면 곧바로 `editor_not_ready`로 되감지하지 않고, same-tab completion URL 또는 publish-layer settle을 짧게 대기한 뒤 재개 여부를 판정함. editor shell(`post-editor-app`, TinyMCE/Toast UI surface) 같은 비-CAPTCHA DOM은 answer/button 후보에서 제외하고, 제목/본문 텍스트에 `captcha`가 남아도 challenge/capture 근거가 없으면 blocking으로 유지하지 않아 false `captcha_required`를 줄임
 - **실제 에디터 준비 probe**: `PREPARE_EDITOR`가 content script alive만 보지 않고 TinyMCE body / contenteditable / publish layer / CAPTCHA 상태까지 확인하며, live `/manage/newpost` 탭 probe가 실패하면 blind reuse 대신 회복 navigation으로 넘김
 - **fail-closed 쓰기 preflight**: `WRITE_POST`는 title/category 쓰기 전에 실제 editor body를 다시 확인하고, 미준비면 `editor_not_ready` + `preflight`로 즉시 중단
 - **재개 전 draft self-heal**: CAPTCHA 후 재개 전에 제목/본문/카테고리/이미지/태그 스냅샷을 확인하고, 비어 있으면 같은 탭에서 자동 복구 후 발행
@@ -474,11 +475,13 @@ v1.8.5부터는 frame submit 직후 iframe reload/navigation 때문에 content-s
 
 v1.8.9 follow-up부터는 same-tab CAPTCHA solve 직후 publish layer가 `저장중/발행중` 상태로 잠깐 남아 있는 회차를 별도 settle 구간으로 관찰합니다. 이 구간에서는 completion URL 감지와 publish-layer progress 텍스트를 함께 보고, TinyMCE/Toast UI/editor shell 같은 비-CAPTCHA DOM을 answer/button 후보에서 제외해 false `captcha_required` 또는 조기 `editor_not_ready` 재개 실패를 줄입니다.
 
+2026-04-13 follow-up부터는 cross-origin frame 안 이미지 export가 tainted canvas로 막혀도, 서비스워커가 `activeCaptureCandidate.sourceUrl`을 직접 fetch해서 `artifacts.sourceImage`를 추가로 만듭니다. 덕분에 `frameDirectImage`가 비는 회차에도 viewport crop 대신 원본 CAPTCHA 이미지를 OCR에 우선 넘길 수 있습니다.
+
 ### CAPTCHA Context / Submit 응답 포인트
 
 - `GET_CAPTCHA_CONTEXT`는 `answerInputCandidates[]`, `submitButtonCandidates[]`, `activeAnswerInput`, `activeSubmitButton`, `captureCandidates[]`, `activeCaptureCandidate`, `challengeText`, `challengeSlotCount`, `challengeCandidates[]`, `answerLengthHint`, `rect`, `matchedSelectors`, `iframeCaptchaPresent`, `preferredSolveMode`, `solveHints`를 포함합니다.
-- `GET_CAPTCHA_ARTIFACTS`는 기본적으로 저장된 `directPublishState.tabId`를 대상으로 `artifact.dataUrl`, `artifact.kind`, `artifacts.directImage`, `artifacts.viewportCrop`, `selectedCandidate`, `captureContext`를 반환하며, 이 `captureContext`에도 `challengeText` / `challengeSlotCount`가 포함될 수 있습니다.
-- `GET_CAPTCHA_ARTIFACTS.artifactPreference`는 외부 에이전트가 우선 사용할 이미지(`viewportCrop` 또는 `directImage`)를 알려줍니다.
+- `GET_CAPTCHA_ARTIFACTS`는 기본적으로 저장된 `directPublishState.tabId`를 대상으로 `artifact.dataUrl`, `artifact.kind`, `artifacts.sourceImage`, `artifacts.frameDirectImage`, `artifacts.directImage`, `artifacts.viewportCrop`, `selectedCandidate`, `captureContext`를 반환하며, 이 `captureContext`에도 `challengeText` / `challengeSlotCount`가 포함될 수 있습니다.
+- `GET_CAPTCHA_ARTIFACTS.artifactPreference`는 외부 에이전트가 우선 사용할 이미지(`sourceImage` / `frameDirectImage` / `viewportCrop` / `directImage`)를 알려줍니다.
 - `INFER_CAPTCHA_ANSWER`는 `challengeText` + `ocrTexts[]`를 받아 빈칸 답안을 추론하고, `chosenCandidate` / `candidates[]`로 어떤 OCR 후보가 채택됐는지 돌려줍니다.
 - `SUBMIT_CAPTCHA`는 `selectedInput`, `selectedButton`, `buttonText`, `captchaPresentAfterWait`, `captchaStillAppears`, `diagnostics.before/after`, `answerNormalization`을 반환합니다. v1.8.0부터는 cross-origin iframe도 우선 frame submit을 시도하고, 그래도 막히면 `captcha_browser_handoff_required`와 `handoff` 힌트를 반환합니다.
 - frame submit recovery가 발동한 회차는 `submitStrategy: "extension_frame_dom_recovered"`, `recoveredAfterMissingResponse: true`, `recoveredReason`, `postSubmitProbe`를 함께 반환합니다.
@@ -535,4 +538,4 @@ v1.8.9 follow-up부터는 same-tab CAPTCHA solve 직후 publish layer가 `저장
 - **OCR 자체는 외부 책임**: 확장 프로그램은 `GET_CAPTCHA_ARTIFACTS`/`captchaArtifacts`로 이미지 아티팩트를 제공하고, `challengeText` / `challengeSlotCount` / `INFER_CAPTCHA_ANSWER`로 빈칸 답안 축약까지 도와주지만, 원본 이미지에서 전체 후보 텍스트를 읽는 OCR/비전 단계 자체는 외부 에이전트/서비스가 수행해야 합니다.
 - **tainted canvas iframe은 여전히 challengeText가 비어 있을 수 있음**: 이번 패치로 same challenge retry는 visual signature로 더 안정화됐지만, `frame_direct_image`가 tainted canvas로 막히고 `challengeText`/`answerCandidates`까지 비면 전체 단어 OCR 단계는 여전히 외부 보강이 필요합니다.
 - **cross-origin iframe 입력도 기본은 확장 same-tab solve**: v1.8.0부터는 `chrome.scripting.executeScript(allFrames)`로 iframe 내부 이미지/입력창/버튼을 직접 다루고, 이 경로가 막힌 예외 케이스에서만 `captcha_browser_handoff_required` + `preferredSolveMode: "browser_handoff"` fallback을 사용합니다.
-- **viewport crop는 Chrome capture 권한 상태에 영향받을 수 있음**: 이 경우에도 Tistory DKAPTCHA가 실제 이미지 요소면 `artifacts.directImage`가 남을 수 있습니다.
+- **viewport crop는 Chrome capture 권한 상태에 영향받을 수 있음**: 이 경우에도 Tistory DKAPTCHA가 실제 이미지 요소면 `artifacts.directImage` 또는 `artifacts.sourceImage`가 남을 수 있습니다.

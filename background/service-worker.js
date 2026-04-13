@@ -28,6 +28,11 @@ import {
   supportsRankedCaptchaAnswerRetries
 } from '../utils/captcha-answer-retry.js';
 import { isPostCaptchaPublishStillInFlight } from '../utils/captcha-post-submit-settle.js';
+import {
+  choosePreferredCaptchaArtifactKey,
+  fetchCaptchaSourceImageArtifact,
+  resolveCaptchaArtifactSourceUrl
+} from '../utils/captcha-artifacts.js';
 
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
@@ -852,15 +857,14 @@ function hasActionableFrameCaptchaCandidate(candidate = null) {
 
   const frameUrl = String(candidate.url || candidate.origin || '').toLowerCase();
   const hasChallengeSignals = !!(
-    candidate.activeSubmitButton
-    || candidate.activeCaptureCandidate
+    candidate.activeCaptureCandidate
     || candidate.challengeText
     || candidate.challengeMasked
     || (Array.isArray(candidate.challengeCandidates) && candidate.challengeCandidates.length > 0)
     || frameUrl.includes('dkaptcha')
   );
 
-  if (candidate.activeAnswerInput) {
+  if (candidate.activeAnswerInput || candidate.activeSubmitButton) {
     return hasChallengeSignals;
   }
 
@@ -870,7 +874,14 @@ function hasActionableFrameCaptchaCandidate(candidate = null) {
 function hasActionableMainDomCaptcha(context = null) {
   if (!context || typeof context !== 'object') return false;
 
-  if (context.activeAnswerInput || context.activeSubmitButton) {
+  const hasChallengeSignals = !!(
+    (context.activeCaptureCandidate && !isIframeCaptchaCandidate(context.activeCaptureCandidate))
+    || context.challengeText
+    || context.challengeMasked
+    || (Array.isArray(context.challengeCandidates) && context.challengeCandidates.length > 0)
+  );
+
+  if (hasChallengeSignals && (context.activeAnswerInput || context.activeSubmitButton)) {
     return true;
   }
 
@@ -917,7 +928,6 @@ function finalizeResolvedCaptchaContext(baseContext = null, frameContextResult =
 
   const captchaBlocking = hasActionableFrameCaptcha(mergedContext, frameContextResult)
     || hasActionableMainDomCaptcha(mergedContext)
-    || (!mergedContext.iframeCaptchaPresent && !!mergedContext.captchaPresent)
     || frameScanFailedClosed;
 
   mergedContext.captchaPresent = captchaBlocking;
@@ -4498,9 +4508,39 @@ async function getCaptchaArtifactsForTab(tabId, options = {}) {
     frameArtifactResult?.frameContextResult || frameArtifactResult || null
   );
 
-  const preferredArtifactKey = artifacts.frameDirectImage
-    ? 'frameDirectImage'
-    : (artifacts.viewportCrop ? 'viewportCrop' : (artifacts.directImage ? 'directImage' : null));
+  const sourceImageUrl = resolveCaptchaArtifactSourceUrl({
+    frameArtifactResult,
+    captureContext,
+    selectedCandidate,
+    directImageResult
+  });
+  const shouldFetchSourceImage = !!sourceImageUrl && (!artifacts.frameDirectImage || !!options.includeSourceImage);
+
+  if (shouldFetchSourceImage) {
+    const sourceImageResult = await fetchCaptchaSourceImageArtifact(sourceImageUrl, {
+      blobToDataUrlImpl: blobToDataUrl,
+      metadata: {
+        width: selectedCandidate?.rect?.width || captureContext?.activeCaptureCandidate?.rect?.width || null,
+        height: selectedCandidate?.rect?.height || captureContext?.activeCaptureCandidate?.rect?.height || null,
+        rect: selectedCandidate?.rect || captureContext?.activeCaptureCandidate?.rect || null,
+        visibleRect: selectedCandidate?.visibleRect || captureContext?.activeCaptureCandidate?.visibleRect || null,
+        sourceTagName: selectedCandidate?.tagName || captureContext?.activeCaptureCandidate?.tagName || null,
+        frameId: frameArtifactResult?.frameId || selectedCandidate?.frameId || null
+      }
+    });
+
+    if (sourceImageResult.success && sourceImageResult.artifact?.dataUrl) {
+      artifacts.sourceImage = sourceImageResult.artifact;
+    } else if (!sourceImageResult.success) {
+      captureErrors.push({
+        type: 'source_image',
+        status: sourceImageResult.status || null,
+        error: sourceImageResult.error || 'source_image_unavailable'
+      });
+    }
+  }
+
+  const preferredArtifactKey = choosePreferredCaptchaArtifactKey(artifacts);
   if (!preferredArtifactKey) {
     return enrichCaptchaArtifactResultWithSolveHints({
       success: false,

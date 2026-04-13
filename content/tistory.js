@@ -23,12 +23,29 @@
   const MANAGE_POST_DIAG_ATTR = 'data-blog-auto-last-manage-post-diag';
   const MANAGE_POST_SEQ_ATTR = 'data-blog-auto-last-manage-post-seq';
   const CAPTCHA_CHALLENGE_UTILS = window.__BLOG_AUTO_CAPTCHA_CHALLENGE__ || {};
+  const DRAFT_SNAPSHOT_UTILS = window.__BLOG_AUTO_DRAFT_SNAPSHOT__ || {};
   const buildCaptchaChallengeFromTexts = CAPTCHA_CHALLENGE_UTILS.buildCaptchaChallengeFromTexts
     || (() => ({
       challengeText: null,
       challengeMasked: null,
       challengeSlotCount: null,
       challengeCandidates: []
+    }));
+  const getLocalDraftMetrics = DRAFT_SNAPSHOT_UTILS.getLocalDraftMetrics
+    || ((contentHtml = '', contentText = '') => ({
+      contentHtmlLength: String(contentHtml || '').trim().length,
+      contentTextLength: String(contentText || '').replace(/\s+/g, ' ').trim().length,
+      imageCount: (String(contentHtml || '').match(/<img\b/gi) || []).length,
+      contentPreview: String(contentText || '').replace(/\s+/g, ' ').trim().slice(0, 160)
+    }));
+  const shouldReadMainWorldSnapshot = DRAFT_SNAPSHOT_UTILS.shouldReadMainWorldSnapshot
+    || (({ editorReady = false, localHtmlLength = 0, localTextLength = 0 } = {}) => !editorReady || localHtmlLength === 0 || localTextLength === 0);
+  const mergeDraftSnapshotMetrics = DRAFT_SNAPSHOT_UTILS.mergeDraftSnapshotMetrics
+    || (({ localMetrics = {}, mainWorldSnapshot = null } = {}) => ({
+      contentHtmlLength: Math.max(Number(localMetrics.contentHtmlLength) || 0, Number(mainWorldSnapshot?.htmlLength) || 0),
+      contentTextLength: Math.max(Number(localMetrics.contentTextLength) || 0, Number(mainWorldSnapshot?.textLength) || 0),
+      imageCount: Math.max(Number(localMetrics.imageCount) || 0, Number(mainWorldSnapshot?.imageCount) || 0),
+      contentPreview: String(localMetrics.contentPreview || '').trim() || String(mainWorldSnapshot?.textPreview || '').replace(/\s+/g, ' ').trim().slice(0, 160)
     }));
   const STAGE_JITTER_DEFAULTS = {
     enabled: true,
@@ -3153,13 +3170,14 @@
     return [...tags];
   }
 
-  function getDraftSnapshot() {
+  async function getDraftSnapshot() {
     const titleEl = findElement(S.title.input, S.title.fallback);
     const title = titleEl?.value?.trim() || titleEl?.textContent?.trim() || '';
     const editor = getTinyMCEEditor();
     const editorProbe = getEditorReadinessProbe();
     let contentHtml = '';
     let contentText = '';
+    let mainWorldSnapshot = null;
 
     if (editor) {
       try {
@@ -3184,8 +3202,40 @@
       }
     }
 
+    const localMetrics = getLocalDraftMetrics(contentHtml, contentText);
+
+    if (shouldReadMainWorldSnapshot({
+      editorReady: editorProbe.ready,
+      localHtmlLength: localMetrics.contentHtmlLength,
+      localTextLength: localMetrics.contentTextLength
+    })) {
+      try {
+        const bridgeResult = await requestMainWorldEditorAction('GET_EDITOR_SNAPSHOT');
+        if (bridgeResult?.success && bridgeResult?.snapshot) {
+          mainWorldSnapshot = bridgeResult.snapshot;
+
+          if ((Number(mainWorldSnapshot.htmlLength) || 0) > localMetrics.contentHtmlLength) {
+            contentHtml = contentHtml || '<!-- blog-auto-main-world-snapshot -->';
+          }
+
+          if ((Number(mainWorldSnapshot.textLength) || 0) > localMetrics.contentTextLength) {
+            contentText = contentText || (mainWorldSnapshot.textPreview || '[main world editor text detected]');
+          }
+        }
+      } catch (error) {
+        console.warn('[TistoryAuto] MAIN world draft snapshot 읽기 실패:', error);
+      }
+    }
+
     const normalizedText = contentText.replace(/\s+/g, ' ').trim();
     const categoryBtn = findElement(S.category.button, null);
+    const mergedMetrics = mergeDraftSnapshotMetrics({
+      localMetrics: {
+        ...localMetrics,
+        contentPreview: normalizedText.slice(0, 160)
+      },
+      mainWorldSnapshot
+    });
 
     return {
       success: true,
@@ -3193,12 +3243,13 @@
       title,
       currentCategory: categoryBtn?.textContent?.trim() || '',
       tags: getCurrentTagsSnapshot(),
-      contentHtmlLength: contentHtml.trim().length,
-      contentTextLength: normalizedText.length,
-      contentPreview: normalizedText.slice(0, 160),
-      imageCount: (contentHtml.match(/<img\b/gi) || []).length,
+      contentHtmlLength: mergedMetrics.contentHtmlLength,
+      contentTextLength: mergedMetrics.contentTextLength,
+      contentPreview: mergedMetrics.contentPreview,
+      imageCount: mergedMetrics.imageCount,
       editorReady: editorProbe.ready,
-      editorProbe
+      editorProbe,
+      mainWorldSnapshot
     };
   }
 
@@ -3283,7 +3334,7 @@
           return getPageInfo();
 
         case 'GET_DRAFT_SNAPSHOT':
-          return getDraftSnapshot();
+          return await getDraftSnapshot();
 
         case 'PROBE_EDITOR_READY':
           return await waitForEditorReady(message.data || {});

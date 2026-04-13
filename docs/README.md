@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.9 (2026-04-10 instruction ranked retry follow-up patch 포함)**
+> 현재 운영 기준: **v1.8.10 (2026-04-13 post-CAPTCHA draft snapshot fallback patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -33,6 +33,8 @@
 > - **발행 직후 탭 navigation 때문에 content-script 응답 채널이 닫혀도 `WRITE_POST`뿐 아니라 queue / `RESUME_AFTER_CAPTCHA` / `RESUME_DIRECT_PUBLISH`까지 recovery verification로 성공 여부를 다시 확정**
 > - **stale tab 회피 + 실제 editor body readiness gate**
 > - **`WRITE_POST` 시작 전 final preflight로 title-only draft fail-closed**
+> - **post-CAPTCHA draft snapshot이 local TinyMCE에서 0으로 읽혀도 MAIN world editor summary로 길이/미리보기를 다시 합산**
+> - **content script를 `document_start`로 당겨 draft restore confirm bypass와 main-world bridge를 더 빨리 심음**
 > - 자동저장 복구 팝업 자동 dismiss
 > - **비공개 발행 visibility 강제 보정(MAIN world XHR/fetch interceptor)**
 
@@ -476,6 +478,8 @@ v1.8.5부터는 frame submit 직후 iframe reload/navigation 때문에 content-s
 v1.8.9 follow-up부터는 same-tab CAPTCHA solve 직후 publish layer가 `저장중/발행중` 상태로 잠깐 남아 있는 회차를 별도 settle 구간으로 관찰합니다. 이 구간에서는 completion URL 감지와 publish-layer progress 텍스트를 함께 보고, TinyMCE/Toast UI/editor shell 같은 비-CAPTCHA DOM을 answer/button 후보에서 제외해 false `captcha_required` 또는 조기 `editor_not_ready` 재개 실패를 줄입니다.
 
 2026-04-13 follow-up부터는 cross-origin frame 안 이미지 export가 tainted canvas로 막혀도, 서비스워커가 `activeCaptureCandidate.sourceUrl`을 직접 fetch해서 `artifacts.sourceImage`를 추가로 만듭니다. 덕분에 `frameDirectImage`가 비는 회차에도 viewport crop 대신 원본 CAPTCHA 이미지를 OCR에 우선 넘길 수 있습니다.
+
+v1.8.10부터는 post-CAPTCHA publish layer가 열린 상태에서 isolated-world TinyMCE snapshot이 0으로 읽혀도, MAIN world editor summary(`GET_EDITOR_SNAPSHOT`)의 html/text/image 길이와 preview를 합산해 false `draft_restore_failed`를 줄입니다. 동시에 content script를 `document_start`에 주입하고 page-world confirm bypass도 함께 깔아, draft restore confirm이 늦게 떠서 재개를 방해하는 회차를 더 이르게 무해화합니다.
 
 ### CAPTCHA Context / Submit 응답 포인트
 

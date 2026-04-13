@@ -5286,6 +5286,7 @@ function installPageWorldPostInterceptor() {
         hasEditor: false,
         htmlLength: 0,
         textLength: 0,
+        textPreview: '',
         imageCount: 0
       };
     }
@@ -5297,6 +5298,7 @@ function installPageWorldPostInterceptor() {
         hasEditor: true,
         htmlLength: html.trim().length,
         textLength: text.length,
+        textPreview: text.slice(0, 160),
         imageCount: countMatches(html, /<img\b/gi)
       };
     } catch (error) {
@@ -5304,14 +5306,45 @@ function installPageWorldPostInterceptor() {
         hasEditor: true,
         htmlLength: 0,
         textLength: 0,
+        textPreview: '',
         imageCount: 0,
         error: error.message || String(error)
       };
     }
   };
 
+  const installConfirmBypass = () => {
+    if (window.__blogAutoConfirmBypassInstalled) {
+      return;
+    }
+
+    window.__blogAutoConfirmBypassInstalled = true;
+    const originalConfirm = window.confirm;
+    window.confirm = function(message) {
+      if (message && /저장된 글이 있습니다|이어서 작성/.test(String(message))) {
+        try {
+          console.log('[TistoryAuto:page] draft restore confirm auto-dismiss:', message);
+        } catch (_error) {}
+        return false;
+      }
+
+      return originalConfirm.call(this, message);
+    };
+  };
+
+  installConfirmBypass();
+
   const handleMainWorldEditorAction = (detail = {}) => {
     const action = detail.action || null;
+
+    if (action === 'GET_EDITOR_SNAPSHOT') {
+      const editor = getMainWorldEditor();
+      return {
+        success: true,
+        status: editor ? 'main_world_snapshot_ready' : 'main_world_editor_missing',
+        snapshot: summarizeMainWorldEditor(editor)
+      };
+    }
 
     if (action === 'SET_EDITOR_CONTENT') {
       const editor = getMainWorldEditor();

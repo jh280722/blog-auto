@@ -28,6 +28,7 @@ import {
   supportsRankedCaptchaAnswerRetries
 } from '../utils/captcha-answer-retry.js';
 import { isPostCaptchaPublishStillInFlight } from '../utils/captcha-post-submit-settle.js';
+import { hasActionableCaptchaAnswerPath } from '../utils/captcha-submit-capability.js';
 import {
   choosePreferredCaptchaArtifactKey,
   fetchCaptchaSourceImageArtifact,
@@ -761,6 +762,7 @@ function summarizeCaptchaFrameEntry(entry = {}) {
     answerLengthHint: normalizeCaptchaAnswerLengthHint(frameContext.answerLengthHint)
       || resolvedChallengeSlotCount
       || null,
+    submitApiAvailable: frameContext.submitApiAvailable === true,
     activeAnswerInput: withFrameMetadata(frameContext.activeAnswerInput, entry.frameId),
     activeSubmitButton: withFrameMetadata(frameContext.activeSubmitButton, entry.frameId),
     activeCaptureCandidate: withFrameMetadata(frameContext.activeCaptureCandidate, entry.frameId)
@@ -799,6 +801,10 @@ function mergeCaptchaContexts(baseContext = null, frameContextResult = null) {
 
   if (frameContextResult.activeSubmitButton) {
     next.activeSubmitButton = cloneJsonValue(frameContextResult.activeSubmitButton);
+  }
+
+  if (frameContextResult.submitApiAvailable === true) {
+    next.submitApiAvailable = true;
   }
 
   if (frameContextResult.activeCaptureCandidate) {
@@ -1262,6 +1268,7 @@ async function captchaFrameAction(action, options = {}) {
     const submitButtons = collectButtons();
     const captureCandidates = collectImages();
     const bodyHint = compactText(document.body?.innerText || '', 360);
+    const submitApiAvailable = typeof window.dkaptcha?.submit === 'function';
     const reasons = [];
     let score = 0;
 
@@ -1305,6 +1312,7 @@ async function captchaFrameAction(action, options = {}) {
         innerHeight: window.innerHeight || null,
         devicePixelRatio: window.devicePixelRatio || 1
       },
+      submitApiAvailable,
       answerInputs,
       submitButtons,
       captureCandidates
@@ -1341,6 +1349,7 @@ async function captchaFrameAction(action, options = {}) {
       challengeSlotCount: challenge.challengeSlotCount,
       challengeCandidates: challenge.challengeCandidates,
       answerLengthHint,
+      submitApiAvailable: runtime.submitApiAvailable === true,
       viewport: runtime.viewport
     };
   };
@@ -1529,6 +1538,7 @@ async function captchaFrameAction(action, options = {}) {
     const inputApplied = appliedValue.replace(/\s+/g, '') === normalizedAnswer;
     const runtimeReadyToSubmit = collectRuntime();
     const selectedButton = runtimeReadyToSubmit.submitButtons[0] || runtimeBefore.submitButtons[0] || null;
+    const submitApiAvailable = runtimeReadyToSubmit.submitApiAvailable === true || runtimeBefore.submitApiAvailable === true;
 
     if (!inputApplied) {
       return {
@@ -1540,7 +1550,7 @@ async function captchaFrameAction(action, options = {}) {
       };
     }
 
-    if (!selectedButton) {
+    if (!selectedButton && !submitApiAvailable) {
       return {
         success: false,
         status: 'captcha_frame_submit_not_found',
@@ -1550,7 +1560,7 @@ async function captchaFrameAction(action, options = {}) {
       };
     }
 
-    const submitDispatch = submitCaptchaChallenge(selectedButton.element);
+    const submitDispatch = submitCaptchaChallenge(selectedButton?.element || null);
     await sleep(Math.max(300, Number(options.waitMs) || 1200));
 
     const runtimeAfter = collectRuntime();
@@ -1561,11 +1571,12 @@ async function captchaFrameAction(action, options = {}) {
       clicked: !!submitDispatch.buttonClicked || !!submitDispatch.submitApiCalled,
       submitApiCalled: !!submitDispatch.submitApiCalled,
       submitApiError: submitDispatch.submitApiError || null,
+      submitApiAvailable,
       inputApplied,
       answerLength: normalizedAnswer.length,
       captchaStillAppears: runtimeAfter.captchaLike,
       selectedInput: selectedInput.summary,
-      selectedButton: selectedButton.summary,
+      selectedButton: selectedButton?.summary || null,
       frameContextBefore: toSerializableContext(runtimeBefore),
       frameContextReadyToSubmit: toSerializableContext(runtimeReadyToSubmit),
       frameContextAfter: toSerializableContext(runtimeAfter),
@@ -1668,7 +1679,8 @@ async function getCrossFrameCaptchaContextForTab(tabId) {
     answerLengthHint: normalizeCaptchaAnswerLengthHint(activeSummary.answerLengthHint)
       || Number(activeSummary.challengeSlotCount)
       || null,
-    preferredSolveMode: activeSummary.activeAnswerInput && activeSummary.activeSubmitButton
+    submitApiAvailable: activeSummary.submitApiAvailable === true,
+    preferredSolveMode: hasActionableCaptchaAnswerPath(activeSummary)
       ? 'extension_frame_dom'
       : 'browser_handoff',
     frameContext: mergeCaptchaContexts(null, {
@@ -1695,7 +1707,8 @@ async function getCrossFrameCaptchaContextForTab(tabId) {
       answerLengthHint: normalizeCaptchaAnswerLengthHint(activeSummary.answerLengthHint)
         || Number(activeSummary.challengeSlotCount)
         || null,
-      preferredSolveMode: activeSummary.activeAnswerInput && activeSummary.activeSubmitButton
+      submitApiAvailable: activeSummary.submitApiAvailable === true,
+      preferredSolveMode: hasActionableCaptchaAnswerPath(activeSummary)
         ? 'extension_frame_dom'
         : 'browser_handoff'
     })
@@ -3066,7 +3079,7 @@ async function waitForCaptchaRetryReadyOnTab(tabId, options = {}) {
     attempts += 1;
     lastContextResult = await getCaptchaContextForTab(tabId);
     const captchaContext = lastContextResult?.success ? lastContextResult.captchaContext || null : null;
-    const ready = !!(captchaContext?.captchaPresent && captchaContext?.activeAnswerInput && captchaContext?.activeSubmitButton);
+    const ready = !!(captchaContext?.captchaPresent && hasActionableCaptchaAnswerPath(captchaContext));
 
     if (ready) {
       return {

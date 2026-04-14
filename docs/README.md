@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.10 (2026-04-13 post-CAPTCHA draft snapshot fallback patch 포함)**
+> 현재 운영 기준: **v1.8.11 (2026-04-14 buttonless DKAPTCHA submit-api fallback patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -14,7 +14,7 @@
 > - **CAPTCHA artifact API (같은 blocked tab 기준 source image / frame direct image / direct image / viewport crop 반환)**
 > - **viewport crop용 `<all_urls>` host permission 포함 (captureVisibleTab 안정화)**
 > - **`captcha_required` / `captcha_browser_handoff_required` 응답에 same-tab artifact handoff 정보 즉시 포함**
-> - **CAPTCHA answer submit API (same blocked tab main DOM + cross-origin iframe 답안 입력 + 확인 버튼 클릭)**
+> - **CAPTCHA answer submit API (same blocked tab main DOM + cross-origin iframe 답안 입력 + 확인 버튼 클릭, visible 버튼이 없어도 `dkaptcha.submit()` 경로가 살아 있으면 same-tab 제출 유지)**
 > - **raw `preferredSolveMode`도 iframe-only CAPTCHA에서 `extension_frame_dom`을 우선 반환해 초기 trace/힌트가 same-tab frame solve 기본값과 일치**
 > - **`SUBMIT_CAPTCHA*`는 merged `captchaContext.preferredSolveMode === "extension_frame_dom"`일 때 frame submit을 먼저 시도하고, 실제 frame solve가 막힌 예외에서만 browser handoff로 내려감**
 > - **iframe submit 직후 frame reload/navigation으로 응답이 비어도 tab URL + refreshed captcha context probe로 `captcha_submit_tab_navigated` / `captcha_submitted` / `captcha_still_present`를 복구**
@@ -54,7 +54,7 @@
 - **CAPTCHA challenge extraction**: context/artifact 응답에 빈칸 문제 문구(`challengeText`)와 칸 수(`challengeSlotCount`)를 포함해 OCR 결과를 답안으로 줄이기 쉬움
 - **CAPTCHA solve hints**: `solveHints.prompt`, `answerMode`, `submitField`, `targetEntity`, `nextAction`을 함께 반환해 masked CAPTCHA는 `ocrTexts` 기반 추론, instruction/map CAPTCHA는 `answer` 직접 제출이 기본이지만, 여러 OCR 후보만 있어도 target entity 기준으로 `ocrTexts` fallback 추론까지 연결 가능
 - **live frame fallback extraction**: DKAPTCHA가 문구를 직접 안 내려줘도 frame body line, submit button text, capture candidate 주변 텍스트를 다시 합쳐 `challengeText`를 복원함
-- **CAPTCHA submit API**: 에이전트가 blocked tab의 main DOM뿐 아니라 cross-origin iframe에도 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음
+- **CAPTCHA submit API**: 에이전트가 blocked tab의 main DOM뿐 아니라 cross-origin iframe에도 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음. 버튼이 잠깐 안 보여도 `window.dkaptcha.submit()`가 살아 있으면 same-tab submit path를 계속 사용합니다.
 - **frame-first submit routing**: merged `captchaContext`가 `extension_frame_dom`을 가리키면 `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`가 content DOM 실패 응답을 기다리지 않고 frame submit을 먼저 시도함
 - **missing-response submit recovery**: frame submit 직후 iframe reload/navigation으로 응답 payload가 비어도 tab URL과 refreshed `captchaContext`를 다시 읽어 `captcha_submit_tab_navigated` / `captcha_submitted` / `captcha_still_present`를 복구함
 - **CAPTCHA inference API**: `INFER_CAPTCHA_ANSWER`로 `백촌오피스□ + 백촌오피스텔 → 텔` 같은 빈칸 답안을 안정적으로 추론
@@ -481,13 +481,15 @@ v1.8.9 follow-up부터는 same-tab CAPTCHA solve 직후 publish layer가 `저장
 
 v1.8.10부터는 post-CAPTCHA publish layer가 열린 상태에서 isolated-world TinyMCE snapshot이 0으로 읽혀도, MAIN world editor summary(`GET_EDITOR_SNAPSHOT`)의 html/text/image 길이와 preview를 합산해 false `draft_restore_failed`를 줄입니다. 동시에 content script를 `document_start`에 주입하고 page-world confirm bypass도 함께 깔아, draft restore confirm이 늦게 떠서 재개를 방해하는 회차를 더 이르게 무해화합니다.
 
+v1.8.11부터는 DKAPTCHA frame/main DOM에서 입력창은 잡혔지만 visible submit button이 잠깐 사라진 회차도 `submitApiAvailable`를 함께 노출하고, `window.dkaptcha.submit()`가 callable이면 browser handoff로 내리지 않고 same-tab submit을 계속 시도합니다. 이 덕분에 버튼 렌더 타이밍 race 때문에 `captcha_submit_not_found` / `captcha_frame_submit_not_found`로 끊기던 회차를 줄입니다.
+
 ### CAPTCHA Context / Submit 응답 포인트
 
-- `GET_CAPTCHA_CONTEXT`는 `answerInputCandidates[]`, `submitButtonCandidates[]`, `activeAnswerInput`, `activeSubmitButton`, `captureCandidates[]`, `activeCaptureCandidate`, `challengeText`, `challengeSlotCount`, `challengeCandidates[]`, `answerLengthHint`, `rect`, `matchedSelectors`, `iframeCaptchaPresent`, `preferredSolveMode`, `solveHints`를 포함합니다.
+- `GET_CAPTCHA_CONTEXT`는 `answerInputCandidates[]`, `submitButtonCandidates[]`, `activeAnswerInput`, `activeSubmitButton`, `captureCandidates[]`, `activeCaptureCandidate`, `challengeText`, `challengeSlotCount`, `challengeCandidates[]`, `answerLengthHint`, `rect`, `matchedSelectors`, `iframeCaptchaPresent`, `preferredSolveMode`, `submitApiAvailable`, `solveHints`를 포함합니다.
 - `GET_CAPTCHA_ARTIFACTS`는 기본적으로 저장된 `directPublishState.tabId`를 대상으로 `artifact.dataUrl`, `artifact.kind`, `artifacts.sourceImage`, `artifacts.frameDirectImage`, `artifacts.directImage`, `artifacts.viewportCrop`, `selectedCandidate`, `captureContext`를 반환하며, 이 `captureContext`에도 `challengeText` / `challengeSlotCount`가 포함될 수 있습니다.
 - `GET_CAPTCHA_ARTIFACTS.artifactPreference`는 외부 에이전트가 우선 사용할 이미지(`sourceImage` / `frameDirectImage` / `viewportCrop` / `directImage`)를 알려줍니다.
 - `INFER_CAPTCHA_ANSWER`는 `challengeText` + `ocrTexts[]`를 받아 빈칸 답안을 추론하고, `chosenCandidate` / `candidates[]`로 어떤 OCR 후보가 채택됐는지 돌려줍니다.
-- `SUBMIT_CAPTCHA`는 `selectedInput`, `selectedButton`, `buttonText`, `captchaPresentAfterWait`, `captchaStillAppears`, `diagnostics.before/after`, `answerNormalization`을 반환합니다. v1.8.0부터는 cross-origin iframe도 우선 frame submit을 시도하고, 그래도 막히면 `captcha_browser_handoff_required`와 `handoff` 힌트를 반환합니다.
+- `SUBMIT_CAPTCHA`는 `selectedInput`, `selectedButton`, `buttonText`, `captchaPresentAfterWait`, `captchaStillAppears`, `diagnostics.before/after`, `answerNormalization`, `submitApiAvailable`을 반환합니다. v1.8.0부터는 cross-origin iframe도 우선 frame submit을 시도하고, 그래도 막히면 `captcha_browser_handoff_required`와 `handoff` 힌트를 반환합니다. v1.8.11부터는 visible submit button이 없어도 `dkaptcha.submit()`가 callable이면 같은 탭 submit을 계속 시도합니다.
 - frame submit recovery가 발동한 회차는 `submitStrategy: "extension_frame_dom_recovered"`, `recoveredAfterMissingResponse: true`, `recoveredReason`, `postSubmitProbe`를 함께 반환합니다.
 - `SUBMIT_CAPTCHA` 기본 대상 탭은 저장된 `directPublishState.tabId`이며, 필요하면 `data.tabId`로 override할 수 있습니다.
 - `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`는 답안을 `trim`하고 내부 공백을 제거해 OCR 공백 노이즈를 줄입니다. `answer` 없이 `ocrTexts[]`만 넘겨도 saved `captchaContext.challengeText` 기준으로 답안을 먼저 추론할 수 있습니다.

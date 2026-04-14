@@ -2197,10 +2197,12 @@
 
   function resolvePreferredCaptchaSolveMode(diagnostics) {
     const iframeCandidates = diagnostics.captchaRoots.filter((match) => match.element?.tagName?.toLowerCase?.() === 'iframe');
-    const hasMainDomAnswerPath = diagnostics.answerInputs.length > 0 && diagnostics.submitButtons.length > 0;
+    const submitApiAvailable = typeof window.dkaptcha?.submit === 'function';
+    const hasMainDomAnswerPath = diagnostics.answerInputs.length > 0 && (diagnostics.submitButtons.length > 0 || submitApiAvailable);
 
     return {
       iframeCandidates,
+      submitApiAvailable,
       preferredSolveMode: hasMainDomAnswerPath
         ? 'extension_dom'
         : (iframeCandidates.length > 0 ? 'extension_frame_dom' : 'extension_dom')
@@ -2212,7 +2214,7 @@
     const publishLayer = getVisiblePublishLayer();
     const confirmBtn = getConfirmButton();
     const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
-    const { iframeCandidates, preferredSolveMode } = resolvePreferredCaptchaSolveMode(diagnostics);
+    const { iframeCandidates, submitApiAvailable, preferredSolveMode } = resolvePreferredCaptchaSolveMode(diagnostics);
     const challenge = buildCaptchaChallenge(diagnostics);
     const answerLengthHint = normalizeCaptchaAnswerLengthHint(diagnostics.answerInputs[0]?.summary?.maxLength)
       || challenge.challengeSlotCount
@@ -2229,6 +2231,7 @@
       iframeCaptchaCandidateCount: iframeCandidates.length,
       iframeCaptchaCandidates: iframeCandidates.map((match) => match.summary),
       preferredSolveMode,
+      submitApiAvailable,
       answerInputCandidateCount: diagnostics.answerInputs.length,
       answerInputCandidates: diagnostics.answerInputs.map((match) => match.summary),
       activeAnswerInput: diagnostics.answerInputs[0]?.summary || null,
@@ -2484,6 +2487,7 @@
     const inputApplied = normalizeCaptchaAnswer(appliedValue) === normalizedAnswer;
     const afterInputDiagnostics = collectCaptchaDiagnostics();
     const selectedButton = afterInputDiagnostics.submitButtons[0] || before.submitButtons[0] || null;
+    const submitApiAvailable = typeof window.dkaptcha?.submit === 'function';
     if (!inputApplied) {
       return {
         success: false,
@@ -2497,7 +2501,7 @@
       };
     }
 
-    if (!selectedButton) {
+    if (!selectedButton && !submitApiAvailable) {
       return {
         success: false,
         status: iframeCaptchaPresent ? 'captcha_browser_handoff_required' : 'captcha_submit_not_found',
@@ -2516,7 +2520,7 @@
       };
     }
 
-    const submitDispatch = submitCaptchaChallenge(selectedButton.element);
+    const submitDispatch = submitCaptchaChallenge(selectedButton?.element || null);
 
     const waitMs = Math.max(300, Number(options.waitMs) || 1200);
     await delay(waitMs);
@@ -2532,9 +2536,10 @@
       clicked: !!submitDispatch.buttonClicked || !!submitDispatch.submitApiCalled,
       submitApiCalled: !!submitDispatch.submitApiCalled,
       submitApiError: submitDispatch.submitApiError || null,
+      submitApiAvailable,
       selectedInput: selectedInput.summary,
-      selectedButton: selectedButton.summary,
-      buttonText: selectedButton.summary?.text || selectedButton.summary?.ariaLabel || selectedButton.summary?.title || null,
+      selectedButton: selectedButton?.summary || null,
+      buttonText: selectedButton?.summary?.text || selectedButton?.summary?.ariaLabel || selectedButton?.summary?.title || (submitDispatch.submitApiCalled ? 'dkaptcha.submit()' : null),
       captchaPresentBefore: before.captchaRoots.length > 0,
       captchaPresentAfterWait: !!afterContext.captchaPresent,
       captchaStillAppears: !!afterContext.captchaPresent,

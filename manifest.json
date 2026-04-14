@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tistory Auto Publisher",
-  "version": "1.8.10",
+  "version": "1.8.11",
   "description": "\ud2f0\uc2a4\ud1a0\ub9ac \ube14\ub85c\uadf8 \uc790\ub3d9 \ubc1c\ud589 \ud655\uc7a5 \ud504\ub85c\uadf8\ub7a8 - \uc2ec\ud50c UI + \uc678\ubd80 API \uc9c0\uc6d0",
   "permissions": [
     "activeTab",

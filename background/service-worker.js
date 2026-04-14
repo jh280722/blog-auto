@@ -8,6 +8,7 @@
 import {
   detectCaptchaChallengeKind,
   inferCaptchaAnswer,
+  inferCaptchaDirectAnswer,
   inferInstructionCaptchaAnswer,
   normalizeCaptchaAnswerLengthHint,
   normalizeCaptchaOcrCandidateTexts,
@@ -2826,13 +2827,52 @@ async function resolveCaptchaAnswerInput(tabId, data = {}, savedState = null) {
   }
 
   const challenge = getChallengeFromCaptchaContext(captchaContext);
+  const fallbackAnswerLengthHint = normalizeCaptchaAnswerLengthHint(data.answerLengthHint)
+    || normalizeCaptchaAnswerLengthHint(data.challengeSlotCount)
+    || normalizeCaptchaAnswerLengthHint(captchaContext?.answerLengthHint)
+    || normalizeCaptchaAnswerLengthHint(captchaContext?.challengeSlotCount)
+    || null;
   if (!challenge.challengeText) {
+    const directAnswerInference = inferCaptchaDirectAnswer({
+      ocrTexts: ocrCandidates,
+      answerLengthHint: fallbackAnswerLengthHint
+    });
+
+    if (directAnswerInference.success) {
+      const inferredAnswer = normalizeCaptchaAnswer(directAnswerInference.answer || '');
+      return {
+        success: true,
+        source: 'ocr_direct_without_challenge',
+        answer: inferredAnswer.value,
+        answerNormalization: inferredAnswer.summary,
+        answerCandidates: (Array.isArray(directAnswerInference.answerCandidates)
+          ? directAnswerInference.answerCandidates
+          : [])
+          .map((candidate) => {
+            const normalized = normalizeCaptchaAnswer(candidate.answer || '');
+            return normalized.value
+              ? {
+                  ...candidate,
+                  answer: normalized.value,
+                  normalizedAnswer: normalized.value,
+                  answerNormalization: normalized.summary
+                }
+              : null;
+          })
+          .filter(Boolean),
+        inference: directAnswerInference,
+        captchaContext,
+        ocrCandidates
+      };
+    }
+
     return {
       success: false,
       status: 'captcha_challenge_context_missing',
-      error: 'CAPTCHA 문제 문구를 읽지 못했습니다.',
+      error: 'CAPTCHA 문제 문구를 읽지 못했고 OCR 후보도 하나로 좁혀지지 않았습니다. explicit answer가 필요합니다.',
       captchaContext,
-      ocrCandidates
+      ocrCandidates,
+      inference: directAnswerInference
     };
   }
 

@@ -47,3 +47,29 @@ test('buildCaptchaSolveHints returns full-name guidance for instruction map DKAP
   assert.match(hints.prompt, /전체 명칭만 한 줄/);
   assert.equal(hints.responseFormat, 'single_line_exact_name');
 });
+
+test('buildCaptchaSolveHints returns direct-answer fallback guidance when challenge text is unavailable', () => {
+  const hints = buildCaptchaSolveHints({
+    preferredSolveMode: 'extension_frame_dom',
+    answerLengthHint: 2,
+    activeCaptureCandidate: {
+      kind: 'captcha_capture_candidate'
+    }
+  }, {
+    artifactPreference: 'sourceImage',
+    artifactKinds: ['sourceImage']
+  });
+
+  assert.equal(hints.challengeKind, null);
+  assert.equal(hints.answerMode, 'vision_direct_answer');
+  assert.equal(hints.submitField, 'answer');
+  assert.equal(hints.useInferenceApi, false);
+  assert.equal(hints.supportsOcrCandidates, true);
+  assert.equal(hints.ocrCandidateSelection, 'single_candidate_if_unambiguous');
+  assert.equal(hints.answerLengthHint, 2);
+  assert.equal(hints.artifactPreference, 'sourceImage');
+  assert.match(hints.prompt, /문제 문구를 DOM에서 읽지 못했습니다/);
+  assert.match(hints.prompt, /정답 길이 힌트: 2자/);
+  assert.match(hints.prompt, /정답만 한 줄로 출력/);
+  assert.match(hints.nextAction, /answer/);
+});

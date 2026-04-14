@@ -37,6 +37,21 @@ function buildInstructionPrompt({ challengeText, targetEntity }) {
   ].filter(Boolean).join(' ');
 }
 
+function buildDirectAnswerPrompt({ answerLengthHint }) {
+  const lengthHint = Number(answerLengthHint) > 0
+    ? `정답 길이 힌트: ${answerLengthHint}자.`
+    : '정답 길이 힌트는 확정되지 않았을 수 있습니다.';
+
+  return [
+    '이 이미지는 티스토리 DKAPTCHA입니다.',
+    '문제 문구를 DOM에서 읽지 못했습니다.',
+    lengthHint,
+    '이미지 전체를 보고 최종 정답을 직접 판단해 주세요.',
+    '여러 상호 후보를 나열하지 말고 제출해야 할 정답만 한 줄로 출력하세요.',
+    'OCR 후보만 있는 경우에도 정답이 하나로 확실할 때만 답을 출력하세요.'
+  ].join(' ');
+}
+
 export function buildCaptchaSolveHints(captchaContext = null, extra = {}) {
   if (!captchaContext || typeof captchaContext !== 'object') {
     return null;
@@ -44,14 +59,25 @@ export function buildCaptchaSolveHints(captchaContext = null, extra = {}) {
 
   const challengeText = normalizeText(captchaContext.challengeText || captchaContext.challengeMasked || '');
   const challengeMasked = normalizeText(captchaContext.challengeMasked || captchaContext.challengeText || '');
-  if (!challengeText && !challengeMasked) {
+  const answerLengthHint = normalizeCaptchaAnswerLengthHint(captchaContext.answerLengthHint)
+    || normalizeCaptchaAnswerLengthHint(captchaContext.challengeSlotCount)
+    || null;
+  const fallbackSupported = !challengeText
+    && !challengeMasked
+    && (
+      answerLengthHint
+      || captchaContext.activeCaptureCandidate
+      || captchaContext.captureCandidateCount
+      || captchaContext.preferredSolveMode
+      || captchaContext.effectiveSolveMode
+      || extra.artifactPreference
+      || (Array.isArray(extra.artifactKinds) && extra.artifactKinds.length > 0)
+    );
+  if (!challengeText && !challengeMasked && !fallbackSupported) {
     return null;
   }
 
   const challengeKind = detectCaptchaChallengeKind(challengeText || challengeMasked || '');
-  const answerLengthHint = normalizeCaptchaAnswerLengthHint(captchaContext.answerLengthHint)
-    || normalizeCaptchaAnswerLengthHint(captchaContext.challengeSlotCount)
-    || null;
   const targetEntity = challengeKind === 'instruction'
     ? extractInstructionTargetEntity(challengeText || challengeMasked)
     : null;
@@ -65,6 +91,20 @@ export function buildCaptchaSolveHints(captchaContext = null, extra = {}) {
     artifactPreference: extra.artifactPreference || null,
     artifactKinds: Array.isArray(extra.artifactKinds) ? extra.artifactKinds : []
   };
+
+  if (!challengeText && !challengeMasked) {
+    return {
+      ...common,
+      answerMode: 'vision_direct_answer',
+      submitField: 'answer',
+      useInferenceApi: false,
+      supportsOcrCandidates: true,
+      ocrCandidateSelection: 'single_candidate_if_unambiguous',
+      prompt: buildDirectAnswerPrompt({ answerLengthHint }),
+      responseFormat: 'single_line_exact_answer',
+      nextAction: 'SUBMIT_CAPTCHA_AND_RESUME with answer (or ocrTexts when a single candidate is unambiguous)'
+    };
+  }
 
   if (challengeKind === 'masked') {
     return {

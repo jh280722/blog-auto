@@ -5,6 +5,7 @@ import {
   countCaptchaMaskSlots,
   extractInstructionTargetEntity,
   inferCaptchaAnswer,
+  inferCaptchaDirectAnswer,
   inferInstructionCaptchaAnswer,
   normalizeCaptchaOcrCandidateTexts,
   normalizeComparableCaptchaText,
@@ -177,4 +178,59 @@ test('inferInstructionCaptchaAnswer fails cleanly when multiple weak candidates 
 
   assert.equal(result.success, false);
   assert.equal(result.status, 'captcha_instruction_answer_ambiguous');
+});
+
+test('inferCaptchaDirectAnswer accepts a sanitized single OCR candidate when length hint matches', () => {
+  const result = inferCaptchaDirectAnswer({
+    ocrTexts: ['"새열린약국" 답변 제출'],
+    answerLengthHint: 5
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.status, 'captcha_direct_answer_inferred');
+  assert.equal(result.answer, '새열린약국');
+  assert.equal(result.chosenCandidate.sanitizedText, '새열린약국');
+  assert.equal(result.answerCandidates[0].sourceText, '새열린약국');
+});
+
+test('inferCaptchaDirectAnswer dedupes multiple sanitized OCR variants to one final answer', () => {
+  const result = inferCaptchaDirectAnswer({
+    ocrTexts: ['새열린약국 답변 제출', '"새열린약국" 음성 문제'],
+    answerLengthHint: 5
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.answer, '새열린약국');
+  assert.equal(result.answerCandidates.length, 1);
+});
+
+test('inferCaptchaDirectAnswer fails closed without answer length hint', () => {
+  const result = inferCaptchaDirectAnswer({
+    ocrTexts: ['새열린약국']
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.status, 'captcha_direct_answer_length_hint_missing');
+});
+
+test('inferCaptchaDirectAnswer fails cleanly when multiple length-matched OCR candidates remain ambiguous', () => {
+  const result = inferCaptchaDirectAnswer({
+    ocrTexts: ['새열린약국', '바로선치과'],
+    answerLengthHint: 5
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.status, 'captcha_direct_answer_ambiguous');
+  assert.deepEqual(result.answerCandidates.map((candidate) => candidate.answer), ['새열린약국', '바로선치과']);
+});
+
+test('inferCaptchaDirectAnswer stays fail-closed when clean and noisy length-matched answers disagree', () => {
+  const result = inferCaptchaDirectAnswer({
+    ocrTexts: ['새열린약국', '"바로선치과" 답변 제출'],
+    answerLengthHint: 5
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.status, 'captcha_direct_answer_ambiguous');
+  assert.deepEqual(result.answerCandidates.map((candidate) => candidate.answer), ['새열린약국', '바로선치과']);
 });

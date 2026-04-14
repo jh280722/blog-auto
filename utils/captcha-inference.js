@@ -423,7 +423,9 @@ function buildUniqueAnswerCandidates(evaluatedCandidates = [], limit = null) {
     uniqueAnswers.push({
       answer: candidate.inferredAnswer,
       normalizedAnswer,
-      sourceText: candidate.sourceText,
+      sourceText: candidate.sanitizedText || candidate.sourceText,
+      rawSourceText: candidate.sourceText,
+      sanitizedText: candidate.sanitizedText || candidate.sourceText,
       normalizedSourceText: candidate.normalizedSourceText,
       inferredAnswerParts: candidate.inferredAnswerParts || [],
       score: candidate.score,
@@ -450,13 +452,23 @@ function buildInstructionTargetForms(targetEntity = '') {
   return Array.from(variants).filter(Boolean);
 }
 
-function scoreInstructionAnswerCandidate(candidateText = '', targetForms = []) {
+function sanitizeDirectAnswerText(value = '') {
+  return String(value ?? '')
+    .replace(INSTRUCTION_TRAILING_NOISE_RE, '')
+    .replace(/^[\s"'`“”‘’〈〉《》「」『』\[\](){}<>.,:;!?]+/gu, '')
+    .replace(/[\s"'`“”‘’〈〉《》「」『』\[\](){}<>.,:;!?]+$/gu, '')
+    .trim();
+}
+
+function scoreDirectAnswerCandidate(candidateText = '', answerLengthHint = null) {
   const sourceText = String(candidateText ?? '').trim();
-  const normalizedSourceText = normalizeComparableCaptchaText(sourceText);
+  const sanitizedText = sanitizeDirectAnswerText(sourceText);
+  const normalizedSourceText = normalizeComparableCaptchaText(sanitizedText);
   if (!normalizedSourceText) {
     return {
       success: false,
       sourceText,
+      sanitizedText,
       normalizedSourceText,
       inferredAnswer: '',
       score: -1,
@@ -466,29 +478,64 @@ function scoreInstructionAnswerCandidate(candidateText = '', targetForms = []) {
 
   let score = 18;
   const reasons = [];
-  const trimmedWithoutNoise = sourceText.replace(INSTRUCTION_TRAILING_NOISE_RE, '').trim();
-  const normalizedInstructionNoise = normalizeComparableCaptchaText(trimmedWithoutNoise);
 
   if (OCR_CANDIDATE_META_RE.test(sourceText) || /^(?:답변제출|새로풀기|음성문제|정답입력해주세요|답입력해주세요)$/u.test(normalizedSourceText)) {
-    score -= 28;
-    reasons.push('ui_meta_noise');
+    if (sanitizedText && sanitizedText !== sourceText) {
+      score -= 8;
+      reasons.push('ui_meta_noise_trimmed');
+    } else {
+      score -= 28;
+      reasons.push('ui_meta_noise');
+    }
   }
 
-  if (normalizedInstructionNoise && normalizedInstructionNoise !== normalizedSourceText) {
-    score -= 8;
-    reasons.push('trailing_meta_noise');
+  if (sanitizedText !== sourceText) {
+    score -= 2;
+    reasons.push('boundary_noise_trimmed');
   }
 
-  if (normalizedSourceText.length >= 4 && normalizedSourceText.length <= 18) {
+  if (normalizedSourceText.length >= 2 && normalizedSourceText.length <= 18) {
     score += 8;
     reasons.push('reasonable_length');
-  } else if (normalizedSourceText.length <= 2) {
+  } else if (normalizedSourceText.length <= 1) {
     score -= 18;
     reasons.push('too_short');
   } else if (normalizedSourceText.length > 24) {
     score -= 10;
     reasons.push('too_long');
   }
+
+  const normalizedAnswerLengthHint = normalizeCaptchaAnswerLengthHint(answerLengthHint);
+  if (normalizedAnswerLengthHint) {
+    if (normalizedSourceText.length === normalizedAnswerLengthHint) {
+      score += 20;
+      reasons.push('answer_length_match');
+    } else {
+      score -= 12;
+      reasons.push('answer_length_mismatch');
+    }
+  }
+
+  return {
+    success: score >= 18,
+    sourceText,
+    sanitizedText,
+    normalizedSourceText,
+    inferredAnswer: sanitizedText,
+    score,
+    reasons
+  };
+}
+
+function scoreInstructionAnswerCandidate(candidateText = '', targetForms = []) {
+  const scored = scoreDirectAnswerCandidate(candidateText);
+  if (!scored.normalizedSourceText) {
+    return scored;
+  }
+
+  let score = scored.score;
+  const reasons = [...(scored.reasons || [])];
+  const normalizedSourceText = scored.normalizedSourceText;
 
   if (targetForms.length > 0) {
     const exactTarget = targetForms.find((target) => normalizedSourceText === target);
@@ -511,10 +558,8 @@ function scoreInstructionAnswerCandidate(candidateText = '', targetForms = []) {
   }
 
   return {
+    ...scored,
     success: score >= 18,
-    sourceText,
-    normalizedSourceText,
-    inferredAnswer: sourceText,
     score,
     reasons
   };
@@ -594,6 +639,74 @@ export function inferInstructionCaptchaAnswer({ challengeText = '', ocrText = ''
     chosenCandidate: best,
     candidates: evaluated,
     answerCandidates
+  };
+}
+
+export function inferCaptchaDirectAnswer({ ocrText = '', ocrTexts = [], answerLengthHint = null } = {}) {
+  const normalizedAnswerLengthHint = normalizeCaptchaAnswerLengthHint(answerLengthHint);
+  const candidates = normalizeCaptchaOcrCandidateTexts([...ocrTexts, ocrText]);
+
+  if (candidates.length === 0) {
+    return {
+      success: false,
+      status: 'captcha_ocr_candidate_missing',
+      error: 'OCR 후보 텍스트가 비어 있습니다.',
+      candidates: [],
+      answerCandidates: [],
+      answerLengthHint: normalizedAnswerLengthHint
+    };
+  }
+
+  const evaluated = candidates
+    .map((candidate) => scoreDirectAnswerCandidate(candidate, normalizedAnswerLengthHint))
+    .sort((left, right) => (right.score || 0) - (left.score || 0));
+
+  const answerCandidates = buildUniqueAnswerCandidates(evaluated);
+
+  if (!normalizedAnswerLengthHint) {
+    return {
+      success: false,
+      status: 'captcha_direct_answer_length_hint_missing',
+      error: 'challenge 문구 없이 OCR 후보만으로 직접 답안을 확정하려면 길이 힌트가 필요합니다.',
+      candidates: evaluated,
+      answerCandidates,
+      answerLengthHint: normalizedAnswerLengthHint
+    };
+  }
+
+  const best = answerCandidates[0] || null;
+
+  if (!best || !best.answer) {
+    return {
+      success: false,
+      status: 'captcha_direct_answer_inference_failed',
+      error: 'OCR 후보에서 직접 제출할 CAPTCHA 정답을 하나로 고르지 못했습니다.',
+      candidates: evaluated,
+      answerCandidates,
+      answerLengthHint: normalizedAnswerLengthHint
+    };
+  }
+
+  if (answerCandidates.length > 1) {
+    return {
+      success: false,
+      status: 'captcha_direct_answer_ambiguous',
+      error: 'OCR 후보가 여러 개라 직접 제출할 CAPTCHA 정답을 하나로 좁히지 못했습니다.',
+      chosenCandidate: best,
+      candidates: evaluated,
+      answerCandidates,
+      answerLengthHint: normalizedAnswerLengthHint
+    };
+  }
+
+  return {
+    success: true,
+    status: 'captcha_direct_answer_inferred',
+    answer: best.answer,
+    chosenCandidate: best,
+    candidates: evaluated,
+    answerCandidates,
+    answerLengthHint: normalizedAnswerLengthHint
   };
 }
 

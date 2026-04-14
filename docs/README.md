@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.11 (2026-04-14 buttonless DKAPTCHA submit-api fallback patch 포함)**
+> 현재 운영 기준: **v1.8.12 (2026-04-14 challenge-missing direct-answer fallback patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -22,6 +22,7 @@
 > - **`SUBMIT_CAPTCHA_AND_RESUME`는 submit 단계에서 이미 `/manage/posts` 또는 permalink로 이동한 회차를 terminal success로 처리해 false `content_empty` 재개를 막음**
 > - **`challengeText` / `challengeSlotCount` / `challengeCandidates`를 same-tab CAPTCHA context와 artifact handoff에 함께 포함**
 > - **`solveHints`를 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` / `captcha_required` handoff 응답에 함께 포함해, 크론이 비전 프롬프트를 추측하지 않고 바로 이미지 판독 → 제출로 이어질 수 있음**
+> - **challenge 문구를 끝내 못 읽는 회차도 `solveHints.answerMode = "vision_direct_answer"` fallback을 내려 same-tab 비전 풀이를 계속 유도하고, OCR 후보가 한 개로 정리되면서 길이 힌트까지 맞으면 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`도 직접 답안으로 수용**
 > - **live DKAPTCHA frame summary가 frame body line + submit button text까지 다시 합쳐 instruction-style / masked challenge를 재구성하므로 `challengeText: null` 회차를 줄임**
 > - **`INFER_CAPTCHA_ANSWER`로 OCR 후보 텍스트를 빈칸 답안으로 바로 줄이는 helper 추가**
 > - **`SUBMIT_CAPTCHA_AND_RESUME`가 explicit answer뿐 아니라 OCR 후보 텍스트 기반 답안 추론도 바로 수용**
@@ -53,6 +54,7 @@
 - **직접 응답 handoff**: `WRITE_POST` / `RESUME_DIRECT_PUBLISH` / `SUBMIT_CAPTCHA*`가 CAPTCHA로 막히면 응답에 `captchaArtifacts`를 같이 붙여 크론이 추가 왕복 없이 바로 OCR/비전으로 넘어갈 수 있음
 - **CAPTCHA challenge extraction**: context/artifact 응답에 빈칸 문제 문구(`challengeText`)와 칸 수(`challengeSlotCount`)를 포함해 OCR 결과를 답안으로 줄이기 쉬움
 - **CAPTCHA solve hints**: `solveHints.prompt`, `answerMode`, `submitField`, `targetEntity`, `nextAction`을 함께 반환해 masked CAPTCHA는 `ocrTexts` 기반 추론, instruction/map CAPTCHA는 `answer` 직접 제출이 기본이지만, 여러 OCR 후보만 있어도 target entity 기준으로 `ocrTexts` fallback 추론까지 연결 가능
+- **challenge-missing fallback hints**: `challengeText`를 끝내 못 읽는 회차도 `solveHints.answerMode = "vision_direct_answer"` + `submitField = "answer"`를 내려 크론이 same-tab 비전 풀이를 계속할 수 있음
 - **live frame fallback extraction**: DKAPTCHA가 문구를 직접 안 내려줘도 frame body line, submit button text, capture candidate 주변 텍스트를 다시 합쳐 `challengeText`를 복원함
 - **CAPTCHA submit API**: 에이전트가 blocked tab의 main DOM뿐 아니라 cross-origin iframe에도 답안을 입력하고 같은 탭의 확인 버튼까지 누를 수 있음. 버튼이 잠깐 안 보여도 `window.dkaptcha.submit()`가 살아 있으면 same-tab submit path를 계속 사용합니다.
 - **frame-first submit routing**: merged `captchaContext`가 `extension_frame_dom`을 가리키면 `SUBMIT_CAPTCHA` / `SUBMIT_CAPTCHA_AND_RESUME`가 content DOM 실패 응답을 기다리지 않고 frame submit을 먼저 시도함
@@ -111,7 +113,8 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 → 응답의 captchaArtifacts 확인 (없거나 재시도가 필요하면 GET_DIRECT_PUBLISH_STATE / GET_CAPTCHA_ARTIFACTS 호출)
 → 응답의 `solveHints`를 먼저 읽고, 거기 적힌 `prompt` 그대로 OCR/비전에 전달
 → `solveHints.submitField === "ocrTexts"`면 전체 후보 텍스트를 줄바꿈 후보로 읽어 `INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`로 빈칸 답안 축약
-→ `solveHints.submitField === "answer"`면 지시문 대상의 전체 명칭을 한 줄 답안으로 읽어 바로 `SUBMIT_CAPTCHA_AND_RESUME({ answer })`
+→ `solveHints.submitField === "answer"`면 지시문 대상의 전체 명칭 또는 challenge-missing fallback에서 비전이 직접 읽은 최종 정답을 한 줄 답안으로 만들어 바로 `SUBMIT_CAPTCHA_AND_RESUME({ answer })`
+→ v1.8.12부터는 `challengeText`를 끝내 못 읽더라도 `solveHints.answerMode = "vision_direct_answer"`가 내려오며, OCR 후보가 한 개로 정리되고 길이 힌트까지 맞으면 서비스워커가 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`도 직접 답안으로 수용
 → v1.8.4 기준 live DKAPTCHA에서도 `challengeText`가 비면 frame body line + submit button text fallback으로 다시 복원되는지 먼저 확인
 → OCR 후보가 여러 개면 `SUBMIT_CAPTCHA*`가 `answerCandidates` 상위 답안을 같은 challenge에서 자동 재시도하고, CAPTCHA 문구가 바뀌면 바로 멈춘 뒤 새 artifact/handoff를 돌려줌
 → `preferredSolveMode`가 `extension_dom` / `extension_frame_dom`이면 SUBMIT_CAPTCHA_AND_RESUME로 같은 탭 답안 입력 + 즉시 재개 (`extension_frame_dom`이면 frame submit 우선)
@@ -173,6 +176,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 - 테스트 발행: `visibility: "private"`
 - DKAPTCHA 발생 시: 먼저 응답의 `captchaArtifacts`와 `solveHints`를 확인하고, 필요하면 `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_ARTIFACTS`로 blocked tab과 캡차 이미지를 다시 확보합니다.
 - `solveHints.prompt`는 그대로 OCR/비전 프롬프트로 사용합니다. masked challenge면 **`ocrTexts` 기반 추론**, instruction/map challenge면 **`answer` 직접 제출**이 기본이지만, 비전이 여러 후보를 줄바꿈으로 돌려준 경우에도 **`ocrTexts` fallback**으로 target entity 기준 자동 선택을 시도할 수 있습니다.
+- v1.8.12부터는 `challengeText`를 못 읽은 회차도 `solveHints.answerMode = "vision_direct_answer"` + `submitField = "answer"`로 직접 정답 판독을 유도합니다. 이때 OCR 후보가 1개로 정리되고 길이 힌트까지 맞으면 서비스워커가 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`도 직접 답안으로 수용합니다.
 - 일반 DOM형 CAPTCHA면 OCR/비전으로 전체 후보 텍스트를 구한 뒤 **`INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`를 우선 사용**
 - OCR 후보가 여러 개면 `answerCandidates`가 순위대로 내려오고, `SUBMIT_CAPTCHA*`가 기본적으로 상위 3개 답안까지 같은 challenge에서 자동 재시도
 - `captcha_browser_handoff_required` 또는 `preferredSolveMode: "browser_handoff"`면 cross-origin iframe이므로 같은 탭에서 browser/CDP로 직접 풀이하고 **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`** 로 자동 재개 대기를 거는 것이 권장
@@ -275,13 +279,14 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 4. `captcha_required`면 우선 응답의 `captchaArtifacts`를 확인하고, 필요하면 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` 또는 `GET_CAPTCHA_ARTIFACTS`로 막힌 탭/캡차 이미지를 다시 확보
 5. `response.captchaArtifacts.artifact.dataUrl`와 `response.captchaArtifacts.captureContext.challengeText`를 OCR/비전 입력으로 사용해 전체 후보 텍스트를 구함
 6. `challengeText`가 있으면 `INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`로 빈칸 답안을 먼저 줄임
-7. OCR 후보가 여러 개면 응답의 `answerCandidates`와 `answerAttemptHistory`를 확인합니다. 같은 challenge가 유지되는 동안에는 `SUBMIT_CAPTCHA*`가 상위 답안을 자동 재시도합니다.
-8. `response.captchaContext` 또는 refreshed direct state의 `preferredSolveMode !== "browser_handoff"`면 `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭에 답안을 제출하고 즉시 재개
-9. 응답이 `captcha_submit_tab_navigated`면 submit 단계에서 이미 완료 URL로 이동한 것이므로 성공으로 처리하고 추가 resume을 호출하지 않습니다.
-10. `preferredSolveMode === "browser_handoff"` 또는 `captcha_browser_handoff_required`면 same-tab browser/CDP 풀이와 함께 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`를 호출해 CAPTCHA 해제 직후 자동 재개
-11. 재개 단계는 저장된 `requestData`를 기준으로 draft snapshot을 검사하고, 제목/본문/이미지가 비어 있으면 먼저 복구합니다. 복구가 충분하지 않으면 `draft_restore_failed`로 fail-closed 합니다.
-12. 응답이 `captcha_still_present`인데 `answerRetrySummary.stoppedReason === "challenge_changed"`면 challenge가 새로고침된 것이므로, 새 artifact/OCR 후보로 다시 시작합니다.
-13. `editor_not_ready`면 `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight.reason`을 보고 `PREPARE_EDITOR` 재호출
+7. v1.8.12부터 `solveHints.answerMode === "vision_direct_answer"`면 challenge 문구가 비어도 비전이 최종 정답을 직접 읽어 `SUBMIT_CAPTCHA_AND_RESUME({ answer })`로 제출합니다. OCR 후보가 1개뿐이면서 길이 힌트까지 맞으면 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`도 same-tab direct answer로 수용됩니다.
+8. OCR 후보가 여러 개면 응답의 `answerCandidates`와 `answerAttemptHistory`를 확인합니다. 같은 challenge가 유지되는 동안에는 `SUBMIT_CAPTCHA*`가 상위 답안을 자동 재시도합니다.
+9. `response.captchaContext` 또는 refreshed direct state의 `preferredSolveMode !== "browser_handoff"`면 `SUBMIT_CAPTCHA_AND_RESUME`로 같은 탭에 답안을 제출하고 즉시 재개
+10. 응답이 `captcha_submit_tab_navigated`면 submit 단계에서 이미 완료 URL로 이동한 것이므로 성공으로 처리하고 추가 resume을 호출하지 않습니다.
+11. `preferredSolveMode === "browser_handoff"` 또는 `captcha_browser_handoff_required`면 same-tab browser/CDP 풀이와 함께 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`를 호출해 CAPTCHA 해제 직후 자동 재개
+12. 재개 단계는 저장된 `requestData`를 기준으로 draft snapshot을 검사하고, 제목/본문/이미지가 비어 있으면 먼저 복구합니다. 복구가 충분하지 않으면 `draft_restore_failed`로 fail-closed 합니다.
+13. 응답이 `captcha_still_present`인데 `answerRetrySummary.stoppedReason === "challenge_changed"`면 challenge가 새로고침된 것이므로, 새 artifact/OCR 후보로 다시 시작합니다.
+14. `editor_not_ready`면 `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight.reason`을 보고 `PREPARE_EDITOR` 재호출
 
 ---
 

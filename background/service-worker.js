@@ -42,22 +42,40 @@ import {
   normalizeLoadedQueueState,
   QUEUE_CONTINUATION_ALARM
 } from '../utils/queue-runtime.js';
+import {
+  buildDirectPublishContinuationPlan,
+  decideDirectPublishStartupAction,
+  DIRECT_PUBLISH_CONTINUATION_ALARM
+} from '../utils/direct-publish-runtime.js';
 
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
 let isProcessing = false;
 let currentTabId = null;
 let directPublishState = null;
+let directPublishRuntimeState = {
+  active: false,
+  tabId: null,
+  nextCheckTimeMs: null,
+  deadlineMs: null,
+  timeoutMs: null,
+  pollIntervalMs: null,
+  postClearDelayMs: null,
+  updatedAt: null
+};
 let queueRuntimeState = {
   active: false,
   scheduledTimeMs: null,
   requestedDelayMs: null,
   updatedAt: null
 };
+let isDirectPublishRuntimeWakeInFlight = false;
+let isDirectPublishCaptchaWaitInProgress = false;
 let runtimeStateLoaded = false;
 let runtimeStateLoadPromise = null;
 
 const DIRECT_PUBLISH_STATE_KEY = 'directPublishState';
+const DIRECT_PUBLISH_RUNTIME_STATE_KEY = 'directPublishRuntimeState';
 const QUEUE_RUNTIME_STATE_KEY = 'publishQueueRuntimeState';
 
 const EDITOR_PREPARE_DEFAULTS = {
@@ -154,6 +172,66 @@ async function scheduleQueueContinuation(intervalMs) {
   return plan;
 }
 
+async function persistDirectPublishRuntimeState() {
+  await chrome.storage.local.set({
+    [DIRECT_PUBLISH_RUNTIME_STATE_KEY]: directPublishRuntimeState
+  });
+}
+
+async function clearDirectPublishContinuationAlarm() {
+  await chrome.alarms.clear(DIRECT_PUBLISH_CONTINUATION_ALARM);
+}
+
+async function resetDirectPublishRuntimeState() {
+  directPublishRuntimeState = {
+    active: false,
+    tabId: null,
+    nextCheckTimeMs: null,
+    deadlineMs: null,
+    timeoutMs: null,
+    pollIntervalMs: null,
+    postClearDelayMs: null,
+    updatedAt: new Date().toISOString()
+  };
+  await persistDirectPublishRuntimeState();
+  await clearDirectPublishContinuationAlarm();
+}
+
+async function updateDirectPublishRuntimeState(patch = {}) {
+  directPublishRuntimeState = {
+    ...directPublishRuntimeState,
+    ...patch,
+    updatedAt: new Date().toISOString()
+  };
+  await persistDirectPublishRuntimeState();
+  return directPublishRuntimeState;
+}
+
+async function scheduleDirectPublishContinuation({ tabId, timeoutMs, pollIntervalMs, postClearDelayMs, deadlineMs = null } = {}) {
+  const plan = buildDirectPublishContinuationPlan({
+    timeoutMs,
+    pollIntervalMs,
+    deadlineMs
+  });
+
+  if (plan.alarmDelayMs > 0) {
+    await chrome.alarms.create(plan.alarmName, { when: plan.scheduledTimeMs });
+  } else {
+    await clearDirectPublishContinuationAlarm();
+  }
+
+  await updateDirectPublishRuntimeState({
+    active: true,
+    tabId,
+    nextCheckTimeMs: plan.nextCheckTimeMs,
+    deadlineMs: plan.deadlineMs,
+    timeoutMs: plan.timeoutMs,
+    pollIntervalMs: plan.pollIntervalMs,
+    postClearDelayMs: Math.max(0, Number(postClearDelayMs) || 0)
+  });
+  return plan;
+}
+
 /**
  * 큐 상태 로드
  */
@@ -179,6 +257,29 @@ async function loadQueueRuntimeState() {
   }
 }
 
+async function loadDirectPublishRuntimeState() {
+  const result = await chrome.storage.local.get(DIRECT_PUBLISH_RUNTIME_STATE_KEY);
+  const stored = result[DIRECT_PUBLISH_RUNTIME_STATE_KEY];
+  if (stored && typeof stored === 'object') {
+    const storedTabId = parseOptionalFiniteNumber(stored.tabId);
+    const storedNextCheckTimeMs = parseOptionalFiniteNumber(stored.nextCheckTimeMs);
+    const storedDeadlineMs = parseOptionalFiniteNumber(stored.deadlineMs);
+    const storedTimeoutMs = parseOptionalFiniteNumber(stored.timeoutMs);
+    const storedPollIntervalMs = parseOptionalFiniteNumber(stored.pollIntervalMs);
+    const storedPostClearDelayMs = parseOptionalFiniteNumber(stored.postClearDelayMs);
+    directPublishRuntimeState = {
+      active: !!stored.active,
+      tabId: Number.isInteger(storedTabId) ? storedTabId : null,
+      nextCheckTimeMs: Number.isFinite(storedNextCheckTimeMs) ? storedNextCheckTimeMs : null,
+      deadlineMs: Number.isFinite(storedDeadlineMs) ? storedDeadlineMs : null,
+      timeoutMs: Number.isFinite(storedTimeoutMs) ? storedTimeoutMs : null,
+      pollIntervalMs: Number.isFinite(storedPollIntervalMs) ? storedPollIntervalMs : null,
+      postClearDelayMs: Number.isFinite(storedPostClearDelayMs) ? storedPostClearDelayMs : null,
+      updatedAt: stored.updatedAt || null
+    };
+  }
+}
+
 async function loadDirectPublishState() {
   const result = await chrome.storage.local.get(DIRECT_PUBLISH_STATE_KEY);
   directPublishState = result[DIRECT_PUBLISH_STATE_KEY] || null;
@@ -191,10 +292,12 @@ async function ensureRuntimeStateLoaded() {
     runtimeStateLoadPromise = Promise.all([
       loadQueueState(),
       loadQueueRuntimeState(),
-      loadDirectPublishState()
+      loadDirectPublishState(),
+      loadDirectPublishRuntimeState()
     ])
       .then(async () => {
         await restoreQueueContinuationAfterStartup();
+        await restoreDirectPublishContinuationAfterStartup();
         runtimeStateLoaded = true;
       })
       .catch((error) => {
@@ -246,6 +349,197 @@ async function restoreQueueContinuationAfterStartup() {
   await clearQueueContinuationAlarm();
 }
 
+async function handleDirectPublishContinuationWakeup(source = 'startup') {
+  const startupAction = decideDirectPublishStartupAction({
+    directPublishState,
+    directPublishRuntimeState,
+    nowMs: Date.now()
+  });
+
+  if (isDirectPublishCaptchaWaitInProgress && directPublishRuntimeState?.active) {
+    const plan = buildDirectPublishContinuationPlan({
+      timeoutMs: directPublishRuntimeState.timeoutMs,
+      pollIntervalMs: directPublishRuntimeState.pollIntervalMs,
+      deadlineMs: directPublishRuntimeState.deadlineMs
+    });
+
+    if (plan.alarmDelayMs > 0) {
+      await chrome.alarms.create(plan.alarmName, { when: plan.scheduledTimeMs });
+      await updateDirectPublishRuntimeState({
+        nextCheckTimeMs: plan.nextCheckTimeMs,
+        deadlineMs: plan.deadlineMs,
+        timeoutMs: plan.timeoutMs,
+        pollIntervalMs: plan.pollIntervalMs
+      });
+    } else {
+      await clearDirectPublishContinuationAlarm();
+    }
+    return;
+  }
+
+  if (startupAction.action === 'none') {
+    await clearDirectPublishContinuationAlarm();
+    return;
+  }
+
+  if (startupAction.action === 'clear_runtime') {
+    await resetDirectPublishRuntimeState();
+    return;
+  }
+
+  if (startupAction.action === 'recreate_alarm') {
+    await chrome.alarms.create(startupAction.alarmName, { when: startupAction.scheduledTimeMs });
+    return;
+  }
+
+  if (startupAction.action === 'resume_now') {
+    if (startupAction.remainingTimeoutMs !== null && startupAction.remainingTimeoutMs <= 0) {
+      await clearDirectPublishContinuationAlarm();
+
+      try {
+        const liveTab = await chrome.tabs.get(startupAction.tabId || directPublishState?.tabId);
+        if (looksLikeDirectPublishCompletionUrl(liveTab?.url || '')) {
+          await clearDirectPublishState();
+          return;
+        }
+      } catch (error) {
+        // 탭 조회 실패는 아래 fail-closed 경로에서 처리
+      }
+
+      try {
+        const captchaCheck = await getBlockingCaptchaStateForTab(startupAction.tabId || directPublishState?.tabId);
+        if (captchaCheck?.success && !captchaCheck.captchaPresent) {
+          queueMicrotask(async () => {
+            try {
+              await resumeDirectPublishFlow(directPublishState?.requestData || {}, {
+                preferredTabId: startupAction.tabId || directPublishState?.tabId || null,
+                waitForCaptcha: false,
+                pollIntervalMs: directPublishRuntimeState?.pollIntervalMs,
+                postClearDelayMs: directPublishRuntimeState?.postClearDelayMs,
+                autoWakeSource: source
+              });
+            } catch (error) {
+              console.warn('[TistoryAuto BG] expired direct publish wait 후 즉시 재개 실패:', error);
+            }
+          });
+          await resetDirectPublishRuntimeState();
+          return;
+        }
+      } catch (error) {
+        // same-tab probe 실패는 timeout fail-closed로 정리
+      }
+
+      if (directPublishState?.status === 'waiting_browser_handoff') {
+        await updateDirectPublishState({
+          status: 'captcha_required',
+          lastCaptchaWait: {
+            ...(directPublishState?.lastCaptchaWait || {}),
+            enabled: true,
+            success: false,
+            status: 'captcha_wait_timeout',
+            error: '저장된 same-tab CAPTCHA 대기 시간이 만료되었습니다. 현재 상태를 확인한 뒤 새 handoff 또는 재시도를 진행하세요.',
+            completedAt: new Date().toISOString()
+          }
+        });
+      }
+      await resetDirectPublishRuntimeState();
+      return;
+    }
+
+    let liveWakeTab = null;
+    try {
+      liveWakeTab = await chrome.tabs.get(startupAction.tabId || directPublishState?.tabId);
+    } catch (error) {
+      if (directPublishState?.status === 'waiting_browser_handoff') {
+        await updateDirectPublishState({
+          status: 'editor_not_ready',
+          lastCaptchaWait: {
+            ...(directPublishState?.lastCaptchaWait || {}),
+            enabled: true,
+            success: false,
+            status: 'editor_not_ready',
+            error: '저장된 same-tab CAPTCHA 대기 탭이 사라져 자동 재개를 중단합니다. 새 handoff 또는 재시도가 필요합니다.',
+            completedAt: new Date().toISOString()
+          }
+        });
+      }
+      await resetDirectPublishRuntimeState();
+      return;
+    }
+
+    if (looksLikeDirectPublishCompletionUrl(liveWakeTab?.url || '')) {
+      await clearDirectPublishState();
+      return;
+    }
+
+    if (isDirectPublishRuntimeWakeInFlight) {
+      return;
+    }
+
+    isDirectPublishRuntimeWakeInFlight = true;
+    await clearDirectPublishContinuationAlarm();
+    await updateDirectPublishRuntimeState({
+      active: true,
+      nextCheckTimeMs: null
+    });
+
+    queueMicrotask(async () => {
+      try {
+        const resumeResponse = await resumeDirectPublishFlow(directPublishState?.requestData || {}, {
+          preferredTabId: startupAction.tabId || directPublishState?.tabId || null,
+          waitForCaptcha: true,
+          waitTimeoutMs: startupAction.remainingTimeoutMs,
+          pollIntervalMs: directPublishRuntimeState?.pollIntervalMs,
+          postClearDelayMs: directPublishRuntimeState?.postClearDelayMs,
+          autoWakeSource: source
+        });
+
+        if (!resumeResponse?.success) {
+          if (directPublishState?.status === 'waiting_browser_handoff') {
+            await updateDirectPublishState({
+              status: resumeResponse?.status === 'captcha_required' ? 'captcha_required' : 'editor_not_ready',
+              lastCaptchaWait: {
+                ...(directPublishState?.lastCaptchaWait || {}),
+                enabled: true,
+                success: false,
+                status: resumeResponse?.status || 'editor_not_ready',
+                error: resumeResponse?.error || null,
+                completedAt: new Date().toISOString()
+              }
+            });
+          }
+          await resetDirectPublishRuntimeState();
+        }
+      } catch (error) {
+        console.warn('[TistoryAuto BG] direct publish 자동 재개 실패:', error);
+        if (directPublishState?.status === 'waiting_browser_handoff') {
+          await updateDirectPublishState({
+            status: 'captcha_required',
+            lastCaptchaWait: {
+              ...(directPublishState?.lastCaptchaWait || {}),
+              enabled: true,
+              success: false,
+              status: 'editor_not_ready',
+              error: error.message,
+              completedAt: new Date().toISOString()
+            }
+          });
+          await resetDirectPublishRuntimeState();
+        }
+      } finally {
+        isDirectPublishRuntimeWakeInFlight = false;
+      }
+    });
+    return;
+  }
+
+  await clearDirectPublishContinuationAlarm();
+}
+
+async function restoreDirectPublishContinuationAfterStartup() {
+  await handleDirectPublishContinuationWakeup('startup');
+}
+
 async function persistDirectPublishState() {
   if (directPublishState) {
     await chrome.storage.local.set({ [DIRECT_PUBLISH_STATE_KEY]: directPublishState });
@@ -263,6 +557,7 @@ async function setDirectPublishState(state) {
 async function clearDirectPublishState() {
   directPublishState = null;
   await persistDirectPublishState();
+  await resetDirectPublishRuntimeState();
 }
 
 async function updateDirectPublishState(patch = {}) {
@@ -282,6 +577,14 @@ function delay(ms) {
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
+}
+
+function parseOptionalFiniteNumber(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
 }
 
 function cloneTraceEntries(trace = []) {
@@ -3524,26 +3827,38 @@ async function submitCaptchaForTab(tabId, answer, options = {}) {
 }
 
 function normalizeDirectPublishCaptchaWaitOptions(options = {}) {
+  const waitTimeoutMs = parseOptionalFiniteNumber(options.waitTimeoutMs);
+  const legacyWaitTimeoutMs = parseOptionalFiniteNumber(options.captchaWaitTimeoutMs);
+  const pollIntervalMs = parseOptionalFiniteNumber(options.pollIntervalMs);
+  const legacyPollIntervalMs = parseOptionalFiniteNumber(options.captchaPollIntervalMs);
+  const postClearDelayMs = parseOptionalFiniteNumber(options.postClearDelayMs);
+  const legacyPostClearDelayMs = parseOptionalFiniteNumber(options.captchaPostClearDelayMs);
   const waitRequested = options.waitForCaptcha === true
     || options.waitForCaptchaResolution === true
-    || Number(options.waitTimeoutMs) > 0
-    || Number(options.captchaWaitTimeoutMs) > 0;
+    || waitTimeoutMs > 0
+    || legacyWaitTimeoutMs > 0;
 
   return {
     enabled: waitRequested,
     timeoutMs: clamp(
-      Number(options.waitTimeoutMs) || Number(options.captchaWaitTimeoutMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.timeoutMs,
+      Number.isFinite(waitTimeoutMs)
+        ? waitTimeoutMs
+        : (Number.isFinite(legacyWaitTimeoutMs) ? legacyWaitTimeoutMs : DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.timeoutMs),
       1000,
       300000
     ),
     pollIntervalMs: clamp(
-      Number(options.pollIntervalMs) || Number(options.captchaPollIntervalMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.pollIntervalMs,
+      Number.isFinite(pollIntervalMs)
+        ? pollIntervalMs
+        : (Number.isFinite(legacyPollIntervalMs) ? legacyPollIntervalMs : DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.pollIntervalMs),
       250,
       5000
     ),
     postClearDelayMs: Math.max(
       0,
-      Number(options.postClearDelayMs) || Number(options.captchaPostClearDelayMs) || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.postClearDelayMs
+      Number.isFinite(postClearDelayMs)
+        ? postClearDelayMs
+        : (Number.isFinite(legacyPostClearDelayMs) ? legacyPostClearDelayMs : DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.postClearDelayMs)
     ),
     stageJitter: options.stageJitter || DIRECT_PUBLISH_CAPTCHA_WAIT_DEFAULTS.stageJitter
   };
@@ -4076,12 +4391,28 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
           pollIntervalMs: waitOptions.pollIntervalMs,
           postClearDelayMs: waitOptions.postClearDelayMs,
           startedAt: new Date().toISOString(),
-          completedAt: null
+          completedAt: null,
+          autoWakeSource: options.autoWakeSource || null
         }
       });
+      await scheduleDirectPublishContinuation({
+        tabId: preparation.tabId,
+        timeoutMs: waitOptions.timeoutMs,
+        pollIntervalMs: waitOptions.pollIntervalMs,
+        postClearDelayMs: waitOptions.postClearDelayMs,
+        deadlineMs: directPublishRuntimeState?.deadlineMs || null
+      });
+    } else {
+      await resetDirectPublishRuntimeState();
     }
 
-    captchaWait = await waitForCaptchaResolutionOnTab(preparation.tabId, waitOptions);
+    isDirectPublishCaptchaWaitInProgress = true;
+    try {
+      captchaWait = await waitForCaptchaResolutionOnTab(preparation.tabId, waitOptions);
+    } finally {
+      isDirectPublishCaptchaWaitInProgress = false;
+    }
+    await resetDirectPublishRuntimeState();
     captchaWait = {
       enabled: true,
       timeoutMs: waitOptions.timeoutMs,
@@ -4141,6 +4472,7 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
       }, preparation)), handoff), captchaWait);
     }
   } else {
+    await resetDirectPublishRuntimeState();
     try {
       const captchaCheck = await getBlockingCaptchaStateForTab(preparation.tabId);
       if (captchaCheck?.captchaPresent) {
@@ -6240,7 +6572,11 @@ async function handleMessage(message, sender) {
 
     case 'GET_DIRECT_PUBLISH_STATE': {
       const state = await getLiveDirectPublishState({ includeCaptchaContext: !!message.data?.includeCaptchaContext });
-      return attachSolveHints({ success: true, directPublish: state }, state?.captchaContext || null);
+      return attachSolveHints({
+        success: true,
+        directPublish: state,
+        directPublishRuntimeState
+      }, state?.captchaContext || null);
     }
 
     case 'GET_CAPTCHA_CONTEXT': {
@@ -6620,26 +6956,34 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   return true; // 비동기 응답
 });
 
-// ── 큐 continuation alarm ─────────────────────────────────
+// ── runtime continuation alarms ─────────────────────────────
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== QUEUE_CONTINUATION_ALARM) return;
+  if (![QUEUE_CONTINUATION_ALARM, DIRECT_PUBLISH_CONTINUATION_ALARM].includes(alarm.name)) return;
 
   ensureRuntimeStateLoaded()
     .then(async () => {
-      if (!queueRuntimeState?.active) {
-        await clearQueueContinuationAlarm();
+      if (alarm.name === QUEUE_CONTINUATION_ALARM) {
+        if (!queueRuntimeState?.active) {
+          await clearQueueContinuationAlarm();
+          return;
+        }
+
+        await updateQueueRuntimeState({
+          active: true,
+          scheduledTimeMs: null,
+          requestedDelayMs: null
+        });
+        await processNextInQueue();
         return;
       }
 
-      await updateQueueRuntimeState({
-        active: true,
-        scheduledTimeMs: null,
-        requestedDelayMs: null
-      });
-      await processNextInQueue();
+      await handleDirectPublishContinuationWakeup('alarm');
     })
     .catch((error) => {
-      console.warn('[TistoryAuto BG] 큐 continuation alarm 처리 실패:', error);
+      const label = alarm.name === DIRECT_PUBLISH_CONTINUATION_ALARM
+        ? 'direct publish continuation alarm'
+        : '큐 continuation alarm';
+      console.warn(`[TistoryAuto BG] ${label} 처리 실패:`, error);
     });
 });
 

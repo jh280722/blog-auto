@@ -2,9 +2,10 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.13 (2026-04-15 MV3 queue durability / service-worker restart recovery patch 포함)**
+> 현재 운영 기준: **v1.8.14 (2026-04-15 direct publish CAPTCHA wait durability patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
+> - **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`도 direct publish runtime state + `chrome.alarms` wake-up을 storage에 남겨, MV3 service worker restart 뒤 same-tab CAPTCHA 대기/재개를 자동 복구**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
 > - **에디터 진입 기본 경로를 `manage → newpost`로 정규화**
 > - **준비/발행 전환 지점에 bounded stage jitter 추가 (고정 sleep 패턴 완화)**
@@ -46,6 +47,7 @@
 - **이미지 삽입**: 로컬 파일, 드래그앤드롭, URL 모두 지원
 - **대량 발행 큐**: JSON으로 여러 글을 한번에 등록, 순차 발행
 - **MV3 queue durability**: `START_QUEUE` 이후에는 in-memory timer + `chrome.alarms` wake-up을 함께 유지하고, `GET_QUEUE`가 `queueRuntimeState`까지 반환해 service worker restart/idle shutdown 이후 자동 재개 여부를 추적할 수 있음
+- **direct publish wait durability**: `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`가 `directPublishRuntimeState`를 storage에 남기고, service worker restart 뒤에도 saved blocked tab의 same-tab CAPTCHA 대기/재개를 alarm 기반으로 다시 이어감 (`GET_DIRECT_PUBLISH_STATE` 응답에도 runtime state 포함)
 - **외부 API**: `externally_connectable`로 외부 도구에서 데이터 전송 가능
 - **직접 발행 상태 추적**: `captcha_required` 시 blocked tab / blog / visibility / diagnostics / requestData와 `publishTrace` / `stage`를 저장
 - **CAPTCHA context API**: 에이전트가 iframe/레이어/입력창/버튼 위치를 읽어 같은 탭에서 해결할 수 있도록 컨텍스트 제공 (`preferredSolveMode`, `iframeCaptchaPresent`, `frameCaptchaCandidates` 포함)
@@ -179,16 +181,16 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 **운영 권장값**
 - 실제 발행: `visibility: "public"`
 - 테스트 발행: `visibility: "private"`
-- DKAPTCHA 발생 시: 먼저 응답의 `captchaArtifacts`와 `solveHints`를 확인하고, 필요하면 `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_ARTIFACTS`로 blocked tab과 캡차 이미지를 다시 확보합니다.
+- DKAPTCHA 발생 시: 먼저 응답의 `captchaArtifacts`와 `solveHints`를 확인하고, 필요하면 `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_ARTIFACTS`로 blocked tab과 캡차 이미지를 다시 확보합니다. `GET_DIRECT_PUBLISH_STATE` 응답에는 `directPublishRuntimeState`도 함께 내려오므로, service worker restart 뒤 same-tab CAPTCHA wait가 다시 이어질 예정인지 바로 확인할 수 있습니다.
 - `solveHints.prompt`는 그대로 OCR/비전 프롬프트로 사용합니다. masked challenge면 **`ocrTexts` 기반 추론**, instruction/map challenge면 **`answer` 직접 제출**이 기본이지만, 비전이 여러 후보를 줄바꿈으로 돌려준 경우에도 **`ocrTexts` fallback**으로 target entity 기준 자동 선택을 시도할 수 있습니다.
 - v1.8.12부터는 `challengeText`를 못 읽은 회차도 `solveHints.answerMode = "vision_direct_answer"` + `submitField = "answer"`로 직접 정답 판독을 유도합니다. 이때 OCR 후보가 1개로 정리되고 길이 힌트까지 맞으면 서비스워커가 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`도 직접 답안으로 수용합니다.
 - 일반 DOM형 CAPTCHA면 OCR/비전으로 전체 후보 텍스트를 구한 뒤 **`INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`를 우선 사용**
 - OCR 후보가 여러 개면 `answerCandidates`가 순위대로 내려오고, `SUBMIT_CAPTCHA*`가 기본적으로 상위 3개 답안까지 같은 challenge에서 자동 재시도
-- `captcha_browser_handoff_required` 또는 `preferredSolveMode: "browser_handoff"`면 cross-origin iframe이므로 같은 탭에서 browser/CDP로 직접 풀이하고 **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`** 로 자동 재개 대기를 거는 것이 권장
+- `captcha_browser_handoff_required` 또는 `preferredSolveMode: "browser_handoff"`면 cross-origin iframe이므로 같은 탭에서 browser/CDP로 직접 풀이하고 **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`** 로 자동 재개 대기를 거는 것이 권장입니다. v1.8.14부터는 이 browser handoff 대기 자체도 `directPublishRuntimeState` + `chrome.alarms`로 영속화돼, MV3 service worker가 idle restart돼도 남은 timeout 범위 안에서 saved tab을 다시 잡고 same-tab 재개를 이어갑니다.
 - 구버전/디버그 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH` 분리 호출
 - 브라우저 시작 직후/오래된 티스토리 탭 사용 시: 먼저 `PREPARE_EDITOR`
 - `editor_not_ready` 발생 시: `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight`를 보고 `PREPARE_EDITOR` 재호출
-- 큐를 외부에서 모니터링할 때 `GET_QUEUE` 응답의 `queueRuntimeState.active` / `scheduledTimeMs`를 같이 보면, worker 재시작 뒤 자동 재개가 예정됐는지 바로 확인할 수 있습니다.
+- 큐를 외부에서 모니터링할 때 `GET_QUEUE` 응답의 `queueRuntimeState.active` / `scheduledTimeMs`를 같이 보면, worker 재시작 뒤 자동 재개가 예정됐는지 바로 확인할 수 있습니다. direct publish handoff는 `GET_DIRECT_PUBLISH_STATE`의 `directPublishRuntimeState.active` / `nextCheckTimeMs` / `deadlineMs`를 같이 보세요.
 
 ```javascript
 const EXTENSION_ID = "your-extension-id";

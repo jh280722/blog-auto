@@ -2,7 +2,7 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.12 (2026-04-14 challenge-missing direct-answer fallback patch 포함)**
+> 현재 운영 기준: **v1.8.13 (2026-04-15 MV3 queue durability / service-worker restart recovery patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -32,6 +32,7 @@
 > - **live `/manage/newpost` 탭에서 content script가 살아 있어도 probe가 실패하면 곧바로 `editor_ready`로 간주하지 않고 `manage → newpost` 회복 경로를 다시 태움**
 > - **`RESUME_DIRECT_PUBLISH(waitForCaptcha)`로 saved blocked tab을 유지한 채 extension-frame/browser fallback same-tab solve 완료까지 대기 후 즉시 재개**
 > - **발행 직후 탭 navigation 때문에 content-script 응답 채널이 닫혀도 `WRITE_POST`뿐 아니라 queue / `RESUME_AFTER_CAPTCHA` / `RESUME_DIRECT_PUBLISH`까지 recovery verification로 성공 여부를 다시 확정**
+> - **발행 큐는 in-memory timer와 `chrome.alarms`를 함께 사용해 MV3 service worker idle shutdown 뒤에도 다음 항목을 다시 깨우고, 재시작 중 이미 `processing`이던 항목은 duplicate publish를 피하기 위해 fail-closed(`worker_restarted_during_publish`)로 전환한 뒤 남은 pending 항목만 재개**
 > - **stale tab 회피 + 실제 editor body readiness gate**
 > - **`WRITE_POST` 시작 전 final preflight로 title-only draft fail-closed**
 > - **post-CAPTCHA draft snapshot이 local TinyMCE에서 0으로 읽혀도 MAIN world editor summary로 길이/미리보기를 다시 합산**
@@ -44,6 +45,7 @@
 - **팝업 UI**: 확장 프로그램 아이콘 클릭 → 직접 글 작성/발행
 - **이미지 삽입**: 로컬 파일, 드래그앤드롭, URL 모두 지원
 - **대량 발행 큐**: JSON으로 여러 글을 한번에 등록, 순차 발행
+- **MV3 queue durability**: `START_QUEUE` 이후에는 in-memory timer + `chrome.alarms` wake-up을 함께 유지하고, `GET_QUEUE`가 `queueRuntimeState`까지 반환해 service worker restart/idle shutdown 이후 자동 재개 여부를 추적할 수 있음
 - **외부 API**: `externally_connectable`로 외부 도구에서 데이터 전송 가능
 - **직접 발행 상태 추적**: `captcha_required` 시 blocked tab / blog / visibility / diagnostics / requestData와 `publishTrace` / `stage`를 저장
 - **CAPTCHA context API**: 에이전트가 iframe/레이어/입력창/버튼 위치를 읽어 같은 탭에서 해결할 수 있도록 컨텍스트 제공 (`preferredSolveMode`, `iframeCaptchaPresent`, `frameCaptchaCandidates` 포함)
@@ -85,6 +87,7 @@
 1. 확장 프로그램 아이콘 클릭 → **설정** 탭
 2. **블로그 이름** 입력 (예: `your-blog-name` → `https://your-blog-name.tistory.com`)
 3. **발행 간격** 설정 (대량 발행 시 글 사이 대기 시간, 초)
+   - MV3 service worker가 idle 종료될 수 있으므로, 확장은 짧은 간격은 in-memory timer로 바로 이어가고 동시에 `chrome.alarms` fallback을 예약합니다. Chrome stable에서는 alarm wake-up이 최소 약 30초까지 늦어질 수 있으니, 5~10초 간격을 넣어도 worker가 잠들면 다음 항목은 다소 늦게 재개될 수 있습니다.
 4. **확장 프로그램 ID** 확인 (외부 API 연동 시 필요)
 
 ---
@@ -165,7 +168,9 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 1. **큐** 탭에서 JSON 대량 입력 영역에 데이터 입력
 2. 또는 **글쓰기** 탭에서 하나씩 **[큐에 추가]**
 3. **[시작]** 클릭 → 순차 발행
-4. CAPTCHA 발생 시 해당 항목이 ⚠️ 상태로 표시 → 해결 후 **[재개]** 클릭
+4. 각 글 사이에는 in-memory timer와 `chrome.alarms` fallback이 함께 예약되어, MV3 service worker가 쉬는 동안에도 다음 항목을 최대한 이어서 깨웁니다.
+5. service worker 재시작 중 이미 `processing`이던 항목은 duplicate publish를 피하려고 `worker_restarted_during_publish` 실패로 남기고, 남은 pending 항목만 이어서 처리합니다.
+6. CAPTCHA 발생 시 해당 항목이 ⚠️ 상태로 표시 → 해결 후 **[재개]** 클릭
 
 ### 3. 외부 API 연동
 
@@ -183,6 +188,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 - 구버전/디버그 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH` 분리 호출
 - 브라우저 시작 직후/오래된 티스토리 탭 사용 시: 먼저 `PREPARE_EDITOR`
 - `editor_not_ready` 발생 시: `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight`를 보고 `PREPARE_EDITOR` 재호출
+- 큐를 외부에서 모니터링할 때 `GET_QUEUE` 응답의 `queueRuntimeState.active` / `scheduledTimeMs`를 같이 보면, worker 재시작 뒤 자동 재개가 예정됐는지 바로 확인할 수 있습니다.
 
 ```javascript
 const EXTENSION_ID = "your-extension-id";
@@ -307,7 +313,8 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 │   └── api-page.html          # 외부 API 테스트 페이지
 ├── utils/
 │   ├── image-handler.js       # 이미지 유틸리티
-│   └── captcha-submit-recovery.js # frame submit 응답 누락 복구 유틸
+│   ├── captcha-submit-recovery.js # frame submit 응답 누락 복구 유틸
+│   └── queue-runtime.js       # MV3 queue wake-up / restart recovery 유틸
 ├── icons/                     # 확장 프로그램 아이콘
 └── docs/
     └── README.md              # 이 문서

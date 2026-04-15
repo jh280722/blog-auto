@@ -36,15 +36,29 @@ import {
   resolveCaptchaArtifactSourceUrl
 } from '../utils/captcha-artifacts.js';
 
+import {
+  buildQueueContinuationPlan,
+  decideQueueStartupAction,
+  normalizeLoadedQueueState,
+  QUEUE_CONTINUATION_ALARM
+} from '../utils/queue-runtime.js';
+
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
 let isProcessing = false;
 let currentTabId = null;
 let directPublishState = null;
+let queueRuntimeState = {
+  active: false,
+  scheduledTimeMs: null,
+  requestedDelayMs: null,
+  updatedAt: null
+};
 let runtimeStateLoaded = false;
 let runtimeStateLoadPromise = null;
 
 const DIRECT_PUBLISH_STATE_KEY = 'directPublishState';
+const QUEUE_RUNTIME_STATE_KEY = 'publishQueueRuntimeState';
 
 const EDITOR_PREPARE_DEFAULTS = {
   loadTimeoutMs: 15000,
@@ -98,13 +112,70 @@ async function saveQueueState() {
   });
 }
 
+async function persistQueueRuntimeState() {
+  await chrome.storage.local.set({
+    [QUEUE_RUNTIME_STATE_KEY]: queueRuntimeState
+  });
+}
+
+async function updateQueueRuntimeState(patch = {}) {
+  queueRuntimeState = {
+    ...queueRuntimeState,
+    ...patch,
+    updatedAt: new Date().toISOString()
+  };
+  await persistQueueRuntimeState();
+  return queueRuntimeState;
+}
+
+async function clearQueueContinuationAlarm() {
+  await chrome.alarms.clear(QUEUE_CONTINUATION_ALARM);
+}
+
+async function resetQueueRuntimeState() {
+  queueRuntimeState = {
+    active: false,
+    scheduledTimeMs: null,
+    requestedDelayMs: null,
+    updatedAt: new Date().toISOString()
+  };
+  await persistQueueRuntimeState();
+  await clearQueueContinuationAlarm();
+}
+
+async function scheduleQueueContinuation(intervalMs) {
+  const plan = buildQueueContinuationPlan({ intervalMs });
+  await chrome.alarms.create(plan.alarmName, { when: plan.scheduledTimeMs });
+  await updateQueueRuntimeState({
+    active: true,
+    scheduledTimeMs: plan.scheduledTimeMs,
+    requestedDelayMs: plan.requestedDelayMs
+  });
+  return plan;
+}
+
 /**
  * 큐 상태 로드
  */
 async function loadQueueState() {
   const result = await chrome.storage.local.get('publishQueue');
-  if (result.publishQueue) {
-    publishQueue = result.publishQueue;
+  const normalized = normalizeLoadedQueueState(result.publishQueue || []);
+  publishQueue = normalized.queue;
+  if (normalized.recoveredCount > 0) {
+    await saveQueueState();
+  }
+}
+
+async function loadQueueRuntimeState() {
+  const result = await chrome.storage.local.get(QUEUE_RUNTIME_STATE_KEY);
+  const stored = result[QUEUE_RUNTIME_STATE_KEY];
+  if (stored && typeof stored === 'object') {
+    queueRuntimeState = {
+      active: !!stored.active,
+      scheduledTimeMs: Number(stored.scheduledTimeMs) || null,
+      requestedDelayMs: Number(stored.requestedDelayMs) || null,
+      updatedAt: stored.updatedAt || null
+    };
   }
 }
 
@@ -117,8 +188,13 @@ async function ensureRuntimeStateLoaded() {
   if (runtimeStateLoaded) return;
 
   if (!runtimeStateLoadPromise) {
-    runtimeStateLoadPromise = Promise.all([loadQueueState(), loadDirectPublishState()])
-      .then(() => {
+    runtimeStateLoadPromise = Promise.all([
+      loadQueueState(),
+      loadQueueRuntimeState(),
+      loadDirectPublishState()
+    ])
+      .then(async () => {
+        await restoreQueueContinuationAfterStartup();
         runtimeStateLoaded = true;
       })
       .catch((error) => {
@@ -128,6 +204,46 @@ async function ensureRuntimeStateLoaded() {
   }
 
   await runtimeStateLoadPromise;
+}
+
+async function restoreQueueContinuationAfterStartup() {
+  const hasPendingItems = publishQueue.some((item) => item?.status === 'pending');
+  if (!hasPendingItems) {
+    if (queueRuntimeState?.active || queueRuntimeState?.scheduledTimeMs) {
+      await resetQueueRuntimeState();
+    } else {
+      await clearQueueContinuationAlarm();
+    }
+    return;
+  }
+
+  const startupAction = decideQueueStartupAction({
+    queue: publishQueue,
+    queueRuntimeState,
+    nowMs: Date.now()
+  });
+
+  if (startupAction.action === 'resume_now') {
+    await clearQueueContinuationAlarm();
+    await updateQueueRuntimeState({
+      active: true,
+      scheduledTimeMs: null,
+      requestedDelayMs: null
+    });
+    queueMicrotask(() => {
+      processNextInQueue().catch((error) => {
+        console.warn('[TistoryAuto BG] 큐 자동 재개 실패:', error);
+      });
+    });
+    return;
+  }
+
+  if (startupAction.action === 'recreate_alarm') {
+    await chrome.alarms.create(startupAction.alarmName, { when: startupAction.scheduledTimeMs });
+    return;
+  }
+
+  await clearQueueContinuationAlarm();
 }
 
 async function persistDirectPublishState() {
@@ -4852,15 +4968,26 @@ async function probeTabReady(tabId, diagnostics, step, options = {}) {
  * 큐에서 글 하나를 발행
  */
 async function processNextInQueue() {
-  if (isProcessing || publishQueue.length === 0) return;
+  if (isProcessing) return;
+  if (publishQueue.length === 0) {
+    await resetQueueRuntimeState();
+    return;
+  }
 
   const pendingIndex = publishQueue.findIndex(item => item.status === 'pending');
   if (pendingIndex === -1) {
     isProcessing = false;
+    await resetQueueRuntimeState();
     return;
   }
 
   isProcessing = true;
+  await clearQueueContinuationAlarm();
+  await updateQueueRuntimeState({
+    active: true,
+    scheduledTimeMs: null,
+    requestedDelayMs: null
+  });
   const item = publishQueue[pendingIndex];
   item.status = 'processing';
   await saveQueueState();
@@ -4914,6 +5041,7 @@ async function processNextInQueue() {
         console.warn('[TistoryAuto BG] CAPTCHA 감지 — 큐 일시정지 (captcha_paused). tabId:', currentTabId);
         await saveQueueState();
         isProcessing = false;
+        await resetQueueRuntimeState();
         return; // 다음 항목 처리하지 않음 (사용자가 Resume 해야 함)
       } else {
         item.status = 'failed';
@@ -4935,8 +5063,16 @@ async function processNextInQueue() {
   if (nextPending) {
     const settings = await chrome.storage.local.get('publishInterval');
     const intervalMs = ((settings.publishInterval || 5) * 1000);
-    setTimeout(() => processNextInQueue(), intervalMs);
+    const continuationPlan = await scheduleQueueContinuation(intervalMs);
+    setTimeout(() => {
+      processNextInQueue().catch((error) => {
+        console.warn('[TistoryAuto BG] 큐 in-memory continuation 실패:', error);
+      });
+    }, continuationPlan.inMemoryDelayMs);
+    return;
   }
+
+  await resetQueueRuntimeState();
 }
 
 /**
@@ -6059,17 +6195,27 @@ async function handleMessage(message, sender) {
 
     // 큐 처리 시작
     case 'START_QUEUE':
-      processNextInQueue();
+      await updateQueueRuntimeState({
+        active: true,
+        scheduledTimeMs: null,
+        requestedDelayMs: null
+      });
+      processNextInQueue().catch((error) => {
+        console.warn('[TistoryAuto BG] START_QUEUE 처리 실패:', error);
+      });
       return { success: true, message: '큐 처리를 시작합니다.' };
 
     // 큐 상태 조회
     case 'GET_QUEUE':
-      return { success: true, queue: publishQueue, isProcessing };
+      return { success: true, queue: publishQueue, isProcessing, queueRuntimeState };
 
     // 큐 항목 삭제
     case 'REMOVE_FROM_QUEUE': {
       publishQueue = publishQueue.filter(item => item.id !== message.data.id);
       await saveQueueState();
+      if (publishQueue.length === 0 || !publishQueue.some(item => item.status === 'pending')) {
+        await resetQueueRuntimeState();
+      }
       return { success: true };
     }
 
@@ -6077,6 +6223,7 @@ async function handleMessage(message, sender) {
     case 'CLEAR_QUEUE':
       publishQueue = [];
       await saveQueueState();
+      await resetQueueRuntimeState();
       return { success: true };
 
     // 설정 저장
@@ -6322,6 +6469,13 @@ async function handleMessage(message, sender) {
 
       // 발행 재시도 전 초안 상태를 다시 점검/복구
       item.status = 'processing';
+      isProcessing = true;
+      await clearQueueContinuationAlarm();
+      await updateQueueRuntimeState({
+        active: true,
+        scheduledTimeMs: null,
+        requestedDelayMs: null
+      });
       await saveQueueState();
 
       try {
@@ -6332,6 +6486,7 @@ async function handleMessage(message, sender) {
           item.publishStatus = draftRestore.status || 'draft_restore_failed';
           await saveQueueState();
           isProcessing = false;
+          await resetQueueRuntimeState();
           return draftRestore;
         }
 
@@ -6376,7 +6531,9 @@ async function handleMessage(message, sender) {
           await saveQueueState();
           isProcessing = false;
           // 다음 대기 항목 처리
-          processNextInQueue();
+          processNextInQueue().catch((error) => {
+            console.warn('[TistoryAuto BG] CAPTCHA 재개 후 다음 큐 처리 실패:', error);
+          });
           return { success: true, status: 'published', url: normalizedResponse.url };
         } else if (normalizedResponse.status === 'captcha_required') {
           item.status = 'captcha_paused';
@@ -6384,6 +6541,7 @@ async function handleMessage(message, sender) {
           item.captchaTabId = tabId;
           await saveQueueState();
           isProcessing = false;
+          await resetQueueRuntimeState();
           return normalizedResponse;
         } else {
           item.status = 'failed';
@@ -6391,6 +6549,7 @@ async function handleMessage(message, sender) {
           item.publishStatus = normalizedResponse.status;
           await saveQueueState();
           isProcessing = false;
+          await resetQueueRuntimeState();
           return normalizedResponse;
         }
       } catch (e) {
@@ -6398,6 +6557,7 @@ async function handleMessage(message, sender) {
         item.error = e.message;
         await saveQueueState();
         isProcessing = false;
+        await resetQueueRuntimeState();
         return { success: false, error: e.message };
       }
     }
@@ -6458,6 +6618,29 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     .catch(err => sendResponse({ success: false, error: err.message }));
 
   return true; // 비동기 응답
+});
+
+// ── 큐 continuation alarm ─────────────────────────────────
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== QUEUE_CONTINUATION_ALARM) return;
+
+  ensureRuntimeStateLoaded()
+    .then(async () => {
+      if (!queueRuntimeState?.active) {
+        await clearQueueContinuationAlarm();
+        return;
+      }
+
+      await updateQueueRuntimeState({
+        active: true,
+        scheduledTimeMs: null,
+        requestedDelayMs: null
+      });
+      await processNextInQueue();
+    })
+    .catch((error) => {
+      console.warn('[TistoryAuto BG] 큐 continuation alarm 처리 실패:', error);
+    });
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {

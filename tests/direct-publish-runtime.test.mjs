@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import {
   DIRECT_PUBLISH_CONTINUATION_ALARM,
   buildDirectPublishContinuationPlan,
-  decideDirectPublishStartupAction
+  decideDirectPublishStartupAction,
+  runTrackedWakeTask
 } from '../utils/direct-publish-runtime.js';
 
 test('buildDirectPublishContinuationPlan schedules MV3-safe rechecks before the final CAPTCHA wait deadline', () => {
@@ -142,4 +143,84 @@ test('decideDirectPublishStartupAction resumes immediately when the timeout dead
     remainingTimeoutMs: 0,
     tabId: 321
   });
+});
+
+test('runTrackedWakeTask keeps the wake in-flight until the async resume task settles', async () => {
+  let inFlight = false;
+  let resolveTask;
+  let taskCalls = 0;
+  const taskPromise = new Promise((resolve) => {
+    resolveTask = resolve;
+  });
+
+  const wakePromise = runTrackedWakeTask({
+    isInFlight: () => inFlight,
+    setInFlight: (next) => {
+      inFlight = next;
+    },
+    task: async () => {
+      taskCalls += 1;
+      return taskPromise;
+    }
+  });
+
+  let settled = false;
+  wakePromise.then(() => {
+    settled = true;
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(taskCalls, 1);
+  assert.equal(inFlight, true);
+  assert.equal(settled, false);
+
+  resolveTask('resumed');
+  const outcome = await wakePromise;
+
+  assert.deepEqual(outcome, {
+    started: true,
+    result: 'resumed'
+  });
+  assert.equal(inFlight, false);
+});
+
+test('runTrackedWakeTask skips duplicate wakeups while another resume is already running', async () => {
+  let taskCalls = 0;
+
+  const outcome = await runTrackedWakeTask({
+    isInFlight: () => true,
+    setInFlight: () => {
+      throw new Error('setInFlight should not run for duplicate wakeups');
+    },
+    task: async () => {
+      taskCalls += 1;
+      return 'unexpected';
+    }
+  });
+
+  assert.deepEqual(outcome, {
+    started: false,
+    skipped: true
+  });
+  assert.equal(taskCalls, 0);
+});
+
+test('runTrackedWakeTask clears the in-flight flag after a resume failure', async () => {
+  let inFlight = false;
+  const error = new Error('resume failed');
+
+  await assert.rejects(
+    runTrackedWakeTask({
+      isInFlight: () => inFlight,
+      setInFlight: (next) => {
+        inFlight = next;
+      },
+      task: async () => {
+        throw error;
+      }
+    }),
+    error
+  );
+
+  assert.equal(inFlight, false);
 });

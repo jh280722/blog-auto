@@ -2,8 +2,9 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.14 (2026-04-15 direct publish CAPTCHA wait durability patch 포함)**
+> 현재 운영 기준: **v1.8.15 (2026-04-18 tracked direct publish wake patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
+> - **direct publish continuation wake는 더 이상 detached microtask로 흘리지 않고, alarm/startup wake가 실제 `resumeDirectPublishFlow()` 완료까지 추적합니다.** 이제 same-tab browser handoff 대기 복구가 alarm 직후 조용히 멈추는 silent stall 가능성을 줄입니다.
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`도 direct publish runtime state + `chrome.alarms` wake-up을 storage에 남겨, MV3 service worker restart 뒤 same-tab CAPTCHA 대기/재개를 자동 복구**
 > - **browser/CDP 외부 풀이 뒤 `/manage/posts` 등 성공 URL로 이동하면 stale directPublishState 자동 정리**
@@ -186,7 +187,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 - v1.8.12부터는 `challengeText`를 못 읽은 회차도 `solveHints.answerMode = "vision_direct_answer"` + `submitField = "answer"`로 직접 정답 판독을 유도합니다. 이때 OCR 후보가 1개로 정리되고 길이 힌트까지 맞으면 서비스워커가 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`도 직접 답안으로 수용합니다.
 - 일반 DOM형 CAPTCHA면 OCR/비전으로 전체 후보 텍스트를 구한 뒤 **`INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`를 우선 사용**
 - OCR 후보가 여러 개면 `answerCandidates`가 순위대로 내려오고, `SUBMIT_CAPTCHA*`가 기본적으로 상위 3개 답안까지 같은 challenge에서 자동 재시도
-- `captcha_browser_handoff_required` 또는 `preferredSolveMode: "browser_handoff"`면 cross-origin iframe이므로 같은 탭에서 browser/CDP로 직접 풀이하고 **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`** 로 자동 재개 대기를 거는 것이 권장입니다. v1.8.14부터는 이 browser handoff 대기 자체도 `directPublishRuntimeState` + `chrome.alarms`로 영속화돼, MV3 service worker가 idle restart돼도 남은 timeout 범위 안에서 saved tab을 다시 잡고 same-tab 재개를 이어갑니다.
+- `captcha_browser_handoff_required` 또는 `preferredSolveMode: "browser_handoff"`면 cross-origin iframe이므로 같은 탭에서 browser/CDP로 직접 풀이하고 **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`** 로 자동 재개 대기를 거는 것이 권장입니다. v1.8.14부터는 이 browser handoff 대기 자체도 `directPublishRuntimeState` + `chrome.alarms`로 영속화돼, MV3 service worker가 idle restart돼도 남은 timeout 범위 안에서 saved tab을 다시 잡고 same-tab 재개를 이어갑니다. v1.8.15부터는 alarm/startup wake가 detached microtask가 아니라 실제 resume 호출 완료까지 추적되므로, wake 직후 continuation alarm만 지워지고 재개가 조용히 멈추는 silent stall 리스크도 함께 줄였습니다.
 - 구버전/디버그 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH` 분리 호출
 - 브라우저 시작 직후/오래된 티스토리 탭 사용 시: 먼저 `PREPARE_EDITOR`
 - `editor_not_ready` 발생 시: `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight`를 보고 `PREPARE_EDITOR` 재호출

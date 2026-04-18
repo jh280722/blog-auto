@@ -45,7 +45,8 @@ import {
 import {
   buildDirectPublishContinuationPlan,
   decideDirectPublishStartupAction,
-  DIRECT_PUBLISH_CONTINUATION_ALARM
+  DIRECT_PUBLISH_CONTINUATION_ALARM,
+  runTrackedWakeTask
 } from '../utils/direct-publish-runtime.js';
 
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
@@ -409,20 +410,30 @@ async function handleDirectPublishContinuationWakeup(source = 'startup') {
       try {
         const captchaCheck = await getBlockingCaptchaStateForTab(startupAction.tabId || directPublishState?.tabId);
         if (captchaCheck?.success && !captchaCheck.captchaPresent) {
-          queueMicrotask(async () => {
-            try {
-              await resumeDirectPublishFlow(directPublishState?.requestData || {}, {
-                preferredTabId: startupAction.tabId || directPublishState?.tabId || null,
-                waitForCaptcha: false,
-                pollIntervalMs: directPublishRuntimeState?.pollIntervalMs,
-                postClearDelayMs: directPublishRuntimeState?.postClearDelayMs,
-                autoWakeSource: source
-              });
-            } catch (error) {
-              console.warn('[TistoryAuto BG] expired direct publish wait 후 즉시 재개 실패:', error);
+          const wakeOutcome = await runTrackedWakeTask({
+            isInFlight: () => isDirectPublishRuntimeWakeInFlight,
+            setInFlight: (next) => {
+              isDirectPublishRuntimeWakeInFlight = !!next;
+            },
+            task: async () => {
+              try {
+                await resumeDirectPublishFlow(directPublishState?.requestData || {}, {
+                  preferredTabId: startupAction.tabId || directPublishState?.tabId || null,
+                  waitForCaptcha: false,
+                  pollIntervalMs: directPublishRuntimeState?.pollIntervalMs,
+                  postClearDelayMs: directPublishRuntimeState?.postClearDelayMs,
+                  autoWakeSource: source
+                });
+              } catch (error) {
+                console.warn('[TistoryAuto BG] expired direct publish wait 후 즉시 재개 실패:', error);
+              } finally {
+                await resetDirectPublishRuntimeState();
+              }
             }
           });
-          await resetDirectPublishRuntimeState();
+          if (!wakeOutcome?.started) {
+            return;
+          }
           return;
         }
       } catch (error) {
@@ -483,51 +494,58 @@ async function handleDirectPublishContinuationWakeup(source = 'startup') {
       nextCheckTimeMs: null
     });
 
-    queueMicrotask(async () => {
-      try {
-        const resumeResponse = await resumeDirectPublishFlow(directPublishState?.requestData || {}, {
-          preferredTabId: startupAction.tabId || directPublishState?.tabId || null,
-          waitForCaptcha: true,
-          waitTimeoutMs: startupAction.remainingTimeoutMs,
-          pollIntervalMs: directPublishRuntimeState?.pollIntervalMs,
-          postClearDelayMs: directPublishRuntimeState?.postClearDelayMs,
-          autoWakeSource: source
-        });
+    await runTrackedWakeTask({
+      isInFlight: () => isDirectPublishRuntimeWakeInFlight,
+      setInFlight: (next) => {
+        isDirectPublishRuntimeWakeInFlight = !!next;
+      },
+      task: async () => {
+        try {
+          const resumeResponse = await resumeDirectPublishFlow(directPublishState?.requestData || {}, {
+            preferredTabId: startupAction.tabId || directPublishState?.tabId || null,
+            waitForCaptcha: true,
+            waitTimeoutMs: startupAction.remainingTimeoutMs,
+            pollIntervalMs: directPublishRuntimeState?.pollIntervalMs,
+            postClearDelayMs: directPublishRuntimeState?.postClearDelayMs,
+            autoWakeSource: source
+          });
 
-        if (!resumeResponse?.success) {
+          if (!resumeResponse?.success) {
+            if (directPublishState?.status === 'waiting_browser_handoff') {
+              await updateDirectPublishState({
+                status: resumeResponse?.status === 'captcha_required' ? 'captcha_required' : 'editor_not_ready',
+                lastCaptchaWait: {
+                  ...(directPublishState?.lastCaptchaWait || {}),
+                  enabled: true,
+                  success: false,
+                  status: resumeResponse?.status || 'editor_not_ready',
+                  error: resumeResponse?.error || null,
+                  completedAt: new Date().toISOString()
+                }
+              });
+            }
+            await resetDirectPublishRuntimeState();
+          }
+
+          return resumeResponse;
+        } catch (error) {
+          console.warn('[TistoryAuto BG] direct publish 자동 재개 실패:', error);
           if (directPublishState?.status === 'waiting_browser_handoff') {
             await updateDirectPublishState({
-              status: resumeResponse?.status === 'captcha_required' ? 'captcha_required' : 'editor_not_ready',
+              status: 'captcha_required',
               lastCaptchaWait: {
                 ...(directPublishState?.lastCaptchaWait || {}),
                 enabled: true,
                 success: false,
-                status: resumeResponse?.status || 'editor_not_ready',
-                error: resumeResponse?.error || null,
+                status: 'editor_not_ready',
+                error: error.message,
                 completedAt: new Date().toISOString()
               }
             });
+            await resetDirectPublishRuntimeState();
           }
-          await resetDirectPublishRuntimeState();
+          return null;
         }
-      } catch (error) {
-        console.warn('[TistoryAuto BG] direct publish 자동 재개 실패:', error);
-        if (directPublishState?.status === 'waiting_browser_handoff') {
-          await updateDirectPublishState({
-            status: 'captcha_required',
-            lastCaptchaWait: {
-              ...(directPublishState?.lastCaptchaWait || {}),
-              enabled: true,
-              success: false,
-              status: 'editor_not_ready',
-              error: error.message,
-              completedAt: new Date().toISOString()
-            }
-          });
-          await resetDirectPublishRuntimeState();
-        }
-      } finally {
-        isDirectPublishRuntimeWakeInFlight = false;
       }
     });
     return;

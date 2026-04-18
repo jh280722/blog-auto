@@ -93,3 +93,30 @@ export function decideDirectPublishStartupAction({
     tabId: runtimeTabId
   };
 }
+
+export async function runTrackedWakeTask({
+  isInFlight = () => false,
+  setInFlight = () => {},
+  task
+} = {}) {
+  if (typeof task !== 'function') {
+    throw new TypeError('runTrackedWakeTask requires a task function');
+  }
+
+  if (isInFlight()) {
+    return {
+      started: false,
+      skipped: true
+    };
+  }
+
+  setInFlight(true);
+  try {
+    return {
+      started: true,
+      result: await task()
+    };
+  } finally {
+    setInFlight(false);
+  }
+}

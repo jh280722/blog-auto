@@ -2,8 +2,9 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.15 (2026-04-18 tracked direct publish wake patch 포함)**
+> 현재 운영 기준: **v1.8.16 (2026-04-18 inline source-image handoff patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
+> - **`captcha_required` / `captcha_browser_handoff_required` / `GET_CAPTCHA_ARTIFACTS` handoff는 이제 기본적으로 `artifacts.sourceImage`까지 함께 채워, 크론/에이전트가 추가 왕복 없이 원본 CAPTCHA 이미지를 바로 OCR/비전에 넘길 수 있습니다. 명시적으로 `includeSourceImage: false`일 때만 opt-out 하며, 원본 fetch는 Tistory/Kakao 계열 CAPTCHA 이미지 origin만 허용합니다.**
 > - **direct publish continuation wake는 더 이상 detached microtask로 흘리지 않고, alarm/startup wake가 실제 `resumeDirectPublishFlow()` 완료까지 추적합니다.** 이제 same-tab browser handoff 대기 복구가 alarm 직후 조용히 멈추는 silent stall 가능성을 줄입니다.
 > - **직접 발행 CAPTCHA state 보존 + saved tab 우선 resume**
 > - **`RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`도 direct publish runtime state + `chrome.alarms` wake-up을 storage에 남겨, MV3 service worker restart 뒤 same-tab CAPTCHA 대기/재개를 자동 복구**
@@ -57,6 +58,7 @@
 - **resume blocking 판정 개선**: `RESUME_DIRECT_PUBLISH(waitForCaptcha)`와 queue resume은 top DOM iframe 껍데기만 보지 않고 merged frame context 기준으로 실제 blocking CAPTCHA만 기다림
 - **CAPTCHA artifact API**: 에이전트가 같은 blocked tab에서 main DOM/iframe 양쪽 CAPTCHA 이미지를 직접 받아 OCR/비전 입력으로 넘길 수 있음
 - **직접 응답 handoff**: `WRITE_POST` / `RESUME_DIRECT_PUBLISH` / `SUBMIT_CAPTCHA*`가 CAPTCHA로 막히면 응답에 `captchaArtifacts`를 같이 붙여 크론이 추가 왕복 없이 바로 OCR/비전으로 넘어갈 수 있음
+- **inline source-image handoff 기본화**: 기본 handoff와 `GET_CAPTCHA_ARTIFACTS`는 `sourceImage`를 함께 채워, `frameDirectImage`가 있어도 원본 CAPTCHA 이미지를 우선 사용할 수 있음 (`includeSourceImage: false`로만 opt-out)
 - **CAPTCHA challenge extraction**: context/artifact 응답에 빈칸 문제 문구(`challengeText`)와 칸 수(`challengeSlotCount`)를 포함해 OCR 결과를 답안으로 줄이기 쉬움
 - **CAPTCHA solve hints**: `solveHints.prompt`, `answerMode`, `submitField`, `targetEntity`, `nextAction`을 함께 반환해 masked CAPTCHA는 `ocrTexts` 기반 추론, instruction/map CAPTCHA는 `answer` 직접 제출이 기본이지만, 여러 OCR 후보만 있어도 target entity 기준으로 `ocrTexts` fallback 추론까지 연결 가능
 - **challenge-missing fallback hints**: `challengeText`를 끝내 못 읽는 회차도 `solveHints.answerMode = "vision_direct_answer"` + `submitField = "answer"`를 내려 크론이 same-tab 비전 풀이를 계속할 수 있음
@@ -183,6 +185,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 - 실제 발행: `visibility: "public"`
 - 테스트 발행: `visibility: "private"`
 - DKAPTCHA 발생 시: 먼저 응답의 `captchaArtifacts`와 `solveHints`를 확인하고, 필요하면 `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_ARTIFACTS`로 blocked tab과 캡차 이미지를 다시 확보합니다. `GET_DIRECT_PUBLISH_STATE` 응답에는 `directPublishRuntimeState`도 함께 내려오므로, service worker restart 뒤 same-tab CAPTCHA wait가 다시 이어질 예정인지 바로 확인할 수 있습니다.
+- 기본 handoff와 `GET_CAPTCHA_ARTIFACTS`는 이제 `artifacts.sourceImage`를 함께 반환하므로, cross-origin frame export가 살아 있어 `frameDirectImage`가 있어도 원본 CAPTCHA 이미지를 우선 OCR/비전에 넘길 수 있습니다. 더 가벼운 응답이 필요할 때만 `includeSourceImage: false`로 opt-out 하세요.
 - `solveHints.prompt`는 그대로 OCR/비전 프롬프트로 사용합니다. masked challenge면 **`ocrTexts` 기반 추론**, instruction/map challenge면 **`answer` 직접 제출**이 기본이지만, 비전이 여러 후보를 줄바꿈으로 돌려준 경우에도 **`ocrTexts` fallback**으로 target entity 기준 자동 선택을 시도할 수 있습니다.
 - v1.8.12부터는 `challengeText`를 못 읽은 회차도 `solveHints.answerMode = "vision_direct_answer"` + `submitField = "answer"`로 직접 정답 판독을 유도합니다. 이때 OCR 후보가 1개로 정리되고 길이 힌트까지 맞으면 서비스워커가 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`도 직접 답안으로 수용합니다.
 - 일반 DOM형 CAPTCHA면 OCR/비전으로 전체 후보 텍스트를 구한 뒤 **`INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`를 우선 사용**

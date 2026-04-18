@@ -33,7 +33,9 @@ import { hasActionableCaptchaAnswerPath } from '../utils/captcha-submit-capabili
 import {
   choosePreferredCaptchaArtifactKey,
   fetchCaptchaSourceImageArtifact,
-  resolveCaptchaArtifactSourceUrl
+  normalizeCaptchaArtifactCaptureOptions,
+  resolveCaptchaArtifactSourceUrl,
+  shouldFetchCaptchaSourceImage
 } from '../utils/captcha-artifacts.js';
 
 import {
@@ -4951,6 +4953,8 @@ async function captureCaptchaViewportCrop(tab, captureContext, options = {}) {
 }
 
 async function getCaptchaArtifactsForTab(tabId, options = {}) {
+  const normalizedOptions = normalizeCaptchaArtifactCaptureOptions(options);
+
   if (!tabId) {
     return {
       success: false,
@@ -4985,7 +4989,7 @@ async function getCaptchaArtifactsForTab(tabId, options = {}) {
   const directImageResult = await getCaptchaImageArtifactForTab(tabId);
   const viewportCropResult = await captureCaptchaViewportCrop(tab, captureContext, options);
   const frameArtifactResult = (captureContext?.iframeCaptchaPresent || !directImageResult.success)
-    ? await getCrossFrameCaptchaArtifactForTab(tabId, options)
+    ? await getCrossFrameCaptchaArtifactForTab(tabId, normalizedOptions)
     : null;
   const artifacts = {};
   const captureErrors = [];
@@ -5033,7 +5037,10 @@ async function getCaptchaArtifactsForTab(tabId, options = {}) {
     selectedCandidate,
     directImageResult
   });
-  const shouldFetchSourceImage = !!sourceImageUrl && (!artifacts.frameDirectImage || !!options.includeSourceImage);
+  const shouldFetchSourceImage = shouldFetchCaptchaSourceImage({
+    sourceImageUrl,
+    includeSourceImage: normalizedOptions.includeSourceImage
+  });
 
   if (shouldFetchSourceImage) {
     const sourceImageResult = await fetchCaptchaSourceImageArtifact(sourceImageUrl, {
@@ -5112,10 +5119,10 @@ async function captureCaptchaHandoffForTab(tabId, options = {}) {
   }
 
   const captchaContextResult = await getCaptchaContextForTab(tabId);
-  const captchaArtifacts = await getCaptchaArtifactsForTab(tabId, {
-    includeSourceImage: false,
-    ...(options.artifactOptions || {})
-  });
+  const captchaArtifacts = await getCaptchaArtifactsForTab(
+    tabId,
+    normalizeCaptchaArtifactCaptureOptions(options.artifactOptions || {})
+  );
   const captchaContext = captchaContextResult.success
     ? captchaContextResult.captchaContext
     : (captchaArtifacts.captureContext || captchaContextResult);

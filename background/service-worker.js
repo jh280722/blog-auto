@@ -45,6 +45,11 @@ import {
   QUEUE_CONTINUATION_ALARM
 } from '../utils/queue-runtime.js';
 import {
+  findQueueCaptchaItem,
+  getQueueCaptchaSelectionFailure,
+  summarizeQueueCaptchaSelection
+} from '../utils/queue-captcha.js';
+import {
   buildDirectPublishContinuationPlan,
   decideDirectPublishStartupAction,
   DIRECT_PUBLISH_CONTINUATION_ALARM,
@@ -173,6 +178,37 @@ async function scheduleQueueContinuation(intervalMs) {
     requestedDelayMs: plan.requestedDelayMs
   });
   return plan;
+}
+
+async function scheduleNextPendingQueueItem() {
+  const nextPending = publishQueue.find((item) => item.status === 'pending');
+  if (!nextPending) {
+    await resetQueueRuntimeState();
+    return {
+      scheduled: false,
+      nextItemId: null,
+      intervalMs: null,
+      continuationPlan: null
+    };
+  }
+
+  const settings = await chrome.storage.local.get('publishInterval');
+  const intervalSeconds = Number(settings.publishInterval);
+  const intervalMs = (Number.isFinite(intervalSeconds) ? Math.max(0, intervalSeconds) : 5) * 1000;
+  const continuationPlan = await scheduleQueueContinuation(intervalMs);
+
+  setTimeout(() => {
+    processNextInQueue().catch((error) => {
+      console.warn('[TistoryAuto BG] 큐 in-memory continuation 실패:', error);
+    });
+  }, continuationPlan.inMemoryDelayMs);
+
+  return {
+    scheduled: true,
+    nextItemId: nextPending.id || null,
+    intervalMs,
+    continuationPlan
+  };
 }
 
 async function persistDirectPublishRuntimeState() {
@@ -5391,7 +5427,7 @@ async function processNextInQueue() {
       } else if (responseWithPreparation.status === 'captcha_required') {
         // CAPTCHA 감지 — 실패가 아닌 일시정지 상태로 보존 (에디터 내용 유지됨)
         item.status = 'captcha_paused';
-        item.error = 'CAPTCHA 감지 — 브라우저에서 해결 후 Resume 클릭';
+        item.error = 'CAPTCHA 감지 — 같은 탭에서 solve 후 재개';
         item.publishStatus = 'captcha_required';
         item.captchaTabId = currentTabId; // 에디터가 살아있는 탭 ID 보존
         item.diagnostics = responseWithPreparation.diagnostics;
@@ -5415,21 +5451,141 @@ async function processNextInQueue() {
   await saveQueueState();
   isProcessing = false;
 
-  // 다음 항목 처리 (사용자 설정 간격 사용)
-  const nextPending = publishQueue.find(i => i.status === 'pending');
-  if (nextPending) {
-    const settings = await chrome.storage.local.get('publishInterval');
-    const intervalMs = ((settings.publishInterval || 5) * 1000);
-    const continuationPlan = await scheduleQueueContinuation(intervalMs);
-    setTimeout(() => {
-      processNextInQueue().catch((error) => {
-        console.warn('[TistoryAuto BG] 큐 in-memory continuation 실패:', error);
-      });
-    }, continuationPlan.inMemoryDelayMs);
-    return;
+  await scheduleNextPendingQueueItem();
+}
+
+async function resumeQueueItemAfterCaptcha(item, options = {}) {
+  const tabId = options.tabId || item?.captchaTabId || currentTabId;
+  if (!tabId) {
+    return { success: false, error: '에디터 탭을 찾을 수 없음. 페이지를 새로 열어주세요.', status: 'editor_not_ready' };
   }
 
-  await resetQueueRuntimeState();
+  const resumeDiagnostics = {
+    requestedBlogName: item?.data?.blogName || null,
+    blogName: item?.data?.blogName || null,
+    currentTabId,
+    candidateCount: 1,
+    attempts: []
+  };
+
+  const resumeProbe = await probeTabReady(tabId, resumeDiagnostics, 'probe_resume_tab');
+  if (!resumeProbe.success) {
+    return {
+      success: false,
+      error: '에디터 탭이 닫혔거나 새로고침됨. RETRY로 처음부터 다시 시도하세요.',
+      status: 'editor_not_ready',
+      tabId,
+      diagnostics: resumeDiagnostics
+    };
+  }
+
+  try {
+    const captchaCheck = await getBlockingCaptchaStateForTab(tabId);
+    if (captchaCheck?.captchaPresent) {
+      return { success: false, error: 'CAPTCHA가 아직 표시되어 있습니다. 먼저 해결해주세요.', status: 'captcha_required' };
+    }
+  } catch (_error) {
+    // 확인 실패 시 발행 시도는 계속 진행
+  }
+
+  item.status = 'processing';
+  isProcessing = true;
+  await clearQueueContinuationAlarm();
+  await updateQueueRuntimeState({
+    active: true,
+    scheduledTimeMs: null,
+    requestedDelayMs: null
+  });
+  await saveQueueState();
+
+  try {
+    const draftRestore = await restoreDraftIfNeeded(tabId, item.data || {});
+    if (!draftRestore.success) {
+      item.status = 'failed';
+      item.error = draftRestore.error || '발행 재개 전 초안 복구 실패';
+      item.publishStatus = draftRestore.status || 'draft_restore_failed';
+      await saveQueueState();
+      isProcessing = false;
+      await resetQueueRuntimeState();
+      return draftRestore;
+    }
+
+    let normalizedResponse;
+    try {
+      const response = await sendEditorMessage(tabId, 'RESUME_PUBLISH', {
+        visibility: item.data?.visibility || 'public'
+      });
+      normalizedResponse = normalizePublishResponse(response);
+    } catch (error) {
+      resumeDiagnostics.attempts.push({
+        step: 'resume_after_captcha_catch_recovery',
+        tabId,
+        originalError: error?.message || String(error),
+        at: new Date().toISOString()
+      });
+
+      const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(makePreparationResponse({
+        success: true,
+        status: 'editor_ready',
+        tabId,
+        url: null,
+        blogName: item.data?.blogName || null,
+        diagnostics: resumeDiagnostics
+      }), item.data || {}, {
+        blogName: item.data?.blogName || null
+      });
+
+      if (!recoveredResponse) {
+        throw error;
+      }
+
+      normalizedResponse = normalizePublishResponse(recoveredResponse);
+    }
+
+    if (normalizedResponse.success) {
+      item.status = 'completed';
+      item.error = null;
+      item.completedAt = new Date().toISOString();
+      item.publishStatus = normalizedResponse.status || 'published';
+      item.captchaTabId = null;
+      await saveQueueState();
+      isProcessing = false;
+      const queueContinuation = await scheduleNextPendingQueueItem();
+      return {
+        success: true,
+        status: normalizedResponse.status || 'published',
+        url: normalizedResponse.url || null,
+        queueContinuation
+      };
+    }
+
+    if (normalizedResponse.status === 'captcha_required') {
+      item.status = 'captcha_paused';
+      item.error = 'CAPTCHA 재발생 — 같은 탭에서 다시 해결 후 재개';
+      item.publishStatus = 'captcha_required';
+      item.captchaTabId = tabId;
+      item.diagnostics = normalizedResponse.diagnostics || item.diagnostics || null;
+      await saveQueueState();
+      isProcessing = false;
+      await resetQueueRuntimeState();
+      return normalizedResponse;
+    }
+
+    item.status = 'failed';
+    item.error = normalizedResponse.error || '재개 후 발행 실패';
+    item.publishStatus = normalizedResponse.status;
+    await saveQueueState();
+    isProcessing = false;
+    await resetQueueRuntimeState();
+    return normalizedResponse;
+  } catch (error) {
+    item.status = 'failed';
+    item.error = error.message;
+    await saveQueueState();
+    isProcessing = false;
+    await resetQueueRuntimeState();
+    return { success: false, error: error.message };
+  }
 }
 
 /**
@@ -6711,9 +6867,41 @@ async function handleMessage(message, sender) {
     }
 
     case 'SUBMIT_CAPTCHA_AND_RESUME': {
+      const explicitItemId = typeof message.data?.id === 'string' ? message.data.id.trim() : '';
       const explicitTabId = message.data?.tabId || null;
       const savedState = explicitTabId ? null : await getLiveDirectPublishState({ includeCaptchaContext: true });
-      const tabId = explicitTabId || savedState?.tabId || currentTabId;
+      const queueSelection = summarizeQueueCaptchaSelection(publishQueue, {
+        itemId: explicitItemId || null,
+        tabId: explicitTabId
+      });
+      const shouldResolveQueueByDefault = !explicitItemId && !explicitTabId && !savedState;
+      const queueCaptchaItem = (explicitItemId || explicitTabId || shouldResolveQueueByDefault)
+        ? findQueueCaptchaItem(publishQueue, {
+            itemId: explicitItemId || null,
+            tabId: explicitTabId
+          })
+        : null;
+      const queueSelectionFailure = getQueueCaptchaSelectionFailure({
+        queue: publishQueue,
+        itemId: explicitItemId || null,
+        tabId: explicitTabId,
+        matchedItem: queueCaptchaItem,
+        directPublishTabId: savedState?.tabId || directPublishState?.tabId || null
+      });
+      if (queueSelectionFailure) {
+        return {
+          success: false,
+          status: queueSelectionFailure.status,
+          error: queueSelectionFailure.error,
+          resumed: false,
+          submitResult: null,
+          resumeResult: null,
+          queueItemId: null,
+          queueSelection,
+          directPublish: savedState?.tabId ? { ...directPublishState } : null
+        };
+      }
+      const tabId = queueCaptchaItem?.captchaTabId || explicitTabId || savedState?.tabId || currentTabId;
       const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, savedState);
       if (!answerResolution.success) {
         return {
@@ -6722,6 +6910,8 @@ async function handleMessage(message, sender) {
           resumed: false,
           submitResult: null,
           resumeResult: null,
+          queueItemId: queueCaptchaItem?.id || null,
+          queueSelection,
           directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
         };
       }
@@ -6734,6 +6924,13 @@ async function handleMessage(message, sender) {
 
       if (!submitResult.success || captchaStillAppears) {
         const handoff = await captureCaptchaHandoffForTab(tabId);
+        if (queueCaptchaItem) {
+          queueCaptchaItem.status = 'captcha_paused';
+          queueCaptchaItem.error = 'CAPTCHA가 아직 표시되어 있습니다. 같은 탭에서 다시 해결 후 재개하세요.';
+          queueCaptchaItem.publishStatus = 'captcha_required';
+          queueCaptchaItem.captchaTabId = tabId;
+          await saveQueueState();
+        }
         if (directPublishState?.tabId === tabId) {
           await updateDirectPublishState({
             url: handoff.captchaContext?.url || directPublishState?.url || null,
@@ -6748,6 +6945,8 @@ async function handleMessage(message, sender) {
           resumed: false,
           submitResult,
           resumeResult: null,
+          queueItemId: queueCaptchaItem?.id || null,
+          queueSelection,
           directPublish: directPublishState?.tabId === tabId ? { ...directPublishState } : null
         }, handoff);
       }
@@ -6755,6 +6954,30 @@ async function handleMessage(message, sender) {
       const submitCompletedByNavigation = submitResult?.status === 'captcha_submit_tab_navigated'
         || looksLikeDirectPublishCompletionUrl(submitResult?.url || '');
       if (submitCompletedByNavigation) {
+        if (queueCaptchaItem) {
+          queueCaptchaItem.status = 'completed';
+          queueCaptchaItem.error = null;
+          queueCaptchaItem.completedAt = new Date().toISOString();
+          queueCaptchaItem.publishStatus = submitResult.status || 'captcha_submit_tab_navigated';
+          queueCaptchaItem.captchaTabId = null;
+          await saveQueueState();
+          const queueContinuation = await scheduleNextPendingQueueItem();
+          return {
+            ...submitResult,
+            success: true,
+            status: submitResult.status || 'captcha_submit_tab_navigated',
+            url: submitResult.url || null,
+            resumed: false,
+            completedDuringSubmit: true,
+            submitResult,
+            resumeResult: null,
+            queueItemId: queueCaptchaItem.id,
+            queueSelection,
+            queueContinuation,
+            directPublish: null
+          };
+        }
+
         if (directPublishState?.tabId === tabId) {
           await clearDirectPublishState();
         }
@@ -6768,6 +6991,21 @@ async function handleMessage(message, sender) {
           completedDuringSubmit: true,
           submitResult,
           resumeResult: null,
+          queueItemId: null,
+          queueSelection,
+          directPublish: null
+        };
+      }
+
+      if (queueCaptchaItem) {
+        const resumeResult = await resumeQueueItemAfterCaptcha(queueCaptchaItem, { tabId });
+        return {
+          ...resumeResult,
+          resumed: !!resumeResult?.success,
+          submitResult,
+          resumeResult,
+          queueItemId: queueCaptchaItem.id,
+          queueSelection,
           directPublish: null
         };
       }
@@ -6784,143 +7022,46 @@ async function handleMessage(message, sender) {
         ...resumeResult,
         resumed: true,
         submitResult,
-        resumeResult
+        resumeResult,
+        queueItemId: null,
+        queueSelection
       };
     }
 
     // CAPTCHA 해결 후 발행 재개 (큐 항목)
     case 'RESUME_AFTER_CAPTCHA': {
-      const itemId = message.data?.id;
-      const item = publishQueue.find(i => i.id === itemId && i.status === 'captcha_paused');
-      if (!item) {
-        return { success: false, error: '재개할 captcha_paused 항목을 찾을 수 없음', status: 'item_not_found' };
-      }
-
-      const tabId = item.captchaTabId || currentTabId;
-      if (!tabId) {
-        return { success: false, error: '에디터 탭을 찾을 수 없음. 페이지를 새로 열어주세요.', status: 'editor_not_ready' };
-      }
-
-      const resumeDiagnostics = {
-        requestedBlogName: item.data?.blogName || null,
-        blogName: item.data?.blogName || null,
-        currentTabId,
-        candidateCount: 1,
-        attempts: []
-      };
-
-      const resumeProbe = await probeTabReady(tabId, resumeDiagnostics, 'probe_resume_tab');
-      if (!resumeProbe.success) {
+      const queueSelection = summarizeQueueCaptchaSelection(publishQueue, {
+        itemId: message.data?.id || null,
+        tabId: message.data?.tabId || null
+      });
+      const item = findQueueCaptchaItem(publishQueue, {
+        itemId: message.data?.id || null,
+        tabId: message.data?.tabId || null
+      });
+      const queueSelectionFailure = getQueueCaptchaSelectionFailure({
+        queue: publishQueue,
+        itemId: message.data?.id || null,
+        tabId: message.data?.tabId || null,
+        matchedItem: item,
+        directPublishTabId: null
+      });
+      if (queueSelectionFailure) {
         return {
           success: false,
-          error: '에디터 탭이 닫혔거나 새로고침됨. RETRY로 처음부터 다시 시도하세요.',
-          status: 'editor_not_ready',
-          tabId,
-          diagnostics: resumeDiagnostics
+          error: queueSelectionFailure.error,
+          status: queueSelectionFailure.status,
+          queueSelection
         };
       }
 
-      // CAPTCHA가 아직 표시되어 있는지 확인
-      try {
-        const captchaCheck = await getBlockingCaptchaStateForTab(tabId);
-        if (captchaCheck?.captchaPresent) {
-          return { success: false, error: 'CAPTCHA가 아직 표시되어 있습니다. 먼저 해결해주세요.', status: 'captcha_required' };
-        }
-      } catch (e) { /* 확인 실패 시 발행 시도 진행 */ }
-
-      // 발행 재시도 전 초안 상태를 다시 점검/복구
-      item.status = 'processing';
-      isProcessing = true;
-      await clearQueueContinuationAlarm();
-      await updateQueueRuntimeState({
-        active: true,
-        scheduledTimeMs: null,
-        requestedDelayMs: null
+      const resumeResult = await resumeQueueItemAfterCaptcha(item, {
+        tabId: message.data?.tabId || item.captchaTabId || currentTabId
       });
-      await saveQueueState();
-
-      try {
-        const draftRestore = await restoreDraftIfNeeded(tabId, item.data || {});
-        if (!draftRestore.success) {
-          item.status = 'failed';
-          item.error = draftRestore.error || '발행 재개 전 초안 복구 실패';
-          item.publishStatus = draftRestore.status || 'draft_restore_failed';
-          await saveQueueState();
-          isProcessing = false;
-          await resetQueueRuntimeState();
-          return draftRestore;
-        }
-
-        let normalizedResponse;
-        try {
-          const response = await sendEditorMessage(tabId, 'RESUME_PUBLISH', {
-            visibility: item.data?.visibility || 'public'
-          });
-          normalizedResponse = normalizePublishResponse(response);
-        } catch (e) {
-          resumeDiagnostics.attempts.push({
-            step: 'resume_after_captcha_catch_recovery',
-            tabId,
-            originalError: e?.message || String(e),
-            at: new Date().toISOString()
-          });
-
-          const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(makePreparationResponse({
-            success: true,
-            status: 'editor_ready',
-            tabId,
-            url: null,
-            blogName: item.data?.blogName || null,
-            diagnostics: resumeDiagnostics
-          }), item.data || {}, {
-            blogName: item.data?.blogName || null
-          });
-
-          if (!recoveredResponse) {
-            throw e;
-          }
-
-          normalizedResponse = normalizePublishResponse(recoveredResponse);
-        }
-
-        if (normalizedResponse.success) {
-          item.status = 'completed';
-          item.error = null;
-          item.completedAt = new Date().toISOString();
-          item.publishStatus = normalizedResponse.status || 'published';
-          item.captchaTabId = null;
-          await saveQueueState();
-          isProcessing = false;
-          // 다음 대기 항목 처리
-          processNextInQueue().catch((error) => {
-            console.warn('[TistoryAuto BG] CAPTCHA 재개 후 다음 큐 처리 실패:', error);
-          });
-          return { success: true, status: 'published', url: normalizedResponse.url };
-        } else if (normalizedResponse.status === 'captcha_required') {
-          item.status = 'captcha_paused';
-          item.error = 'CAPTCHA 재발생 — 다시 해결 후 Resume 클릭';
-          item.captchaTabId = tabId;
-          await saveQueueState();
-          isProcessing = false;
-          await resetQueueRuntimeState();
-          return normalizedResponse;
-        } else {
-          item.status = 'failed';
-          item.error = normalizedResponse.error || '재개 후 발행 실패';
-          item.publishStatus = normalizedResponse.status;
-          await saveQueueState();
-          isProcessing = false;
-          await resetQueueRuntimeState();
-          return normalizedResponse;
-        }
-      } catch (e) {
-        item.status = 'failed';
-        item.error = e.message;
-        await saveQueueState();
-        isProcessing = false;
-        await resetQueueRuntimeState();
-        return { success: false, error: e.message };
-      }
+      return {
+        ...resumeResult,
+        queueItemId: item.id,
+        queueSelection
+      };
     }
 
     // 실패/일시정지 항목 처음부터 재시도

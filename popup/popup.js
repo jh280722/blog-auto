@@ -139,7 +139,7 @@
         hideCaptchaAlert();
         clearForm();
       } else if (result.status === 'captcha_required') {
-        showToast('CAPTCHA 감지 — 브라우저에서 해결 후 재개 클릭', 'error');
+        showToast('CAPTCHA 감지 — 같은 탭에서 solve 후 재개', 'error');
         setStatus('CAPTCHA 대기 중', 'error');
         showCaptchaAlert(); // 재개 버튼 배너 표시
       } else {

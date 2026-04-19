@@ -45,6 +45,7 @@ import {
   QUEUE_CONTINUATION_ALARM
 } from '../utils/queue-runtime.js';
 import {
+  decideQueueCaptchaResumeProbeAction,
   findQueueCaptchaItem,
   getQueueCaptchaSelectionFailure,
   summarizeQueueCaptchaSelection
@@ -5430,6 +5431,7 @@ async function processNextInQueue() {
         item.error = 'CAPTCHA 감지 — 같은 탭에서 solve 후 재개';
         item.publishStatus = 'captcha_required';
         item.captchaTabId = currentTabId; // 에디터가 살아있는 탭 ID 보존
+        item.captchaStage = responseWithPreparation.captchaStage || null;
         item.diagnostics = responseWithPreparation.diagnostics;
         console.warn('[TistoryAuto BG] CAPTCHA 감지 — 큐 일시정지 (captcha_paused). tabId:', currentTabId);
         await saveQueueState();
@@ -5469,10 +5471,44 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
   };
 
   const resumeProbe = await probeTabReady(tabId, resumeDiagnostics, 'probe_resume_tab');
-  if (!resumeProbe.success) {
+  const resumeAction = decideQueueCaptchaResumeProbeAction({
+    probeResult: resumeProbe,
+    captchaStage: item?.captchaStage || null
+  });
+  if (resumeAction.action === 'editor_not_ready') {
     return {
       success: false,
       error: '에디터 탭이 닫혔거나 새로고침됨. RETRY로 처음부터 다시 시도하세요.',
+      status: 'editor_not_ready',
+      tabId,
+      diagnostics: resumeDiagnostics
+    };
+  }
+  if (resumeAction.action === 'captcha_required') {
+    return {
+      success: false,
+      error: resumeAction.error || 'CAPTCHA가 아직 표시되어 있습니다. 먼저 해결해주세요.',
+      status: 'captcha_required',
+      tabId,
+      diagnostics: resumeDiagnostics
+    };
+  }
+
+  let resumePreparation = null;
+  try {
+    const resumeTab = await chrome.tabs.get(tabId);
+    currentTabId = tabId;
+    resumePreparation = makePreparationResponse({
+      success: true,
+      status: resumeAction.status || 'editor_ready',
+      tab: resumeTab,
+      blogName: item?.data?.blogName || getTabBlogName(resumeTab.url) || null,
+      diagnostics: resumeDiagnostics
+    });
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message || '에디터 탭이 닫혔거나 새로고침됨. RETRY로 처음부터 다시 시도하세요.',
       status: 'editor_not_ready',
       tabId,
       diagnostics: resumeDiagnostics
@@ -5498,12 +5534,72 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
   });
   await saveQueueState();
 
+  const handleQueueResumeResponse = async (normalizedResponse) => {
+    if (normalizedResponse.success) {
+      item.status = 'completed';
+      item.error = null;
+      item.completedAt = new Date().toISOString();
+      item.publishStatus = normalizedResponse.status || 'published';
+      item.captchaTabId = null;
+      item.captchaStage = null;
+      await saveQueueState();
+      isProcessing = false;
+      const queueContinuation = await scheduleNextPendingQueueItem();
+      return {
+        success: true,
+        status: normalizedResponse.status || 'published',
+        url: normalizedResponse.url || null,
+        queueContinuation
+      };
+    }
+
+    if (normalizedResponse.status === 'captcha_required') {
+      item.status = 'captcha_paused';
+      item.error = 'CAPTCHA 재발생 — 같은 탭에서 다시 해결 후 재개';
+      item.publishStatus = 'captcha_required';
+      item.captchaTabId = tabId;
+      item.captchaStage = normalizedResponse.captchaStage || item.captchaStage || null;
+      item.diagnostics = normalizedResponse.diagnostics || item.diagnostics || null;
+      await saveQueueState();
+      isProcessing = false;
+      await resetQueueRuntimeState();
+      return normalizedResponse;
+    }
+
+    item.status = 'failed';
+    item.error = normalizedResponse.error || '재개 후 발행 실패';
+    item.publishStatus = normalizedResponse.status;
+    item.captchaStage = null;
+    await saveQueueState();
+    isProcessing = false;
+    await resetQueueRuntimeState();
+    return normalizedResponse;
+  };
+
   try {
+    if (resumeAction.action === 'wait_for_post_captcha_settle') {
+      const postCaptchaSettle = await waitForPostCaptchaCompletionOrResume(resumePreparation, item.data || {});
+      if (postCaptchaSettle.completed && postCaptchaSettle.response) {
+        return handleQueueResumeResponse(normalizePublishResponse(postCaptchaSettle.response));
+      }
+      if (!postCaptchaSettle.success) {
+        return handleQueueResumeResponse(normalizePublishResponse({
+          success: false,
+          error: postCaptchaSettle.error || 'CAPTCHA가 다시 표시되어 자동 재개를 중단합니다.',
+          status: postCaptchaSettle.status || 'captcha_required',
+          tabId,
+          diagnostics: resumeDiagnostics,
+          captchaStage: item?.captchaStage || null
+        }));
+      }
+    }
+
     const draftRestore = await restoreDraftIfNeeded(tabId, item.data || {});
     if (!draftRestore.success) {
       item.status = 'failed';
       item.error = draftRestore.error || '발행 재개 전 초안 복구 실패';
       item.publishStatus = draftRestore.status || 'draft_restore_failed';
+      item.captchaStage = null;
       await saveQueueState();
       isProcessing = false;
       await resetQueueRuntimeState();
@@ -5524,14 +5620,10 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
         at: new Date().toISOString()
       });
 
-      const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(makePreparationResponse({
-        success: true,
-        status: 'editor_ready',
-        tabId,
-        url: null,
-        blogName: item.data?.blogName || null,
-        diagnostics: resumeDiagnostics
-      }), item.data || {}, {
+      const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure({
+        ...resumePreparation,
+        status: resumeAction.status || resumePreparation?.status || 'editor_ready'
+      }, item.data || {}, {
         blogName: item.data?.blogName || null
       });
 
@@ -5542,45 +5634,11 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
       normalizedResponse = normalizePublishResponse(recoveredResponse);
     }
 
-    if (normalizedResponse.success) {
-      item.status = 'completed';
-      item.error = null;
-      item.completedAt = new Date().toISOString();
-      item.publishStatus = normalizedResponse.status || 'published';
-      item.captchaTabId = null;
-      await saveQueueState();
-      isProcessing = false;
-      const queueContinuation = await scheduleNextPendingQueueItem();
-      return {
-        success: true,
-        status: normalizedResponse.status || 'published',
-        url: normalizedResponse.url || null,
-        queueContinuation
-      };
-    }
-
-    if (normalizedResponse.status === 'captcha_required') {
-      item.status = 'captcha_paused';
-      item.error = 'CAPTCHA 재발생 — 같은 탭에서 다시 해결 후 재개';
-      item.publishStatus = 'captcha_required';
-      item.captchaTabId = tabId;
-      item.diagnostics = normalizedResponse.diagnostics || item.diagnostics || null;
-      await saveQueueState();
-      isProcessing = false;
-      await resetQueueRuntimeState();
-      return normalizedResponse;
-    }
-
-    item.status = 'failed';
-    item.error = normalizedResponse.error || '재개 후 발행 실패';
-    item.publishStatus = normalizedResponse.status;
-    await saveQueueState();
-    isProcessing = false;
-    await resetQueueRuntimeState();
-    return normalizedResponse;
+    return handleQueueResumeResponse(normalizedResponse);
   } catch (error) {
     item.status = 'failed';
     item.error = error.message;
+    item.captchaStage = null;
     await saveQueueState();
     isProcessing = false;
     await resetQueueRuntimeState();
@@ -6960,6 +7018,7 @@ async function handleMessage(message, sender) {
           queueCaptchaItem.completedAt = new Date().toISOString();
           queueCaptchaItem.publishStatus = submitResult.status || 'captcha_submit_tab_navigated';
           queueCaptchaItem.captchaTabId = null;
+          queueCaptchaItem.captchaStage = null;
           await saveQueueState();
           const queueContinuation = await scheduleNextPendingQueueItem();
           return {
@@ -7072,6 +7131,7 @@ async function handleMessage(message, sender) {
       item.status = 'pending';
       item.error = null;
       item.captchaTabId = null;
+      item.captchaStage = null;
       item.completedAt = null;
       item.publishStatus = null;
       await saveQueueState();

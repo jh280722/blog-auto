@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  decideQueueCaptchaResumeProbeAction,
   findQueueCaptchaItem,
   getQueueCaptchaSelectionFailure,
   summarizeQueueCaptchaSelection
@@ -184,5 +185,95 @@ test('getQueueCaptchaSelectionFailure requires a selector when multiple paused q
       pausedItemIds: ['paused-a', 'paused-b'],
       pausedTabIds: [101, 202]
     }
+  });
+});
+
+test('decideQueueCaptchaResumeProbeAction waits for post-submit settle when the publish layer stays open after final confirm', () => {
+  const action = decideQueueCaptchaResumeProbeAction({
+    probeResult: {
+      success: false,
+      reason: 'publish_layer_open',
+      error: '발행 레이어가 열린 상태라 새 쓰기를 시작할 수 없습니다.'
+    },
+    captchaStage: 'after_final_confirm'
+  });
+
+  assert.deepEqual(action, {
+    action: 'wait_for_post_captcha_settle',
+    status: 'resume_post_captcha_settle',
+    reason: 'publish_layer_open',
+    error: '발행 레이어가 열린 상태라 새 쓰기를 시작할 수 없습니다.'
+  });
+});
+
+test('decideQueueCaptchaResumeProbeAction allows same-tab resume when the publish layer stays open before final confirm', () => {
+  const action = decideQueueCaptchaResumeProbeAction({
+    probeResult: {
+      success: false,
+      reason: 'publish_layer_open',
+      error: '발행 레이어가 열린 상태라 새 쓰기를 시작할 수 없습니다.'
+    },
+    captchaStage: 'after_open_publish_layer'
+  });
+
+  assert.deepEqual(action, {
+    action: 'resume_publish_layer_open',
+    status: 'resume_publish_layer_open',
+    reason: 'publish_layer_open',
+    error: '발행 레이어가 열린 상태라 새 쓰기를 시작할 수 없습니다.'
+  });
+});
+
+test('decideQueueCaptchaResumeProbeAction stays conservative when publish layer state has no trusted captcha stage', () => {
+  const action = decideQueueCaptchaResumeProbeAction({
+    probeResult: {
+      success: false,
+      reason: 'publish_layer_open',
+      error: '발행 레이어가 열린 상태라 새 쓰기를 시작할 수 없습니다.'
+    },
+    captchaStage: null
+  });
+
+  assert.deepEqual(action, {
+    action: 'wait_for_post_captcha_settle',
+    status: 'resume_post_captcha_settle',
+    reason: 'publish_layer_open',
+    error: '발행 레이어가 열린 상태라 새 쓰기를 시작할 수 없습니다.'
+  });
+});
+
+test('decideQueueCaptchaResumeProbeAction keeps explicit captcha blockers as captcha_required', () => {
+  const action = decideQueueCaptchaResumeProbeAction({
+    probeResult: {
+      success: false,
+      reason: 'captcha_present',
+      error: '현재 탭에 CAPTCHA가 떠 있어 새 쓰기를 시작할 수 없습니다.'
+    },
+    captchaStage: 'after_final_confirm'
+  });
+
+  assert.deepEqual(action, {
+    action: 'captcha_required',
+    status: 'captcha_required',
+    reason: 'captcha_present',
+    error: '현재 탭에 CAPTCHA가 떠 있어 새 쓰기를 시작할 수 없습니다.'
+  });
+});
+
+test('decideQueueCaptchaResumeProbeAction fail-closes non-resumable editor readiness misses', () => {
+  const action = decideQueueCaptchaResumeProbeAction({
+    probeResult: {
+      success: false,
+      reason: 'editor_body_missing',
+      error: '에디터 본문 영역을 아직 찾지 못했습니다.'
+    },
+    captchaStage: 'after_open_publish_layer'
+  });
+
+  assert.deepEqual(action, {
+    action: 'editor_not_ready',
+    status: 'editor_not_ready',
+    reason: 'editor_body_missing',
+    error: '에디터 본문 영역을 아직 찾지 못했습니다.'
   });
 });

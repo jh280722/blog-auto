@@ -3,10 +3,65 @@ function normalizePositiveInteger(value) {
   return Number.isInteger(normalized) && normalized > 0 ? normalized : null;
 }
 
+function normalizeCaptchaStage(value) {
+  return typeof value === 'string' && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+function isResumePublishLayerStage(stage) {
+  return stage === 'before_publish' || stage === 'after_open_publish_layer';
+}
+
 function isProvidedSelector(value) {
   if (value === null || value === undefined) return false;
   if (typeof value === 'string') return value.trim().length > 0;
   return true;
+}
+
+export function decideQueueCaptchaResumeProbeAction({ probeResult = null, captchaStage = null } = {}) {
+  if (probeResult?.success) {
+    return {
+      action: 'resume_now',
+      status: 'editor_ready',
+      reason: null,
+      error: null
+    };
+  }
+
+  const reason = probeResult?.reason || null;
+  const error = probeResult?.error || null;
+  const normalizedStage = normalizeCaptchaStage(captchaStage);
+
+  if (reason === 'captcha_present') {
+    return {
+      action: 'captcha_required',
+      status: 'captcha_required',
+      reason,
+      error
+    };
+  }
+
+  if (reason === 'publish_layer_open') {
+    const shouldResumePublishLayer = isResumePublishLayerStage(normalizedStage);
+    return {
+      action: shouldResumePublishLayer
+        ? 'resume_publish_layer_open'
+        : 'wait_for_post_captcha_settle',
+      status: shouldResumePublishLayer
+        ? 'resume_publish_layer_open'
+        : 'resume_post_captcha_settle',
+      reason,
+      error
+    };
+  }
+
+  return {
+    action: 'editor_not_ready',
+    status: 'editor_not_ready',
+    reason,
+    error
+  };
 }
 
 export function findQueueCaptchaItem(queue = [], { itemId = null, tabId = null } = {}) {

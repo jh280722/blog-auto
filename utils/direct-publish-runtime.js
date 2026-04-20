@@ -1,4 +1,6 @@
-import { MV3_MIN_ALARM_DELAY_MS } from './queue-runtime.js';
+import { MV3_MIN_ALARM_DELAY_MS, runTrackedWakeTask } from './queue-runtime.js';
+
+export { runTrackedWakeTask } from './queue-runtime.js';
 
 export const DIRECT_PUBLISH_CONTINUATION_ALARM = 'direct-publish-continuation';
 const WAITING_DIRECT_PUBLISH_STATUSES = new Set(['waiting_browser_handoff']);
@@ -92,31 +94,4 @@ export function decideDirectPublishStartupAction({
     scheduledTimeMs: nextCheckTimeMs,
     tabId: runtimeTabId
   };
-}
-
-export async function runTrackedWakeTask({
-  isInFlight = () => false,
-  setInFlight = () => {},
-  task
-} = {}) {
-  if (typeof task !== 'function') {
-    throw new TypeError('runTrackedWakeTask requires a task function');
-  }
-
-  if (isInFlight()) {
-    return {
-      started: false,
-      skipped: true
-    };
-  }
-
-  setInFlight(true);
-  try {
-    return {
-      started: true,
-      result: await task()
-    };
-  } finally {
-    setInFlight(false);
-  }
 }

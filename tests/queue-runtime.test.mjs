@@ -6,7 +6,8 @@ import {
   QUEUE_CONTINUATION_ALARM,
   buildQueueContinuationPlan,
   decideQueueStartupAction,
-  normalizeLoadedQueueState
+  normalizeLoadedQueueState,
+  runTrackedWakeTask
 } from '../utils/queue-runtime.js';
 
 test('normalizeLoadedQueueState fail-closes in-flight items after a service worker restart', () => {
@@ -161,4 +162,84 @@ test('decideQueueStartupAction stays idle when the queue was never explicitly st
   });
 
   assert.deepEqual(action, { action: 'none' });
+});
+
+test('runTrackedWakeTask keeps queue wake work in-flight until the async task settles', async () => {
+  let inFlight = false;
+  let resolveTask;
+  let taskCalls = 0;
+  const taskPromise = new Promise((resolve) => {
+    resolveTask = resolve;
+  });
+
+  const wakePromise = runTrackedWakeTask({
+    isInFlight: () => inFlight,
+    setInFlight: (next) => {
+      inFlight = next;
+    },
+    task: async () => {
+      taskCalls += 1;
+      return taskPromise;
+    }
+  });
+
+  let settled = false;
+  wakePromise.then(() => {
+    settled = true;
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(taskCalls, 1);
+  assert.equal(inFlight, true);
+  assert.equal(settled, false);
+
+  resolveTask('queued');
+  const outcome = await wakePromise;
+
+  assert.deepEqual(outcome, {
+    started: true,
+    result: 'queued'
+  });
+  assert.equal(inFlight, false);
+});
+
+test('runTrackedWakeTask skips duplicate queue wakeups while another wake is running', async () => {
+  let taskCalls = 0;
+
+  const outcome = await runTrackedWakeTask({
+    isInFlight: () => true,
+    setInFlight: () => {
+      throw new Error('setInFlight should not run for duplicate wakeups');
+    },
+    task: async () => {
+      taskCalls += 1;
+      return 'unexpected';
+    }
+  });
+
+  assert.deepEqual(outcome, {
+    started: false,
+    skipped: true
+  });
+  assert.equal(taskCalls, 0);
+});
+
+test('runTrackedWakeTask clears the queue wake in-flight flag after a failure', async () => {
+  let inFlight = false;
+  const error = new Error('queue wake failed');
+
+  await assert.rejects(
+    runTrackedWakeTask({
+      isInFlight: () => inFlight,
+      setInFlight: (next) => {
+        inFlight = next;
+      },
+      task: async () => {
+        throw error;
+      }
+    }),
+    error
+  );
+
+  assert.equal(inFlight, false);
 });

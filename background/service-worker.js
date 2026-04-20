@@ -42,7 +42,9 @@ import {
   buildQueueContinuationPlan,
   decideQueueStartupAction,
   normalizeLoadedQueueState,
-  QUEUE_CONTINUATION_ALARM
+  QUEUE_CONTINUATION_ALARM,
+  MV3_MIN_ALARM_DELAY_MS,
+  runTrackedWakeTask
 } from '../utils/queue-runtime.js';
 import {
   buildQueueCaptchaPauseState,
@@ -55,8 +57,7 @@ import {
 import {
   buildDirectPublishContinuationPlan,
   decideDirectPublishStartupAction,
-  DIRECT_PUBLISH_CONTINUATION_ALARM,
-  runTrackedWakeTask
+  DIRECT_PUBLISH_CONTINUATION_ALARM
 } from '../utils/direct-publish-runtime.js';
 
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
@@ -81,6 +82,7 @@ let queueRuntimeState = {
   updatedAt: null
 };
 let isDirectPublishRuntimeWakeInFlight = false;
+let isQueueRuntimeWakeInFlight = false;
 let isDirectPublishCaptchaWaitInProgress = false;
 let runtimeStateLoaded = false;
 let runtimeStateLoadPromise = null;
@@ -211,6 +213,51 @@ async function scheduleNextPendingQueueItem() {
     nextItemId: nextPending.id || null,
     intervalMs,
     continuationPlan
+  };
+}
+
+async function wakeQueueProcessing(source = 'runtime') {
+  const wakeOutcome = await runTrackedWakeTask({
+    isInFlight: () => isQueueRuntimeWakeInFlight,
+    setInFlight: (next) => {
+      isQueueRuntimeWakeInFlight = !!next;
+    },
+    task: async () => {
+      await clearQueueContinuationAlarm();
+      await updateQueueRuntimeState({
+        active: true,
+        scheduledTimeMs: null,
+        requestedDelayMs: null
+      });
+      return processNextInQueue();
+    }
+  });
+
+  if (!wakeOutcome?.started && wakeOutcome?.skipped) {
+    console.log(`[TistoryAuto BG] queue wake skipped (${source}) — another wake is already running.`);
+  }
+
+  return wakeOutcome;
+}
+
+async function scheduleImmediateQueueWake(source = 'runtime') {
+  const fallbackScheduledTimeMs = Date.now() + MV3_MIN_ALARM_DELAY_MS;
+  await chrome.alarms.create(QUEUE_CONTINUATION_ALARM, { when: fallbackScheduledTimeMs });
+  await updateQueueRuntimeState({
+    active: true,
+    scheduledTimeMs: fallbackScheduledTimeMs,
+    requestedDelayMs: 0
+  });
+
+  setTimeout(() => {
+    wakeQueueProcessing(source).catch((error) => {
+      console.warn(`[TistoryAuto BG] queue immediate wake 실패 (${source}):`, error);
+    });
+  }, 0);
+
+  return {
+    scheduled: true,
+    scheduledTimeMs: fallbackScheduledTimeMs
   };
 }
 
@@ -369,17 +416,7 @@ async function restoreQueueContinuationAfterStartup() {
   });
 
   if (startupAction.action === 'resume_now') {
-    await clearQueueContinuationAlarm();
-    await updateQueueRuntimeState({
-      active: true,
-      scheduledTimeMs: null,
-      requestedDelayMs: null
-    });
-    queueMicrotask(() => {
-      processNextInQueue().catch((error) => {
-        console.warn('[TistoryAuto BG] 큐 자동 재개 실패:', error);
-      });
-    });
+    await scheduleImmediateQueueWake('startup');
     return;
   }
 
@@ -6772,16 +6809,16 @@ async function handleMessage(message, sender) {
     }
 
     // 큐 처리 시작
-    case 'START_QUEUE':
-      await updateQueueRuntimeState({
-        active: true,
-        scheduledTimeMs: null,
-        requestedDelayMs: null
-      });
-      processNextInQueue().catch((error) => {
-        console.warn('[TistoryAuto BG] START_QUEUE 처리 실패:', error);
-      });
-      return { success: true, message: '큐 처리를 시작합니다.' };
+    case 'START_QUEUE': {
+      await scheduleImmediateQueueWake('start_queue');
+      return {
+        success: true,
+        message: '큐 처리를 시작합니다.',
+        wakeStarted: false,
+        wakeSkipped: false,
+        wakeScheduled: true
+      };
+    }
 
     // 큐 상태 조회
     case 'GET_QUEUE':
@@ -7202,12 +7239,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
           return;
         }
 
-        await updateQueueRuntimeState({
-          active: true,
-          scheduledTimeMs: null,
-          requestedDelayMs: null
-        });
-        await processNextInQueue();
+        await wakeQueueProcessing('alarm');
         return;
       }
 

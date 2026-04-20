@@ -2,8 +2,9 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.19 (2026-04-20 queue CAPTCHA metadata refresh patch 포함)**
+> 현재 운영 기준: **v1.8.20 (2026-04-20 queue wake tracking patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
+> - **v1.8.20부터 queue continuation wake도 `START_QUEUE` / startup recovery / `chrome.alarms` 분기 모두 tracked wake helper를 공유해, MV3 service worker restart 직후 queue resume이 detached microtask/fire-and-forget로 흘러 continuation alarm만 지워지고 실제 `processNextInQueue()`가 조용히 멈추는 silent stall 가능성을 줄입니다. 중복 wake는 skip하고, in-flight 플래그는 성공/실패 모두에서 정리됩니다.**
 > - **큐의 `captcha_paused` 항목은 이제 최초 pause, same-tab 재개 중 `captcha_required` 재발생, `SUBMIT_CAPTCHA_AND_RESUME` 재시도까지 모두 최신 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult` / `lastCheckedAt` 메타데이터를 함께 갱신합니다. 따라서 크론/에이전트는 `GET_QUEUE`만 읽어도 대상 `id` / `captchaTabId`뿐 아니라 어떤 프롬프트·solve mode·아티팩트 preference로 다시 풀어야 하는지 바로 파악할 수 있고, stale queue CAPTCHA 힌트 때문에 잘못된 재개 분기로 가는 일을 줄입니다. 완료/재시도 시에는 이 transient 메타데이터를 자동으로 비웁니다.**
 > - **큐의 `captcha_paused` 항목도 이제 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })`로 same-tab CAPTCHA 제출 뒤 해당 큐 항목 재개까지 바로 이어집니다. direct publish state가 없고 `captcha_paused` 항목이 하나뿐이면 자동 선택하고, 여러 개면 fail-closed로 `id` 또는 `tabId`를 요구합니다. queue resume 성공 뒤 다음 pending 항목도 기존 publish interval을 다시 존중합니다.**
 > - **v1.8.18부터는 queue CAPTCHA 재개도 `publish_layer_open`을 무조건 `editor_not_ready`로 끊지 않습니다. CAPTCHA가 최종 발행 직후 걸렸던 회차(`after_final_confirm`)는 먼저 post-submit settle/navigation을 짧게 확인하고, 발행 레이어가 열린 채 남은 회차는 같은 탭 `RESUME_PUBLISH`로 이어서 false `editor_not_ready`를 줄입니다.**
@@ -51,7 +52,7 @@
 - **팝업 UI**: 확장 프로그램 아이콘 클릭 → 직접 글 작성/발행
 - **이미지 삽입**: 로컬 파일, 드래그앤드롭, URL 모두 지원
 - **대량 발행 큐**: JSON으로 여러 글을 한번에 등록, 순차 발행
-- **MV3 queue durability**: `START_QUEUE` 이후에는 in-memory timer + `chrome.alarms` wake-up을 함께 유지하고, `GET_QUEUE`가 `queueRuntimeState`뿐 아니라 `captcha_paused` 항목의 최신 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult` 메타데이터도 함께 보존해 service worker restart/idle shutdown 이후 자동 재개 여부와 same-tab CAPTCHA 재개 힌트를 같이 추적할 수 있음
+- **MV3 queue durability**: `START_QUEUE` 이후에는 in-memory timer + `chrome.alarms` wake-up을 함께 유지하고, queue continuation wake 자체도 tracked helper로 묶어 startup recovery / alarm / explicit start가 모두 같은 in-flight 가드를 공유합니다. 따라서 `GET_QUEUE`는 `queueRuntimeState`뿐 아니라 `captcha_paused` 항목의 최신 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult` 메타데이터도 함께 보존해 service worker restart/idle shutdown 이후 자동 재개 여부와 same-tab CAPTCHA 재개 힌트를 같이 추적할 수 있음
 - **direct publish wait durability**: `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`가 `directPublishRuntimeState`를 storage에 남기고, service worker restart 뒤에도 saved blocked tab의 same-tab CAPTCHA 대기/재개를 alarm 기반으로 다시 이어감 (`GET_DIRECT_PUBLISH_STATE` 응답에도 runtime state 포함)
 - **외부 API**: `externally_connectable`로 외부 도구에서 데이터 전송 가능
 - **직접 발행 상태 추적**: `captcha_required` 시 blocked tab / blog / visibility / diagnostics / requestData와 `publishTrace` / `stage`를 저장
@@ -183,8 +184,9 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 2. 또는 **글쓰기** 탭에서 하나씩 **[큐에 추가]**
 3. **[시작]** 클릭 → 순차 발행
 4. 각 글 사이에는 in-memory timer와 `chrome.alarms` fallback이 함께 예약되어, MV3 service worker가 쉬는 동안에도 다음 항목을 최대한 이어서 깨웁니다.
-5. service worker 재시작 중 이미 `processing`이던 항목은 duplicate publish를 피하려고 `worker_restarted_during_publish` 실패로 남기고, 남은 pending 항목만 이어서 처리합니다.
-6. CAPTCHA 발생 시 해당 항목이 ⚠️ 상태로 표시 → same-tab solve 뒤 **[재개]** 클릭하거나, 외부 크론/에이전트는 `GET_QUEUE`로 `id` / `captchaTabId`와 최신 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 확인한 뒤 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })`를 호출해 해당 항목만 바로 재개
+5. `START_QUEUE` / startup recovery / alarm wake는 같은 tracked helper를 공유하므로, worker restart 직후 queue resume이 detached microtask/fire-and-forget로 끝나 continuation alarm만 사라지는 silent stall 리스크를 줄입니다.
+6. service worker 재시작 중 이미 `processing`이던 항목은 duplicate publish를 피하려고 `worker_restarted_during_publish` 실패로 남기고, 남은 pending 항목만 이어서 처리합니다.
+7. CAPTCHA 발생 시 해당 항목이 ⚠️ 상태로 표시 → same-tab solve 뒤 **[재개]** 클릭하거나, 외부 크론/에이전트는 `GET_QUEUE`로 `id` / `captchaTabId`와 최신 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 확인한 뒤 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })`를 호출해 해당 항목만 바로 재개
 
 ### 3. 외부 API 연동
 
@@ -348,7 +350,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 
 ---
 
-## 발행 상태 코드 (v1.8.19)
+## 발행 상태 코드 (v1.8.20)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 

@@ -9,6 +9,18 @@ function normalizeDelayMs(intervalMs) {
   return Math.max(0, Math.round(numeric));
 }
 
+function clearRecoveredQueueCaptchaState() {
+  return {
+    captchaTabId: null,
+    captchaStage: null,
+    captchaContext: null,
+    solveHints: null,
+    lastCaptchaArtifactCapture: null,
+    lastCaptchaSubmitResult: null,
+    lastCheckedAt: null
+  };
+}
+
 export function normalizeLoadedQueueState(queue = [], { recoveredAt = new Date().toISOString() } = {}) {
   const source = Array.isArray(queue) ? queue : [];
   let recoveredCount = 0;
@@ -24,6 +36,7 @@ export function normalizeLoadedQueueState(queue = [], { recoveredAt = new Date()
     recoveredCount += 1;
     return {
       ...item,
+      ...clearRecoveredQueueCaptchaState(),
       status: 'failed',
       publishStatus: 'worker_restarted_during_publish',
       error: 'Manifest V3 service worker restarted while this queue item was publishing. Verify whether Tistory already saved it before retrying.',

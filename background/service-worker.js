@@ -45,6 +45,8 @@ import {
   QUEUE_CONTINUATION_ALARM
 } from '../utils/queue-runtime.js';
 import {
+  buildQueueCaptchaPauseState,
+  clearQueueCaptchaPauseState,
   decideQueueCaptchaResumeProbeAction,
   findQueueCaptchaItem,
   getQueueCaptchaSelectionFailure,
@@ -5427,12 +5429,14 @@ async function processNextInQueue() {
         item.publishStatus = responseWithPreparation.status || 'published';
       } else if (responseWithPreparation.status === 'captcha_required') {
         // CAPTCHA 감지 — 실패가 아닌 일시정지 상태로 보존 (에디터 내용 유지됨)
-        item.status = 'captcha_paused';
-        item.error = 'CAPTCHA 감지 — 같은 탭에서 solve 후 재개';
-        item.publishStatus = 'captcha_required';
-        item.captchaTabId = currentTabId; // 에디터가 살아있는 탭 ID 보존
-        item.captchaStage = responseWithPreparation.captchaStage || null;
-        item.diagnostics = responseWithPreparation.diagnostics;
+        const handoff = await captureCaptchaHandoffForTab(currentTabId);
+        Object.assign(item, buildQueueCaptchaPauseState({
+          existingItem: item,
+          tabId: currentTabId,
+          response: responseWithPreparation,
+          handoff,
+          error: 'CAPTCHA 감지 — 같은 탭에서 solve 후 재개'
+        }));
         console.warn('[TistoryAuto BG] CAPTCHA 감지 — 큐 일시정지 (captcha_paused). tabId:', currentTabId);
         await saveQueueState();
         isProcessing = false;
@@ -5524,6 +5528,8 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
     // 확인 실패 시 발행 시도는 계속 진행
   }
 
+  const previousQueueCaptchaSnapshot = cloneJsonValue(item) || { ...item };
+  Object.assign(item, clearQueueCaptchaPauseState());
   item.status = 'processing';
   isProcessing = true;
   await clearQueueContinuationAlarm();
@@ -5540,8 +5546,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
       item.error = null;
       item.completedAt = new Date().toISOString();
       item.publishStatus = normalizedResponse.status || 'published';
-      item.captchaTabId = null;
-      item.captchaStage = null;
+      Object.assign(item, clearQueueCaptchaPauseState());
       await saveQueueState();
       isProcessing = false;
       const queueContinuation = await scheduleNextPendingQueueItem();
@@ -5554,12 +5559,14 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
     }
 
     if (normalizedResponse.status === 'captcha_required') {
-      item.status = 'captcha_paused';
-      item.error = 'CAPTCHA 재발생 — 같은 탭에서 다시 해결 후 재개';
-      item.publishStatus = 'captcha_required';
-      item.captchaTabId = tabId;
-      item.captchaStage = normalizedResponse.captchaStage || item.captchaStage || null;
-      item.diagnostics = normalizedResponse.diagnostics || item.diagnostics || null;
+      const handoff = await captureCaptchaHandoffForTab(tabId);
+      Object.assign(item, buildQueueCaptchaPauseState({
+        existingItem: previousQueueCaptchaSnapshot,
+        tabId,
+        response: normalizedResponse,
+        handoff,
+        error: 'CAPTCHA 재발생 — 같은 탭에서 다시 해결 후 재개'
+      }));
       await saveQueueState();
       isProcessing = false;
       await resetQueueRuntimeState();
@@ -5569,7 +5576,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
     item.status = 'failed';
     item.error = normalizedResponse.error || '재개 후 발행 실패';
     item.publishStatus = normalizedResponse.status;
-    item.captchaStage = null;
+    Object.assign(item, clearQueueCaptchaPauseState());
     await saveQueueState();
     isProcessing = false;
     await resetQueueRuntimeState();
@@ -5599,7 +5606,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
       item.status = 'failed';
       item.error = draftRestore.error || '발행 재개 전 초안 복구 실패';
       item.publishStatus = draftRestore.status || 'draft_restore_failed';
-      item.captchaStage = null;
+      Object.assign(item, clearQueueCaptchaPauseState());
       await saveQueueState();
       isProcessing = false;
       await resetQueueRuntimeState();
@@ -5638,7 +5645,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
   } catch (error) {
     item.status = 'failed';
     item.error = error.message;
-    item.captchaStage = null;
+    Object.assign(item, clearQueueCaptchaPauseState());
     await saveQueueState();
     isProcessing = false;
     await resetQueueRuntimeState();
@@ -6983,10 +6990,13 @@ async function handleMessage(message, sender) {
       if (!submitResult.success || captchaStillAppears) {
         const handoff = await captureCaptchaHandoffForTab(tabId);
         if (queueCaptchaItem) {
-          queueCaptchaItem.status = 'captcha_paused';
-          queueCaptchaItem.error = 'CAPTCHA가 아직 표시되어 있습니다. 같은 탭에서 다시 해결 후 재개하세요.';
-          queueCaptchaItem.publishStatus = 'captcha_required';
-          queueCaptchaItem.captchaTabId = tabId;
+          Object.assign(queueCaptchaItem, buildQueueCaptchaPauseState({
+            existingItem: queueCaptchaItem,
+            tabId,
+            handoff,
+            submitResult,
+            error: 'CAPTCHA가 아직 표시되어 있습니다. 같은 탭에서 다시 해결 후 재개하세요.'
+          }));
           await saveQueueState();
         }
         if (directPublishState?.tabId === tabId) {
@@ -7017,8 +7027,7 @@ async function handleMessage(message, sender) {
           queueCaptchaItem.error = null;
           queueCaptchaItem.completedAt = new Date().toISOString();
           queueCaptchaItem.publishStatus = submitResult.status || 'captcha_submit_tab_navigated';
-          queueCaptchaItem.captchaTabId = null;
-          queueCaptchaItem.captchaStage = null;
+          Object.assign(queueCaptchaItem, clearQueueCaptchaPauseState());
           await saveQueueState();
           const queueContinuation = await scheduleNextPendingQueueItem();
           return {
@@ -7130,8 +7139,7 @@ async function handleMessage(message, sender) {
       if (!item) return { success: false, error: '항목을 찾을 수 없음' };
       item.status = 'pending';
       item.error = null;
-      item.captchaTabId = null;
-      item.captchaStage = null;
+      Object.assign(item, clearQueueCaptchaPauseState());
       item.completedAt = null;
       item.publishStatus = null;
       await saveQueueState();

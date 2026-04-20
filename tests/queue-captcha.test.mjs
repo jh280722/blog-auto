@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  buildQueueCaptchaPauseState,
+  clearQueueCaptchaPauseState,
   decideQueueCaptchaResumeProbeAction,
   findQueueCaptchaItem,
   getQueueCaptchaSelectionFailure,
@@ -275,5 +277,159 @@ test('decideQueueCaptchaResumeProbeAction fail-closes non-resumable editor readi
     status: 'editor_not_ready',
     reason: 'editor_body_missing',
     error: '에디터 본문 영역을 아직 찾지 못했습니다.'
+  });
+});
+
+test('buildQueueCaptchaPauseState stores fresh handoff metadata for captcha_paused queue items', () => {
+  const pausedState = buildQueueCaptchaPauseState({
+    tabId: 202,
+    response: {
+      captchaStage: 'after_final_confirm',
+      diagnostics: { attempts: [{ step: 'probe_resume_tab' }] },
+      solveHints: {
+        prompt: '오래된 힌트',
+        submitField: 'answer'
+      }
+    },
+    handoff: {
+      captchaContext: {
+        preferredSolveMode: 'extension_frame_dom',
+        challengeText: '백촌오피스□',
+        solveHints: {
+          prompt: '이미지에서 전체 후보 텍스트를 읽으세요.',
+          submitField: 'ocrTexts'
+        }
+      },
+      captchaArtifacts: {
+        success: true,
+        status: 'captcha_artifacts_ready',
+        artifactPreference: 'sourceImage',
+        artifact: { kind: 'sourceImage' },
+        captureErrors: [{ status: 'tainted_canvas' }]
+      }
+    },
+    error: 'CAPTCHA 감지 — 같은 탭에서 solve 후 재개',
+    nowIso: '2026-04-20T01:02:03.000Z'
+  });
+
+  assert.deepEqual(pausedState, {
+    status: 'captcha_paused',
+    error: 'CAPTCHA 감지 — 같은 탭에서 solve 후 재개',
+    publishStatus: 'captcha_required',
+    captchaTabId: 202,
+    captchaStage: 'after_final_confirm',
+    diagnostics: { attempts: [{ step: 'probe_resume_tab' }] },
+    captchaContext: {
+      preferredSolveMode: 'extension_frame_dom',
+      challengeText: '백촌오피스□',
+      solveHints: {
+        prompt: '이미지에서 전체 후보 텍스트를 읽으세요.',
+        submitField: 'ocrTexts'
+      }
+    },
+    solveHints: {
+      prompt: '이미지에서 전체 후보 텍스트를 읽으세요.',
+      submitField: 'ocrTexts'
+    },
+    lastCaptchaArtifactCapture: {
+      success: true,
+      status: 'captcha_artifacts_ready',
+      artifactKind: 'sourceImage',
+      artifactPreference: 'sourceImage',
+      captureErrorCount: 1,
+      capturedAt: '2026-04-20T01:02:03.000Z'
+    },
+    lastCaptchaSubmitResult: null,
+    lastCheckedAt: '2026-04-20T01:02:03.000Z'
+  });
+});
+
+test('buildQueueCaptchaPauseState refreshes submit summary while preserving prior queue captcha context', () => {
+  const pausedState = buildQueueCaptchaPauseState({
+    existingItem: {
+      captchaTabId: 101,
+      captchaStage: 'after_open_publish_layer',
+      diagnostics: { attempts: [{ step: 'existing_probe' }] },
+      captchaContext: {
+        preferredSolveMode: 'extension_dom',
+        challengeText: '새열린약□',
+        solveHints: {
+          prompt: 'DOM에서 전체 후보 텍스트를 읽으세요.',
+          submitField: 'ocrTexts'
+        }
+      },
+      solveHints: {
+        prompt: 'DOM에서 전체 후보 텍스트를 읽으세요.',
+        submitField: 'ocrTexts'
+      },
+      lastCaptchaArtifactCapture: {
+        success: true,
+        status: 'captcha_artifacts_ready',
+        artifactKind: 'viewportCrop',
+        artifactPreference: 'viewportCrop',
+        captureErrorCount: 0,
+        capturedAt: '2026-04-20T00:59:00.000Z'
+      }
+    },
+    tabId: 303,
+    submitResult: {
+      success: true,
+      status: 'captcha_still_present',
+      captchaStillAppears: true,
+      answerLength: 5,
+      answerNormalization: '새열린약국'
+    },
+    error: 'CAPTCHA가 아직 표시되어 있습니다. 같은 탭에서 다시 해결 후 재개하세요.',
+    nowIso: '2026-04-20T01:05:06.000Z'
+  });
+
+  assert.deepEqual(pausedState, {
+    status: 'captcha_paused',
+    error: 'CAPTCHA가 아직 표시되어 있습니다. 같은 탭에서 다시 해결 후 재개하세요.',
+    publishStatus: 'captcha_required',
+    captchaTabId: 303,
+    captchaStage: 'after_open_publish_layer',
+    diagnostics: { attempts: [{ step: 'existing_probe' }] },
+    captchaContext: {
+      preferredSolveMode: 'extension_dom',
+      challengeText: '새열린약□',
+      solveHints: {
+        prompt: 'DOM에서 전체 후보 텍스트를 읽으세요.',
+        submitField: 'ocrTexts'
+      }
+    },
+    solveHints: {
+      prompt: 'DOM에서 전체 후보 텍스트를 읽으세요.',
+      submitField: 'ocrTexts'
+    },
+    lastCaptchaArtifactCapture: {
+      success: true,
+      status: 'captcha_artifacts_ready',
+      artifactKind: 'viewportCrop',
+      artifactPreference: 'viewportCrop',
+      captureErrorCount: 0,
+      capturedAt: '2026-04-20T00:59:00.000Z'
+    },
+    lastCaptchaSubmitResult: {
+      success: true,
+      status: 'captcha_still_present',
+      captchaStillAppears: true,
+      answerLength: 5,
+      normalization: '새열린약국',
+      updatedAt: '2026-04-20T01:05:06.000Z'
+    },
+    lastCheckedAt: '2026-04-20T01:05:06.000Z'
+  });
+});
+
+test('clearQueueCaptchaPauseState drops transient captcha metadata after completion or retry', () => {
+  assert.deepEqual(clearQueueCaptchaPauseState(), {
+    captchaTabId: null,
+    captchaStage: null,
+    captchaContext: null,
+    solveHints: null,
+    lastCaptchaArtifactCapture: null,
+    lastCaptchaSubmitResult: null,
+    lastCheckedAt: null
   });
 });

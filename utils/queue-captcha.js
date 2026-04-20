@@ -9,6 +9,16 @@ function normalizeCaptchaStage(value) {
     : null;
 }
 
+function cloneJsonValue(value) {
+  if (value == null) return value;
+
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return null;
+  }
+}
+
 function isResumePublishLayerStage(stage) {
   return stage === 'before_publish' || stage === 'after_open_publish_layer';
 }
@@ -17,6 +27,96 @@ function isProvidedSelector(value) {
   if (value === null || value === undefined) return false;
   if (typeof value === 'string') return value.trim().length > 0;
   return true;
+}
+
+export function summarizeQueueCaptchaArtifactCapture(artifactResult = null, { nowIso = new Date().toISOString() } = {}) {
+  if (!artifactResult || typeof artifactResult !== 'object') {
+    return null;
+  }
+
+  return {
+    success: !!artifactResult.success,
+    status: artifactResult.status || null,
+    artifactKind: artifactResult.artifact?.kind || null,
+    artifactPreference: artifactResult.artifactPreference || null,
+    captureErrorCount: Array.isArray(artifactResult.captureErrors) ? artifactResult.captureErrors.length : 0,
+    capturedAt: nowIso
+  };
+}
+
+export function summarizeQueueCaptchaSubmitResult(submitResult = null, { nowIso = new Date().toISOString() } = {}) {
+  if (!submitResult || typeof submitResult !== 'object') {
+    return null;
+  }
+
+  return {
+    success: !!submitResult.success,
+    status: submitResult.status || null,
+    captchaStillAppears: submitResult.captchaStillAppears ?? null,
+    answerLength: typeof submitResult.answerLength === 'number' ? submitResult.answerLength : null,
+    normalization: submitResult.answerNormalization || null,
+    updatedAt: nowIso
+  };
+}
+
+export function clearQueueCaptchaPauseState() {
+  return {
+    captchaTabId: null,
+    captchaStage: null,
+    captchaContext: null,
+    solveHints: null,
+    lastCaptchaArtifactCapture: null,
+    lastCaptchaSubmitResult: null,
+    lastCheckedAt: null
+  };
+}
+
+export function buildQueueCaptchaPauseState({
+  existingItem = null,
+  tabId = null,
+  response = null,
+  handoff = null,
+  submitResult = null,
+  error = null,
+  nowIso = new Date().toISOString()
+} = {}) {
+  const normalizedTabId = normalizePositiveInteger(tabId) ?? normalizePositiveInteger(existingItem?.captchaTabId);
+  const diagnostics = cloneJsonValue(response?.diagnostics)
+    ?? cloneJsonValue(existingItem?.diagnostics)
+    ?? null;
+  const responseContext = cloneJsonValue(response?.captchaContext) || null;
+  const handoffContext = cloneJsonValue(handoff?.captchaContext) || null;
+  const existingContext = cloneJsonValue(existingItem?.captchaContext) || null;
+  const captchaContext = handoffContext || responseContext || existingContext || null;
+  const solveHints = cloneJsonValue(captchaContext?.solveHints)
+    || cloneJsonValue(handoff?.captchaArtifacts?.solveHints)
+    || cloneJsonValue(response?.solveHints)
+    || cloneJsonValue(existingItem?.solveHints)
+    || null;
+
+  if (captchaContext && solveHints && !captchaContext.solveHints) {
+    captchaContext.solveHints = cloneJsonValue(solveHints);
+  }
+
+  return {
+    status: 'captcha_paused',
+    error: typeof error === 'string' && error.trim().length > 0
+      ? error.trim()
+      : (existingItem?.error || 'CAPTCHA 감지 — 같은 탭에서 solve 후 재개'),
+    publishStatus: 'captcha_required',
+    captchaTabId: normalizedTabId,
+    captchaStage: normalizeCaptchaStage(response?.captchaStage) || normalizeCaptchaStage(existingItem?.captchaStage),
+    diagnostics,
+    captchaContext,
+    solveHints,
+    lastCaptchaArtifactCapture: summarizeQueueCaptchaArtifactCapture(handoff?.captchaArtifacts, { nowIso })
+      || cloneJsonValue(existingItem?.lastCaptchaArtifactCapture)
+      || null,
+    lastCaptchaSubmitResult: summarizeQueueCaptchaSubmitResult(submitResult, { nowIso })
+      || cloneJsonValue(existingItem?.lastCaptchaSubmitResult)
+      || null,
+    lastCheckedAt: nowIso
+  };
 }
 
 export function decideQueueCaptchaResumeProbeAction({ probeResult = null, captchaStage = null } = {}) {

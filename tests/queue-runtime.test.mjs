@@ -55,6 +55,31 @@ test('normalizeLoadedQueueState overwrites stale captcha failure markers when a 
   });
 });
 
+test('normalizeLoadedQueueState scrubs transient queue CAPTCHA metadata when a resumed publish crashes mid-flight', () => {
+  const { queue } = normalizeLoadedQueueState([
+    {
+      id: 'resumed-with-captcha-state',
+      status: 'processing',
+      captchaTabId: 404,
+      captchaStage: 'after_final_confirm',
+      captchaContext: { preferredSolveMode: 'extension_frame_dom' },
+      solveHints: { submitField: 'ocrTexts' },
+      lastCaptchaArtifactCapture: { artifactPreference: 'sourceImage' },
+      lastCaptchaSubmitResult: { status: 'captcha_still_present' },
+      lastCheckedAt: '2026-04-20T01:05:06.000Z'
+    }
+  ]);
+
+  assert.equal(queue[0].status, 'failed');
+  assert.equal(queue[0].captchaTabId, null);
+  assert.equal(queue[0].captchaStage, null);
+  assert.equal(queue[0].captchaContext, null);
+  assert.equal(queue[0].solveHints, null);
+  assert.equal(queue[0].lastCaptchaArtifactCapture, null);
+  assert.equal(queue[0].lastCaptchaSubmitResult, null);
+  assert.equal(queue[0].lastCheckedAt, null);
+});
+
 test('buildQueueContinuationPlan keeps short in-memory pacing but clamps the wake-up alarm for MV3', () => {
   const nowMs = Date.UTC(2026, 3, 15, 1, 30, 0);
   const plan = buildQueueContinuationPlan({ intervalMs: 5000, nowMs });

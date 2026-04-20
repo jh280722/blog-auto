@@ -2,8 +2,9 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.18 (2026-04-19 queue post-CAPTCHA settle resume patch 포함)**
+> 현재 운영 기준: **v1.8.19 (2026-04-20 queue CAPTCHA metadata refresh patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
+> - **큐의 `captcha_paused` 항목은 이제 최초 pause, same-tab 재개 중 `captcha_required` 재발생, `SUBMIT_CAPTCHA_AND_RESUME` 재시도까지 모두 최신 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult` / `lastCheckedAt` 메타데이터를 함께 갱신합니다. 따라서 크론/에이전트는 `GET_QUEUE`만 읽어도 대상 `id` / `captchaTabId`뿐 아니라 어떤 프롬프트·solve mode·아티팩트 preference로 다시 풀어야 하는지 바로 파악할 수 있고, stale queue CAPTCHA 힌트 때문에 잘못된 재개 분기로 가는 일을 줄입니다. 완료/재시도 시에는 이 transient 메타데이터를 자동으로 비웁니다.**
 > - **큐의 `captcha_paused` 항목도 이제 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })`로 same-tab CAPTCHA 제출 뒤 해당 큐 항목 재개까지 바로 이어집니다. direct publish state가 없고 `captcha_paused` 항목이 하나뿐이면 자동 선택하고, 여러 개면 fail-closed로 `id` 또는 `tabId`를 요구합니다. queue resume 성공 뒤 다음 pending 항목도 기존 publish interval을 다시 존중합니다.**
 > - **v1.8.18부터는 queue CAPTCHA 재개도 `publish_layer_open`을 무조건 `editor_not_ready`로 끊지 않습니다. CAPTCHA가 최종 발행 직후 걸렸던 회차(`after_final_confirm`)는 먼저 post-submit settle/navigation을 짧게 확인하고, 발행 레이어가 열린 채 남은 회차는 같은 탭 `RESUME_PUBLISH`로 이어서 false `editor_not_ready`를 줄입니다.**
 > - **`captcha_required` / `captcha_browser_handoff_required` / `GET_CAPTCHA_ARTIFACTS` handoff는 이제 기본적으로 `artifacts.sourceImage`까지 함께 채워, 크론/에이전트가 추가 왕복 없이 원본 CAPTCHA 이미지를 바로 OCR/비전에 넘길 수 있습니다. 명시적으로 `includeSourceImage: false`일 때만 opt-out 하며, 원본 fetch는 Tistory/Kakao 계열 CAPTCHA 이미지 origin만 허용합니다.**
@@ -50,7 +51,7 @@
 - **팝업 UI**: 확장 프로그램 아이콘 클릭 → 직접 글 작성/발행
 - **이미지 삽입**: 로컬 파일, 드래그앤드롭, URL 모두 지원
 - **대량 발행 큐**: JSON으로 여러 글을 한번에 등록, 순차 발행
-- **MV3 queue durability**: `START_QUEUE` 이후에는 in-memory timer + `chrome.alarms` wake-up을 함께 유지하고, `GET_QUEUE`가 `queueRuntimeState`까지 반환해 service worker restart/idle shutdown 이후 자동 재개 여부를 추적할 수 있음
+- **MV3 queue durability**: `START_QUEUE` 이후에는 in-memory timer + `chrome.alarms` wake-up을 함께 유지하고, `GET_QUEUE`가 `queueRuntimeState`뿐 아니라 `captcha_paused` 항목의 최신 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult` 메타데이터도 함께 보존해 service worker restart/idle shutdown 이후 자동 재개 여부와 same-tab CAPTCHA 재개 힌트를 같이 추적할 수 있음
 - **direct publish wait durability**: `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`가 `directPublishRuntimeState`를 storage에 남기고, service worker restart 뒤에도 saved blocked tab의 same-tab CAPTCHA 대기/재개를 alarm 기반으로 다시 이어감 (`GET_DIRECT_PUBLISH_STATE` 응답에도 runtime state 포함)
 - **외부 API**: `externally_connectable`로 외부 도구에서 데이터 전송 가능
 - **직접 발행 상태 추적**: `captcha_required` 시 blocked tab / blog / visibility / diagnostics / requestData와 `publishTrace` / `stage`를 저장
@@ -140,7 +141,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 
 ```
 큐 처리 중 CAPTCHA 감지 → 해당 항목이 captcha_paused 상태로 일시정지
-→ GET_QUEUE 또는 팝업 큐 탭에서 대상 항목 id / captchaTabId 확인
+→ GET_QUEUE 또는 팝업 큐 탭에서 대상 항목 id / captchaTabId 와 함께 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` 확인
 → 같은 탭에서 OCR/비전으로 정답 판독
 → SUBMIT_CAPTCHA_AND_RESUME({ id, ocrTexts }) 또는 SUBMIT_CAPTCHA_AND_RESUME({ tabId, answer }) 호출
 → 답안 제출 + 해당 큐 항목 same-tab 재개
@@ -183,7 +184,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 3. **[시작]** 클릭 → 순차 발행
 4. 각 글 사이에는 in-memory timer와 `chrome.alarms` fallback이 함께 예약되어, MV3 service worker가 쉬는 동안에도 다음 항목을 최대한 이어서 깨웁니다.
 5. service worker 재시작 중 이미 `processing`이던 항목은 duplicate publish를 피하려고 `worker_restarted_during_publish` 실패로 남기고, 남은 pending 항목만 이어서 처리합니다.
-6. CAPTCHA 발생 시 해당 항목이 ⚠️ 상태로 표시 → same-tab solve 뒤 **[재개]** 클릭하거나, 외부 크론/에이전트는 `GET_QUEUE`로 `id` / `captchaTabId`를 확인한 뒤 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })`를 호출해 해당 항목만 바로 재개
+6. CAPTCHA 발생 시 해당 항목이 ⚠️ 상태로 표시 → same-tab solve 뒤 **[재개]** 클릭하거나, 외부 크론/에이전트는 `GET_QUEUE`로 `id` / `captchaTabId`와 최신 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 확인한 뒤 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })`를 호출해 해당 항목만 바로 재개
 
 ### 3. 외부 API 연동
 
@@ -202,7 +203,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 - 구버전/디버그 호환이 필요할 때만 `SUBMIT_CAPTCHA` → `RESUME_DIRECT_PUBLISH` 분리 호출
 - 브라우저 시작 직후/오래된 티스토리 탭 사용 시: 먼저 `PREPARE_EDITOR`
 - `editor_not_ready` 발생 시: `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight`를 보고 `PREPARE_EDITOR` 재호출
-- 큐를 외부에서 모니터링할 때 `GET_QUEUE` 응답의 `queueRuntimeState.active` / `scheduledTimeMs`를 같이 보면, worker 재시작 뒤 자동 재개가 예정됐는지 바로 확인할 수 있습니다. queue CAPTCHA solve 뒤에는 `captcha_paused` 항목의 `id` 또는 `captchaTabId`를 그대로 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })`에 넘겨 같은 항목만 재개하세요. v1.8.18부터는 `after_final_confirm` 회차가 final submit 직후 `publish_layer_open`으로 남아도 post-submit settle/navigation을 먼저 확인한 뒤 same-tab 재개를 이어갑니다. direct publish handoff는 `GET_DIRECT_PUBLISH_STATE`의 `directPublishRuntimeState.active` / `nextCheckTimeMs` / `deadlineMs`를 같이 보세요.
+- 큐를 외부에서 모니터링할 때 `GET_QUEUE` 응답의 `queueRuntimeState.active` / `scheduledTimeMs`를 같이 보면, worker 재시작 뒤 자동 재개가 예정됐는지 바로 확인할 수 있습니다. 이제 `captcha_paused` 항목에는 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult` / `lastCheckedAt`도 함께 남으므로, 큐 solve 직전에 별도 상태 재구성 없이 어떤 문제를 같은 탭에서 다시 풀어야 하는지 바로 판단할 수 있습니다. queue CAPTCHA solve 뒤에는 `captcha_paused` 항목의 `id` 또는 `captchaTabId`를 그대로 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })`에 넘겨 같은 항목만 재개하세요. v1.8.18부터는 `after_final_confirm` 회차가 final submit 직후 `publish_layer_open`으로 남아도 post-submit settle/navigation을 먼저 확인한 뒤 same-tab 재개를 이어갑니다. direct publish handoff는 `GET_DIRECT_PUBLISH_STATE`의 `directPublishRuntimeState.active` / `nextCheckTimeMs` / `deadlineMs`를 같이 보세요.
 
 ```javascript
 const EXTENSION_ID = "your-extension-id";
@@ -347,7 +348,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 
 ---
 
-## 발행 상태 코드 (v1.8.18)
+## 발행 상태 코드 (v1.8.19)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 
@@ -360,7 +361,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 | `captcha_submit_tab_navigated` | same-tab CAPTCHA 제출 직후 이미 `/manage/posts` 또는 permalink로 이동함 | 성공으로 처리, 추가 `RESUME_DIRECT_PUBLISH` 호출 불필요 |
 | `captcha_browser_handoff_required` | cross-origin iframe에서도 extension-frame solve가 막힌 예외 케이스 | 같은 탭에서 browser/CDP로 풀이하고 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`로 자동 재개 대기 |
 | `captcha_wait_timeout` | `RESUME_DIRECT_PUBLISH(waitForCaptcha)` 대기 시간이 초과됨 | 같은 탭 solve 진행 상태 확인 후 재시도 또는 `waitTimeoutMs` 증가 |
-| `captcha_paused` | 큐 항목 CAPTCHA 일시정지 | `GET_QUEUE`로 `id` / `captchaTabId` 확인 후 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })` 권장. v1.8.18부터는 `publish_layer_open` 상태도 same-tab 재개/settle 확인으로 이어지고, 팝업 수동 solve라면 `RESUME_AFTER_CAPTCHA` |
+| `captcha_paused` | 큐 항목 CAPTCHA 일시정지 | `GET_QUEUE`로 `id` / `captchaTabId`뿐 아니라 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 함께 확인한 뒤 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })` 권장. v1.8.18부터는 `publish_layer_open` 상태도 same-tab 재개/settle 확인으로 이어지고, 팝업 수동 solve라면 `RESUME_AFTER_CAPTCHA` |
 | `editor_not_ready` | 실제 editor body 준비/복구 실패 또는 `WRITE_POST` preflight 실패 | `diagnostics`/`preflight` 확인 후 `PREPARE_EDITOR` 재호출 |
 | `item_not_found` | 재개할 큐 항목 없음 | 큐 확인 |
 | `content_empty` | 본문 비어있거나 에디터 미반영 | 본문 확인 후 재시도 |

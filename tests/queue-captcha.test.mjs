@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   buildQueueCaptchaPauseState,
+  buildQueueCaptchaSavedStateForAnswerResolution,
   clearQueueCaptchaPauseState,
   decideQueueCaptchaResumeProbeAction,
   findQueueCaptchaItem,
@@ -419,6 +420,123 @@ test('buildQueueCaptchaPauseState refreshes submit summary while preserving prio
       updatedAt: '2026-04-20T01:05:06.000Z'
     },
     lastCheckedAt: '2026-04-20T01:05:06.000Z'
+  });
+});
+
+test('buildQueueCaptchaSavedStateForAnswerResolution prefers persisted queue captcha context for OCR inference', () => {
+  const savedState = buildQueueCaptchaSavedStateForAnswerResolution({
+    directPublishState: {
+      tabId: 999,
+      captchaContext: {
+        challengeText: '다른문제□',
+        challengeMasked: '다른문제□',
+        solveHints: {
+          prompt: 'stale direct publish prompt',
+          submitField: 'ocrTexts'
+        }
+      }
+    },
+    queueItem: {
+      id: 'paused-item',
+      status: 'captcha_paused',
+      captchaTabId: 303,
+      captchaContext: {
+        preferredSolveMode: 'extension_frame_dom',
+        challengeText: '새열린약□',
+        challengeMasked: '새열린약□'
+      },
+      solveHints: {
+        prompt: 'queue OCR prompt',
+        submitField: 'ocrTexts'
+      }
+    }
+  });
+
+  assert.deepEqual(savedState, {
+    tabId: 999,
+    captchaContext: {
+      challengeText: '새열린약□',
+      challengeMasked: '새열린약□',
+      solveHints: {
+        prompt: 'queue OCR prompt',
+        submitField: 'ocrTexts'
+      },
+      preferredSolveMode: 'extension_frame_dom'
+    }
+  });
+});
+
+test('buildQueueCaptchaSavedStateForAnswerResolution does not leak stale direct-publish solve hints into queue context', () => {
+  const savedState = buildQueueCaptchaSavedStateForAnswerResolution({
+    directPublishState: {
+      tabId: 999,
+      captchaContext: {
+        challengeText: '다른문제□',
+        challengeMasked: '다른문제□',
+        solveHints: {
+          prompt: 'stale direct publish prompt',
+          submitField: 'answer',
+          targetEntity: '약국'
+        }
+      }
+    },
+    queueItem: {
+      id: 'paused-item',
+      status: 'captcha_paused',
+      captchaTabId: 303,
+      captchaContext: {
+        preferredSolveMode: 'extension_frame_dom',
+        challengeText: '새열린약□',
+        challengeMasked: '새열린약□'
+      },
+      solveHints: null
+    }
+  });
+
+  assert.deepEqual(savedState, {
+    tabId: 999,
+    captchaContext: {
+      challengeText: '새열린약□',
+      challengeMasked: '새열린약□',
+      preferredSolveMode: 'extension_frame_dom'
+    }
+  });
+});
+
+test('buildQueueCaptchaSavedStateForAnswerResolution does not leak stale direct-publish challenge text when queue metadata only has solve hints', () => {
+  const savedState = buildQueueCaptchaSavedStateForAnswerResolution({
+    directPublishState: {
+      tabId: 999,
+      captchaContext: {
+        challengeText: '다른문제□',
+        challengeMasked: '다른문제□',
+        solveHints: {
+          prompt: 'stale direct publish prompt',
+          submitField: 'answer',
+          targetEntity: '약국'
+        }
+      }
+    },
+    queueItem: {
+      id: 'paused-item',
+      status: 'captcha_paused',
+      captchaTabId: 303,
+      captchaContext: null,
+      solveHints: {
+        prompt: 'queue OCR prompt',
+        submitField: 'ocrTexts'
+      }
+    }
+  });
+
+  assert.deepEqual(savedState, {
+    tabId: 999,
+    captchaContext: {
+      solveHints: {
+        prompt: 'queue OCR prompt',
+        submitField: 'ocrTexts'
+      }
+    }
   });
 });
 

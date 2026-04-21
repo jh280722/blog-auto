@@ -71,6 +71,32 @@ export function clearQueueCaptchaPauseState() {
   };
 }
 
+export function buildQueueCaptchaSavedStateForAnswerResolution({ queueItem = null, directPublishState = null } = {}) {
+  const baseState = cloneJsonValue(directPublishState) || null;
+  const queueContext = cloneJsonValue(queueItem?.captchaContext) || null;
+  const queueSolveHints = cloneJsonValue(queueItem?.solveHints) || null;
+  const hasQueueContext = !!(queueContext && typeof queueContext === 'object');
+
+  if (!queueContext && !queueSolveHints) {
+    return baseState;
+  }
+
+  const mergedCaptchaContext = hasQueueContext
+    ? { ...queueContext }
+    : {};
+
+  if (queueSolveHints) {
+    mergedCaptchaContext.solveHints = queueSolveHints;
+  } else if (hasQueueContext && !queueContext?.solveHints) {
+    delete mergedCaptchaContext.solveHints;
+  }
+
+  return {
+    ...(baseState && typeof baseState === 'object' ? baseState : {}),
+    captchaContext: mergedCaptchaContext
+  };
+}
+
 export function buildQueueCaptchaPauseState({
   existingItem = null,
   tabId = null,

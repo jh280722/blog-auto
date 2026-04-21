@@ -48,6 +48,7 @@ import {
 } from '../utils/queue-runtime.js';
 import {
   buildQueueCaptchaPauseState,
+  buildQueueCaptchaSavedStateForAnswerResolution,
   clearQueueCaptchaPauseState,
   decideQueueCaptchaResumeProbeAction,
   findQueueCaptchaItem,
@@ -7004,7 +7005,13 @@ async function handleMessage(message, sender) {
         };
       }
       const tabId = queueCaptchaItem?.captchaTabId || explicitTabId || savedState?.tabId || currentTabId;
-      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, savedState);
+      const answerResolutionState = queueCaptchaItem
+        ? buildQueueCaptchaSavedStateForAnswerResolution({
+            queueItem: queueCaptchaItem,
+            directPublishState: savedState
+          })
+        : savedState;
+      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, answerResolutionState);
       if (!answerResolution.success) {
         return {
           ...answerResolution,

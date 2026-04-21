@@ -6972,7 +6972,7 @@ async function handleMessage(message, sender) {
     case 'SUBMIT_CAPTCHA_AND_RESUME': {
       const explicitItemId = typeof message.data?.id === 'string' ? message.data.id.trim() : '';
       const explicitTabId = message.data?.tabId || null;
-      const savedState = explicitTabId ? null : await getLiveDirectPublishState({ includeCaptchaContext: true });
+      const savedState = await getLiveDirectPublishState({ includeCaptchaContext: true });
       const queueSelection = summarizeQueueCaptchaSelection(publishQueue, {
         itemId: explicitItemId || null,
         tabId: explicitTabId
@@ -7008,9 +7008,13 @@ async function handleMessage(message, sender) {
       const answerResolutionState = queueCaptchaItem
         ? buildQueueCaptchaSavedStateForAnswerResolution({
             queueItem: queueCaptchaItem,
-            directPublishState: savedState
+            directPublishState: savedState,
+            requestedTabId: tabId
           })
-        : savedState;
+        : buildQueueCaptchaSavedStateForAnswerResolution({
+            directPublishState: savedState,
+            requestedTabId: tabId
+          });
       const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, answerResolutionState);
       if (!answerResolution.success) {
         return {

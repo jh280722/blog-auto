@@ -20,6 +20,82 @@ function buildQueue() {
   ];
 }
 
+test('buildQueueCaptchaSavedStateForAnswerResolution preserves direct publish challenge context when requested tab matches', () => {
+  const savedState = buildQueueCaptchaSavedStateForAnswerResolution({
+    requestedTabId: 900,
+    directPublishState: {
+      tabId: 900,
+      captchaContext: {
+        challengeText: '백촌오피스□',
+        solveHints: {
+          submitField: 'ocrTexts'
+        }
+      }
+    }
+  });
+
+  assert.deepEqual(savedState, {
+    tabId: 900,
+    captchaContext: {
+      challengeText: '백촌오피스□',
+      solveHints: {
+        submitField: 'ocrTexts'
+      }
+    }
+  });
+});
+
+test('buildQueueCaptchaSavedStateForAnswerResolution drops unrelated direct publish state when explicit tab targets another captcha tab', () => {
+  const savedState = buildQueueCaptchaSavedStateForAnswerResolution({
+    requestedTabId: 901,
+    directPublishState: {
+      tabId: 900,
+      captchaContext: {
+        challengeText: '백촌오피스□'
+      }
+    }
+  });
+
+  assert.equal(savedState, null);
+});
+
+test('buildQueueCaptchaSavedStateForAnswerResolution overlays paused queue metadata on top of matching direct publish state', () => {
+  const savedState = buildQueueCaptchaSavedStateForAnswerResolution({
+    requestedTabId: 900,
+    directPublishState: {
+      tabId: 900,
+      blogName: 'nakseo-dev',
+      captchaContext: {
+        challengeText: 'old challenge',
+        solveHints: {
+          submitField: 'answer'
+        }
+      }
+    },
+    queueItem: {
+      captchaContext: {
+        challengeText: '지도에 있는 약국의 전체 명칭을 입력해주세요'
+      },
+      solveHints: {
+        submitField: 'answer',
+        targetEntity: '약국'
+      }
+    }
+  });
+
+  assert.deepEqual(savedState, {
+    tabId: 900,
+    blogName: 'nakseo-dev',
+    captchaContext: {
+      challengeText: '지도에 있는 약국의 전체 명칭을 입력해주세요',
+      solveHints: {
+        submitField: 'answer',
+        targetEntity: '약국'
+      }
+    }
+  });
+});
+
 test('findQueueCaptchaItem prefers an explicit paused queue item id', () => {
   const item = findQueueCaptchaItem(buildQueue(), { itemId: 'paused-b' });
   assert.equal(item?.id, 'paused-b');

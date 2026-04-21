@@ -71,8 +71,18 @@ export function clearQueueCaptchaPauseState() {
   };
 }
 
-export function buildQueueCaptchaSavedStateForAnswerResolution({ queueItem = null, directPublishState = null } = {}) {
-  const baseState = cloneJsonValue(directPublishState) || null;
+export function buildQueueCaptchaSavedStateForAnswerResolution({
+  queueItem = null,
+  directPublishState = null,
+  requestedTabId = null
+} = {}) {
+  const normalizedRequestedTabId = normalizePositiveInteger(requestedTabId);
+  const normalizedDirectPublishTabId = normalizePositiveInteger(directPublishState?.tabId);
+  const shouldReuseDirectPublishState = !normalizedRequestedTabId
+    || (normalizedDirectPublishTabId !== null && normalizedDirectPublishTabId === normalizedRequestedTabId);
+  const baseState = shouldReuseDirectPublishState
+    ? (cloneJsonValue(directPublishState) || null)
+    : null;
   const queueContext = cloneJsonValue(queueItem?.captchaContext) || null;
   const queueSolveHints = cloneJsonValue(queueItem?.solveHints) || null;
   const hasQueueContext = !!(queueContext && typeof queueContext === 'object');

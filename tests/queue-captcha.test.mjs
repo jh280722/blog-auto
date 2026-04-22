@@ -171,6 +171,29 @@ test('getQueueCaptchaSelectionFailure fail-closes an explicit queue item id miss
   });
 });
 
+test('getQueueCaptchaSelectionFailure fail-closes a matched queue item that lost its captcha tab id', () => {
+  const queue = [{ id: 'paused-only', status: 'captcha_paused', captchaTabId: null }];
+  const matchedItem = findQueueCaptchaItem(queue, { itemId: 'paused-only' });
+  const failure = getQueueCaptchaSelectionFailure({
+    queue,
+    itemId: 'paused-only',
+    matchedItem,
+    directPublishTabId: 999
+  });
+
+  assert.deepEqual(failure, {
+    status: 'captcha_target_not_found',
+    error: '선택한 captcha_paused 큐 항목에 유효한 captchaTabId가 없습니다. GET_QUEUE 상태를 다시 확인하세요.',
+    queueSelection: {
+      pausedCount: 1,
+      requestedItemId: 'paused-only',
+      requestedTabId: null,
+      pausedItemIds: ['paused-only'],
+      pausedTabIds: []
+    }
+  });
+});
+
 test('getQueueCaptchaSelectionFailure fail-closes mismatched explicit id and tab id selectors', () => {
   const matchedItem = findQueueCaptchaItem(buildQueue(), { itemId: 'paused-a', tabId: 202 });
   const failure = getQueueCaptchaSelectionFailure({

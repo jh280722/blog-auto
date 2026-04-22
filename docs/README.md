@@ -2,8 +2,9 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.23 (2026-04-22 direct publish CAPTCHA context preservation patch 포함)**
+> 현재 운영 기준: **v1.8.24 (2026-04-22 CAPTCHA target fail-closed current-tab fallback patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
+> - **v1.8.24부터 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `INFER_CAPTCHA_ANSWER` / `SUBMIT_CAPTCHA*`는 저장된 blocked tab이 없을 때 아무 탭에나 `currentTabId`를 쓰지 않고, 현재 탭에 live CAPTCHA가 실제로 남아 있을 때만 current-tab fallback을 허용합니다. 제출 계열(`SUBMIT_CAPTCHA`, `SUBMIT_CAPTCHA_AND_RESUME`)은 current tab에 actionable answer path까지 확인하지 못하면 `captcha_target_not_found`로 fail-closed 하므로, stale editor/currentTab drift 때문에 잘못된 탭에 답을 넣는 위험을 줄이고 크론은 `GET_DIRECT_PUBLISH_STATE` / `GET_QUEUE`로 다시 대상 탭을 잡으면 됩니다.**
 > - **v1.8.23부터 direct publish same-tab CAPTCHA 재시도/재조회가 중간에 live handoff를 다시 못 읽더라도, 서비스워커가 기존 `directPublishState.captchaContext` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 보존한 채 새 결과만 덮어씁니다.** 따라서 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `SUBMIT_CAPTCHA*` 중 한 번이 `editor_not_ready`·빈 handoff·부분 컨텍스트로 돌아와도, 이전 `challengeText` / `challengeMasked` / solve hint가 direct publish state에서 사라져 false `captcha_challenge_context_missing`로 재개가 끊기는 회차를 더 줄입니다.
 > - **v1.8.22부터 direct publish도 `SUBMIT_CAPTCHA_AND_RESUME({ tabId, ocrTexts })`처럼 explicit `tabId`를 넘긴 재개 경로에서, 저장된 `directPublishState.captchaContext` / `solveHints`를 같은 blocked tab이면 답안 추론 입력으로 다시 재사용합니다.** 따라서 크론이 `GET_DIRECT_PUBLISH_STATE`에서 받은 `tabId`를 그대로 넘기거나 MV3 service worker restart 직후 live `GET_CAPTCHA_CONTEXT` probe가 잠깐 비어도, 이전 handoff에 남아 있던 `challengeText` / `challengeMasked` / target hint 기준 OCR 축약을 이어가 false `captcha_challenge_context_missing`로 same-tab 재개가 끊기는 회차를 줄입니다.
 > - **v1.8.21부터 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ocrTexts })`의 queue 경로도 `captcha_paused` 항목에 저장된 `captchaContext` / `solveHints`를 답안 추론 입력으로 우선 재사용합니다.** 따라서 MV3 service worker restart 직후나 live `GET_CAPTCHA_CONTEXT` probe가 잠깐 비어도, `GET_QUEUE`에 남아 있던 `challengeText` / `challengeMasked` / target hint 기준으로 OCR 후보를 다시 줄일 수 있어 false `captcha_challenge_context_missing`로 same-tab 재개가 끊기는 회차를 줄입니다.
@@ -201,6 +202,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 - 실제 발행: `visibility: "public"`
 - 테스트 발행: `visibility: "private"`
 - DKAPTCHA 발생 시: 먼저 응답의 `captchaArtifacts`와 `solveHints`를 확인하고, 필요하면 `GET_DIRECT_PUBLISH_STATE` / `GET_CAPTCHA_ARTIFACTS`로 blocked tab과 캡차 이미지를 다시 확보합니다. `GET_DIRECT_PUBLISH_STATE` 응답에는 `directPublishRuntimeState`도 함께 내려오므로, service worker restart 뒤 same-tab CAPTCHA wait가 다시 이어질 예정인지 바로 확인할 수 있습니다. v1.8.22부터는 direct publish가 saved blocked tab으로 남아 있을 때 `GET_DIRECT_PUBLISH_STATE`에서 받은 `tabId`를 그대로 `SUBMIT_CAPTCHA_AND_RESUME({ tabId, ... })`에 넘겨도 저장된 `captchaContext` / `solveHints`를 answer inference에 재사용합니다.
+- v1.8.24부터는 저장된 blocked tab이 없을 때 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `INFER_CAPTCHA_ANSWER` / `SUBMIT_CAPTCHA*`가 무조건 마지막 `currentTabId`로 떨어지지 않습니다. 현재 탭에 live CAPTCHA가 실제로 남아 있을 때만 current-tab fallback을 허용하고, 제출 계열은 actionable answer path까지 확인하지 못하면 `captcha_target_not_found`로 fail-closed 합니다. 크론은 이 응답을 받으면 `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` 또는 `GET_QUEUE`로 대상 탭을 다시 고정한 뒤 재시도하세요.
 - 기본 handoff와 `GET_CAPTCHA_ARTIFACTS`는 이제 `artifacts.sourceImage`를 함께 반환하므로, cross-origin frame export가 살아 있어 `frameDirectImage`가 있어도 원본 CAPTCHA 이미지를 우선 OCR/비전에 넘길 수 있습니다. 더 가벼운 응답이 필요할 때만 `includeSourceImage: false`로 opt-out 하세요.
 - `solveHints.prompt`는 그대로 OCR/비전 프롬프트로 사용합니다. masked challenge면 **`ocrTexts` 기반 추론**, instruction/map challenge면 **`answer` 직접 제출**이 기본이지만, 비전이 여러 후보를 줄바꿈으로 돌려준 경우에도 **`ocrTexts` fallback**으로 target entity 기준 자동 선택을 시도할 수 있습니다.
 - v1.8.12부터는 `challengeText`를 못 읽은 회차도 `solveHints.answerMode = "vision_direct_answer"` + `submitField = "answer"`로 직접 정답 판독을 유도합니다. 이때 OCR 후보가 1개로 정리되고 길이 힌트까지 맞으면 서비스워커가 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`도 직접 답안으로 수용합니다.
@@ -355,7 +357,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 
 ---
 
-## 발행 상태 코드 (v1.8.21)
+## 발행 상태 코드 (v1.8.24)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 
@@ -367,6 +369,7 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 | `captcha_required` | CAPTCHA 감지됨 (직접 발행) | 응답의 `captchaArtifacts` 우선 확인 → `preferredSolveMode`가 `extension_dom` / `extension_frame_dom`이면 `SUBMIT_CAPTCHA_AND_RESUME`, 드물게 `browser_handoff`면 browser/CDP fallback + `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })` |
 | `captcha_submit_tab_navigated` | same-tab CAPTCHA 제출 직후 이미 `/manage/posts` 또는 permalink로 이동함 | 성공으로 처리, 추가 `RESUME_DIRECT_PUBLISH` 호출 불필요 |
 | `captcha_browser_handoff_required` | cross-origin iframe에서도 extension-frame solve가 막힌 예외 케이스 | 같은 탭에서 browser/CDP로 풀이하고 `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`로 자동 재개 대기 |
+| `captcha_target_not_found` | 저장된 blocked tab이 없고 현재 탭에도 live/actionable CAPTCHA가 없음 | `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` 또는 `GET_QUEUE`로 대상 `tabId` / `id`를 다시 확인한 뒤 재시도 |
 | `captcha_wait_timeout` | `RESUME_DIRECT_PUBLISH(waitForCaptcha)` 대기 시간이 초과됨 | 같은 탭 solve 진행 상태 확인 후 재시도 또는 `waitTimeoutMs` 증가 |
 | `captcha_paused` | 큐 항목 CAPTCHA 일시정지 | `GET_QUEUE`로 `id` / `captchaTabId`뿐 아니라 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 함께 확인한 뒤 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })` 권장. v1.8.21부터는 이 queue submit path가 저장된 `captchaContext` / `solveHints`를 answer inference에 우선 재사용해 false `captcha_challenge_context_missing`를 줄입니다. v1.8.18부터는 `publish_layer_open` 상태도 same-tab 재개/settle 확인으로 이어지고, 팝업 수동 solve라면 `RESUME_AFTER_CAPTCHA` |
 | `editor_not_ready` | 실제 editor body 준비/복구 실패 또는 `WRITE_POST` preflight 실패 | `diagnostics`/`preflight` 확인 후 `PREPARE_EDITOR` 재호출 |

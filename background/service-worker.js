@@ -30,6 +30,7 @@ import {
 } from '../utils/captcha-answer-retry.js';
 import { isPostCaptchaPublishStillInFlight } from '../utils/captcha-post-submit-settle.js';
 import { hasActionableCaptchaAnswerPath } from '../utils/captcha-submit-capability.js';
+import { decideCaptchaTargetSelection } from '../utils/captcha-target.js';
 import {
   choosePreferredCaptchaArtifactKey,
   fetchCaptchaSourceImageArtifact,
@@ -3284,6 +3285,76 @@ async function getBlockingCaptchaStateForTab(tabId) {
     preferredSolveMode: captchaContext?.preferredSolveMode || null,
     captchaContext
   };
+}
+
+function buildCaptchaTargetNotFoundResponse({ requireActionablePath = false, currentTabContextResult = null } = {}) {
+  return {
+    success: false,
+    status: 'captcha_target_not_found',
+    error: requireActionablePath
+      ? '저장된 CAPTCHA 탭이 없고 현재 탭에도 제출 가능한 CAPTCHA가 없습니다. explicit tabId 또는 GET_DIRECT_PUBLISH_STATE/GET_QUEUE로 대상 탭을 지정하세요.'
+      : '저장된 CAPTCHA 탭이 없고 현재 탭에도 live CAPTCHA가 없습니다. explicit tabId 또는 GET_DIRECT_PUBLISH_STATE/GET_QUEUE로 대상 탭을 지정하세요.',
+    currentTabId,
+    currentTabContext: currentTabContextResult?.success ? currentTabContextResult.captchaContext || null : null,
+    currentTabContextResult: currentTabContextResult || null
+  };
+}
+
+async function resolveCaptchaActionTarget({ explicitTabId = null, savedState = null, requireActionablePath = false } = {}) {
+  if (explicitTabId) {
+    const savedStateForTab = savedState?.tabId === explicitTabId ? savedState : null;
+    return {
+      success: true,
+      source: 'explicit_tab',
+      tabId: explicitTabId,
+      savedStateForTab,
+      captchaState: savedStateForTab,
+      currentTabContextResult: null
+    };
+  }
+
+  const savedTarget = decideCaptchaTargetSelection({
+    savedTabId: savedState?.tabId || null,
+    requireActionablePath
+  });
+  if (savedTarget.success) {
+    return {
+      success: true,
+      source: savedTarget.source,
+      tabId: savedTarget.tabId,
+      savedStateForTab: savedState,
+      captchaState: savedState,
+      currentTabContextResult: null
+    };
+  }
+
+  let currentTabContextResult = null;
+  if (currentTabId) {
+    currentTabContextResult = await getCaptchaContextForTab(currentTabId);
+    const currentTarget = decideCaptchaTargetSelection({
+      currentTabId,
+      currentTabContext: currentTabContextResult?.success ? currentTabContextResult.captchaContext || null : null,
+      requireActionablePath
+    });
+    if (currentTarget.success) {
+      return {
+        success: true,
+        source: currentTarget.source,
+        tabId: currentTarget.tabId,
+        savedStateForTab: null,
+        captchaState: {
+          tabId: currentTarget.tabId,
+          captchaContext: currentTabContextResult?.captchaContext || null
+        },
+        currentTabContextResult
+      };
+    }
+  }
+
+  return buildCaptchaTargetNotFoundResponse({
+    requireActionablePath,
+    currentTabContextResult
+  });
 }
 
 function normalizeCaptchaAnswer(answer) {
@@ -6927,18 +6998,33 @@ async function handleMessage(message, sender) {
     case 'GET_CAPTCHA_CONTEXT': {
       const explicitTabId = message.data?.tabId || null;
       const savedState = await getDirectPublishStateForTargetTab(explicitTabId);
-      const tabId = explicitTabId || savedState?.tabId || currentTabId;
-      const captchaContextResult = await getCaptchaContextForTab(tabId);
+      const target = await resolveCaptchaActionTarget({
+        explicitTabId,
+        savedState,
+        requireActionablePath: false
+      });
+      if (!target.success) {
+        return {
+          ...target,
+          directPublish: savedState?.tabId ? { ...directPublishState } : null
+        };
+      }
+
+      const tabId = target.tabId;
+      const savedStateForTab = target.savedStateForTab;
+      const captchaContextResult = target.currentTabContextResult?.success
+        ? target.currentTabContextResult
+        : await getCaptchaContextForTab(tabId);
 
       if (!captchaContextResult.success) {
         return captchaContextResult;
       }
 
-      if (savedState?.tabId && savedState.tabId === tabId) {
+      if (savedStateForTab?.tabId && savedStateForTab.tabId === tabId) {
         await updateDirectPublishState(buildMergedDirectPublishCaptchaState({
-          existingState: savedState,
+          existingState: savedStateForTab,
           tabId,
-          url: captchaContextResult.captchaContext?.url || savedState.url,
+          url: captchaContextResult.captchaContext?.url || savedStateForTab.url,
           captchaContext: captchaContextResult.captchaContext,
           lastCheckedAt: new Date().toISOString()
         }));
@@ -6948,22 +7034,35 @@ async function handleMessage(message, sender) {
         success: true,
         tabId,
         captchaContext: captchaContextResult.captchaContext,
-        directPublish: savedState?.tabId === tabId ? enrichDirectPublishStateWithSolveHints({ ...directPublishState }) : null
+        directPublish: savedStateForTab?.tabId === tabId ? enrichDirectPublishStateWithSolveHints({ ...directPublishState }) : null
       }, captchaContextResult.captchaContext);
     }
 
     case 'GET_CAPTCHA_ARTIFACTS': {
       const explicitTabId = message.data?.tabId || null;
       const savedState = await getDirectPublishStateForTargetTab(explicitTabId);
-      const tabId = explicitTabId || savedState?.tabId || currentTabId;
+      const target = await resolveCaptchaActionTarget({
+        explicitTabId,
+        savedState,
+        requireActionablePath: false
+      });
+      if (!target.success) {
+        return {
+          ...target,
+          directPublish: savedState?.tabId ? { ...directPublishState } : null
+        };
+      }
+
+      const tabId = target.tabId;
+      const savedStateForTab = target.savedStateForTab;
       const artifactResult = await getCaptchaArtifactsForTab(tabId, message.data || {});
 
-      if (savedState?.tabId && savedState.tabId === tabId) {
+      if (savedStateForTab?.tabId && savedStateForTab.tabId === tabId) {
         await updateDirectPublishState(buildMergedDirectPublishCaptchaState({
-          existingState: savedState,
+          existingState: savedStateForTab,
           tabId,
-          url: artifactResult.captureContext?.url || savedState.url,
-          captchaContext: artifactResult.captureContext || savedState.captchaContext || null,
+          url: artifactResult.captureContext?.url || savedStateForTab.url,
+          captchaContext: artifactResult.captureContext || savedStateForTab.captchaContext || null,
           handoff: {
             captchaContext: artifactResult.captureContext || null,
             captchaArtifacts: artifactResult
@@ -6974,33 +7073,58 @@ async function handleMessage(message, sender) {
 
       return attachSolveHints({
         ...artifactResult,
-        directPublish: savedState?.tabId === tabId ? enrichDirectPublishStateWithSolveHints({ ...directPublishState }) : null
+        directPublish: savedStateForTab?.tabId === tabId ? enrichDirectPublishStateWithSolveHints({ ...directPublishState }) : null
       }, artifactResult.captureContext || null);
     }
 
     case 'INFER_CAPTCHA_ANSWER': {
       const explicitTabId = message.data?.tabId || null;
       const savedState = await getDirectPublishStateForTargetTab(explicitTabId, { includeCaptchaContext: true });
-      const tabId = explicitTabId || savedState?.tabId || currentTabId;
-      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, savedState);
+      const target = await resolveCaptchaActionTarget({
+        explicitTabId,
+        savedState,
+        requireActionablePath: false
+      });
+      if (!target.success) {
+        return {
+          ...target,
+          directPublish: savedState?.tabId ? { ...directPublishState } : null
+        };
+      }
+
+      const tabId = target.tabId;
+      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, target.captchaState);
 
       return {
         ...answerResolution,
         tabId,
-        directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
+        directPublish: target.savedStateForTab?.tabId === tabId ? { ...directPublishState } : null
       };
     }
 
     case 'SUBMIT_CAPTCHA': {
       const explicitTabId = message.data?.tabId || null;
       const savedState = await getDirectPublishStateForTargetTab(explicitTabId, { includeCaptchaContext: true });
-      const tabId = explicitTabId || savedState?.tabId || currentTabId;
-      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, savedState);
+      const target = await resolveCaptchaActionTarget({
+        explicitTabId,
+        savedState,
+        requireActionablePath: true
+      });
+      if (!target.success) {
+        return {
+          ...target,
+          directPublish: savedState?.tabId ? { ...directPublishState } : null
+        };
+      }
+
+      const tabId = target.tabId;
+      const savedStateForTab = target.savedStateForTab;
+      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, target.captchaState);
       if (!answerResolution.success) {
         return {
           ...answerResolution,
           tabId,
-          directPublish: savedState?.tabId === tabId ? { ...directPublishState } : null
+          directPublish: savedStateForTab?.tabId === tabId ? { ...directPublishState } : null
         };
       }
 
@@ -7074,18 +7198,35 @@ async function handleMessage(message, sender) {
           directPublish: savedState?.tabId ? { ...directPublishState } : null
         };
       }
-      const tabId = queueCaptchaItem?.captchaTabId || explicitTabId || savedState?.tabId || currentTabId;
-      const answerResolutionState = queueCaptchaItem
-        ? buildQueueCaptchaSavedStateForAnswerResolution({
-            queueItem: queueCaptchaItem,
-            directPublishState: savedState,
-            requestedTabId: tabId
-          })
-        : buildQueueCaptchaSavedStateForAnswerResolution({
-            directPublishState: savedState,
-            requestedTabId: tabId
+      const target = queueCaptchaItem
+        ? {
+            success: true,
+            tabId: queueCaptchaItem.captchaTabId || explicitTabId || savedState?.tabId || currentTabId,
+            savedStateForTab: savedState?.tabId === (queueCaptchaItem.captchaTabId || explicitTabId || savedState?.tabId || currentTabId) ? savedState : null,
+            captchaState: buildQueueCaptchaSavedStateForAnswerResolution({
+              queueItem: queueCaptchaItem,
+              directPublishState: savedState,
+              requestedTabId: queueCaptchaItem.captchaTabId || explicitTabId || savedState?.tabId || currentTabId
+            })
+          }
+        : await resolveCaptchaActionTarget({
+            explicitTabId,
+            savedState,
+            requireActionablePath: true
           });
-      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, answerResolutionState);
+      if (!target.success) {
+        return {
+          ...target,
+          resumed: false,
+          submitResult: null,
+          resumeResult: null,
+          queueItemId: null,
+          queueSelection,
+          directPublish: savedState?.tabId ? { ...directPublishState } : null
+        };
+      }
+      const tabId = target.tabId;
+      const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, target.captchaState);
       if (!answerResolution.success) {
         return {
           ...answerResolution,

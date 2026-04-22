@@ -286,6 +286,14 @@ export function getQueueCaptchaSelectionFailure({
     };
   }
 
+  if (matchedItem && normalizePositiveInteger(matchedItem?.captchaTabId) === null && !tabIdProvided) {
+    return {
+      status: 'captcha_target_not_found',
+      error: '선택한 captcha_paused 큐 항목에 유효한 captchaTabId가 없습니다. GET_QUEUE 상태를 다시 확인하세요.',
+      queueSelection: selection
+    };
+  }
+
   if (!normalizedItemId && !tabIdProvided && normalizedDirectPublishTabId === null && selection.pausedCount > 1) {
     return {
       status: 'queue_captcha_target_required',

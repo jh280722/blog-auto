@@ -2,8 +2,9 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.22 (2026-04-21 direct publish explicit-tab OCR resume context patch 포함)**
+> 현재 운영 기준: **v1.8.23 (2026-04-22 direct publish CAPTCHA context preservation patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
+> - **v1.8.23부터 direct publish same-tab CAPTCHA 재시도/재조회가 중간에 live handoff를 다시 못 읽더라도, 서비스워커가 기존 `directPublishState.captchaContext` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 보존한 채 새 결과만 덮어씁니다.** 따라서 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `SUBMIT_CAPTCHA*` 중 한 번이 `editor_not_ready`·빈 handoff·부분 컨텍스트로 돌아와도, 이전 `challengeText` / `challengeMasked` / solve hint가 direct publish state에서 사라져 false `captcha_challenge_context_missing`로 재개가 끊기는 회차를 더 줄입니다.
 > - **v1.8.22부터 direct publish도 `SUBMIT_CAPTCHA_AND_RESUME({ tabId, ocrTexts })`처럼 explicit `tabId`를 넘긴 재개 경로에서, 저장된 `directPublishState.captchaContext` / `solveHints`를 같은 blocked tab이면 답안 추론 입력으로 다시 재사용합니다.** 따라서 크론이 `GET_DIRECT_PUBLISH_STATE`에서 받은 `tabId`를 그대로 넘기거나 MV3 service worker restart 직후 live `GET_CAPTCHA_CONTEXT` probe가 잠깐 비어도, 이전 handoff에 남아 있던 `challengeText` / `challengeMasked` / target hint 기준 OCR 축약을 이어가 false `captcha_challenge_context_missing`로 same-tab 재개가 끊기는 회차를 줄입니다.
 > - **v1.8.21부터 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ocrTexts })`의 queue 경로도 `captcha_paused` 항목에 저장된 `captchaContext` / `solveHints`를 답안 추론 입력으로 우선 재사용합니다.** 따라서 MV3 service worker restart 직후나 live `GET_CAPTCHA_CONTEXT` probe가 잠깐 비어도, `GET_QUEUE`에 남아 있던 `challengeText` / `challengeMasked` / target hint 기준으로 OCR 후보를 다시 줄일 수 있어 false `captcha_challenge_context_missing`로 same-tab 재개가 끊기는 회차를 줄입니다.
 > - **v1.8.20부터 queue continuation wake도 `START_QUEUE` / startup recovery / `chrome.alarms` 분기 모두 tracked wake helper를 공유해, MV3 service worker restart 직후 queue resume이 detached microtask/fire-and-forget로 흘러 continuation alarm만 지워지고 실제 `processNextInQueue()`가 조용히 멈추는 silent stall 가능성을 줄입니다. 중복 wake는 skip하고, in-flight 플래그는 성공/실패 모두에서 정리됩니다.**
@@ -127,6 +128,7 @@ DKAPTCHA 등이 감지된 경우. 에디터 내용(제목/본문/태그 등)은 
 → 응답의 captchaArtifacts 확인 (없거나 재시도가 필요하면 GET_DIRECT_PUBLISH_STATE / GET_CAPTCHA_ARTIFACTS 호출)
 → 응답의 `solveHints`를 먼저 읽고, 거기 적힌 `prompt` 그대로 OCR/비전에 전달
 → direct publish가 saved blocked tab으로 남아 있다면, v1.8.22부터는 `GET_DIRECT_PUBLISH_STATE`에서 받은 `tabId`를 그대로 `SUBMIT_CAPTCHA_AND_RESUME({ tabId, ... })`에 넘겨도 저장된 `captchaContext` / `solveHints`를 answer inference에 다시 재사용
+→ v1.8.23부터는 같은 direct publish state가 후속 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `SUBMIT_CAPTCHA*` 중간에 partial handoff만 받아도 이전 `challengeText` / `challengeMasked` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 보존해, live probe miss 한 번으로 same-tab 재개 힌트를 잃지 않음
 → `solveHints.submitField === "ocrTexts"`면 전체 후보 텍스트를 줄바꿈 후보로 읽어 `INFER_CAPTCHA_ANSWER` 또는 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`로 빈칸 답안 축약
 → `solveHints.submitField === "answer"`면 지시문 대상의 전체 명칭 또는 challenge-missing fallback에서 비전이 직접 읽은 최종 정답을 한 줄 답안으로 만들어 바로 `SUBMIT_CAPTCHA_AND_RESUME({ answer })`
 → v1.8.12부터는 `challengeText`를 끝내 못 읽더라도 `solveHints.answerMode = "vision_direct_answer"`가 내려오며, OCR 후보가 한 개로 정리되고 길이 힌트까지 맞으면 서비스워커가 `SUBMIT_CAPTCHA_AND_RESUME({ ocrTexts })`도 직접 답안으로 수용

@@ -60,6 +60,7 @@ import {
   decideDirectPublishStartupAction,
   DIRECT_PUBLISH_CONTINUATION_ALARM
 } from '../utils/direct-publish-runtime.js';
+import { buildMergedDirectPublishCaptchaState } from '../utils/direct-publish-captcha.js';
 
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
@@ -3119,6 +3120,27 @@ async function getLiveDirectPublishState(options = {}) {
   return enrichDirectPublishStateWithSolveHints(snapshot);
 }
 
+function normalizeOptionalTabId(value) {
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric : null;
+}
+
+async function getDirectPublishStateForTargetTab(explicitTabId = null, options = {}) {
+  const liveState = await getLiveDirectPublishState(options);
+  if (!liveState) {
+    return null;
+  }
+
+  const normalizedExplicitTabId = normalizeOptionalTabId(explicitTabId);
+  if (normalizedExplicitTabId === null) {
+    return liveState;
+  }
+
+  return normalizeOptionalTabId(liveState.tabId) === normalizedExplicitTabId
+    ? liveState
+    : null;
+}
+
 function getProbeFailureReason(probeResult = null) {
   return probeResult?.reason
     || probeResult?.diagnostics?.reason
@@ -4289,19 +4311,17 @@ async function refreshDirectPublishCaptchaState(tabId, submitResult) {
 
   const refreshedContext = await getCaptchaContextForTab(tabId);
   if (directPublishState?.tabId === tabId) {
-    await updateDirectPublishState({
+    await updateDirectPublishState(buildMergedDirectPublishCaptchaState({
+      existingState: directPublishState,
+      tabId,
       url: refreshedContext.success ? (refreshedContext.captchaContext?.url || directPublishState?.url) : directPublishState?.url,
-      captchaContext: refreshedContext.success ? refreshedContext.captchaContext : refreshedContext,
-      lastCheckedAt: new Date().toISOString(),
-      lastCaptchaSubmitResult: {
-        success: submitResult.success,
-        status: submitResult.status || null,
-        captchaStillAppears: submitResult.captchaStillAppears ?? refreshedContext?.captchaContext?.captchaPresent ?? null,
-        answerLength: typeof submitResult.answerLength === 'number' ? submitResult.answerLength : null,
-        normalization: submitResult.answerNormalization || null,
-        updatedAt: new Date().toISOString()
-      }
-    });
+      captchaContext: refreshedContext.success ? refreshedContext.captchaContext : null,
+      submitResult: {
+        ...submitResult,
+        captchaStillAppears: submitResult.captchaStillAppears ?? refreshedContext?.captchaContext?.captchaPresent ?? null
+      },
+      lastCheckedAt: new Date().toISOString()
+    }));
   }
 
   return refreshedContext;
@@ -4543,15 +4563,17 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
         captchaContext: handoff.captchaContext || null
       });
       const failedState = {
-        ...nextState,
-        tabId: preparation.tabId,
-        blogName: mergedRequestData.blogName || nextState.blogName || preparation.blogName,
-        url: preparation.url || nextState.url,
-        status: captchaWait.status === 'editor_not_ready' ? 'editor_not_ready' : 'captcha_required',
-        requestData: normalizeDirectPublishRequestData(mergedRequestData),
-        captchaContext: handoff.captchaContext || null,
-        lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts),
-        lastCaptchaWait: summarizeCaptchaWaitResult(captchaWait, waitOptions)
+        ...buildMergedDirectPublishCaptchaState({
+          existingState: nextState,
+          tabId: preparation.tabId,
+          status: captchaWait.status === 'editor_not_ready' ? 'editor_not_ready' : 'captcha_required',
+          url: preparation.url || nextState.url,
+          requestData: normalizeDirectPublishRequestData(mergedRequestData),
+          handoff,
+          lastCaptchaWait: summarizeCaptchaWaitResult(captchaWait, waitOptions),
+          lastCheckedAt: new Date().toISOString()
+        }),
+        blogName: mergedRequestData.blogName || nextState.blogName || preparation.blogName
       };
       await setDirectPublishState({
         ...failedState,
@@ -4581,14 +4603,16 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
           captchaContext: handoff.captchaContext || null
         });
         const blockedState = {
-          ...nextState,
-          tabId: preparation.tabId,
-          blogName: mergedRequestData.blogName || nextState.blogName || preparation.blogName,
-          url: preparation.url || nextState.url,
-          status: 'captcha_required',
-          requestData: normalizeDirectPublishRequestData(mergedRequestData),
-          captchaContext: handoff.captchaContext || null,
-          lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
+          ...buildMergedDirectPublishCaptchaState({
+            existingState: nextState,
+            tabId: preparation.tabId,
+            status: 'captcha_required',
+            url: preparation.url || nextState.url,
+            requestData: normalizeDirectPublishRequestData(mergedRequestData),
+            handoff,
+            lastCheckedAt: new Date().toISOString()
+          }),
+          blogName: mergedRequestData.blogName || nextState.blogName || preparation.blogName
         };
         await setDirectPublishState({
           ...blockedState,
@@ -4639,18 +4663,30 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
         status: postCaptchaSettle.status || 'captcha_required',
         error: postCaptchaSettle.error || 'CAPTCHA가 다시 표시되어 자동 재개를 중단합니다.'
       }, preparation);
-      await setDirectPublishState({
-        ...buildDirectPublishState({
-          response: blockedResponse,
-          preparation,
-          requestData: mergedRequestData,
-          captchaContext: handoff.captchaContext || postCaptchaSettle.lastCaptchaCheck?.captchaContext || null
-        }),
+      const blockedBaseState = buildDirectPublishState({
+        response: blockedResponse,
+        preparation,
+        requestData: mergedRequestData,
+        captchaContext: handoff.captchaContext || postCaptchaSettle.lastCaptchaCheck?.captchaContext || null
+      });
+      await setDirectPublishState(buildMergedDirectPublishCaptchaState({
+        existingState: directPublishState?.tabId === preparation.tabId
+          ? {
+              ...(directPublishState || {}),
+              ...blockedBaseState
+            }
+          : blockedBaseState,
+        tabId: preparation.tabId,
+        status: blockedResponse.status || 'captcha_required',
+        url: preparation.url || blockedBaseState.url || directPublishState?.url || null,
+        requestData: normalizeDirectPublishRequestData(mergedRequestData),
+        captchaContext: handoff.captchaContext || postCaptchaSettle.lastCaptchaCheck?.captchaContext || (directPublishState?.tabId === preparation.tabId ? directPublishState?.captchaContext : null) || null,
+        handoff,
         lastCaptchaWait: captchaWait
           ? summarizeCaptchaWaitResult(captchaWait, waitOptions)
           : (directPublishState?.lastCaptchaWait || null),
-        lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
-      });
+        lastCheckedAt: new Date().toISOString()
+      }));
       return attachCaptchaWait(attachCaptchaHandoff(attachDirectPublishState(blockedResponse), handoff), captchaWait);
     }
   }
@@ -4730,17 +4766,29 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
 
     if (responseWithPreparation.status === 'captcha_required') {
       const handoff = await captureCaptchaHandoffForTab(preparation.tabId);
-      await setDirectPublishState({
-        ...buildDirectPublishState({
-          response: responseWithPreparation,
-          preparation,
-          requestData: {
-            ...mergedRequestData,
-            blogName: mergedRequestData.blogName || directPublishState?.blogName || preparation.blogName,
-            visibility: mergedRequestData.visibility || directPublishState?.visibility || null
-          },
-          captchaContext: handoff.captchaContext || responseWithPreparation.captchaContext || null
-        }),
+      const blockedResumeState = buildDirectPublishState({
+        response: responseWithPreparation,
+        preparation,
+        requestData: {
+          ...mergedRequestData,
+          blogName: mergedRequestData.blogName || directPublishState?.blogName || preparation.blogName,
+          visibility: mergedRequestData.visibility || directPublishState?.visibility || null
+        },
+        captchaContext: handoff.captchaContext || responseWithPreparation.captchaContext || null
+      });
+      await setDirectPublishState(buildMergedDirectPublishCaptchaState({
+        existingState: directPublishState?.tabId === preparation.tabId
+          ? {
+              ...(directPublishState || {}),
+              ...blockedResumeState
+            }
+          : blockedResumeState,
+        tabId: preparation.tabId,
+        status: responseWithPreparation.status || 'captcha_required',
+        url: preparation.url || blockedResumeState.url || directPublishState?.url || null,
+        requestData: blockedResumeState.requestData,
+        captchaContext: handoff.captchaContext || responseWithPreparation.captchaContext || (directPublishState?.tabId === preparation.tabId ? directPublishState?.captchaContext : null) || null,
+        handoff,
         lastDraftRestore: {
           success: true,
           restored: !!draftRestore.restored,
@@ -4751,8 +4799,8 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
         lastCaptchaWait: captchaWait
           ? summarizeCaptchaWaitResult(captchaWait, waitOptions)
           : (directPublishState?.lastCaptchaWait || null),
-        lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
-      });
+        lastCheckedAt: new Date().toISOString()
+      }));
       return attachCaptchaWait(attachCaptchaHandoff(attachDirectPublishState(responseWithPreparation), handoff), captchaWait);
     }
 
@@ -6717,15 +6765,28 @@ async function handleMessage(message, sender) {
 
         if (responseWithPreparation.status === 'captcha_required') {
           const handoff = await captureCaptchaHandoffForTab(preparation.tabId);
-          await setDirectPublishState({
-            ...buildDirectPublishState({
-              response: responseWithPreparation,
-              preparation,
-              requestData: message.data || {},
-              captchaContext: handoff.captchaContext || responseWithPreparation.captchaContext || null
-            }),
-            lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
+          const blockedWriteState = buildDirectPublishState({
+            response: responseWithPreparation,
+            preparation,
+            requestData: message.data || {},
+            captchaContext: handoff.captchaContext || responseWithPreparation.captchaContext || null
           });
+          await setDirectPublishState(buildMergedDirectPublishCaptchaState({
+            existingState: {
+              ...(directPublishState?.tabId === preparation.tabId ? directPublishState : {}),
+              ...blockedWriteState
+            },
+            tabId: preparation.tabId,
+            status: responseWithPreparation.status || 'captcha_required',
+            url: preparation.url || blockedWriteState.url || directPublishState?.url || null,
+            requestData: blockedWriteState.requestData,
+            captchaContext: handoff.captchaContext
+              || responseWithPreparation.captchaContext
+              || (directPublishState?.tabId === preparation.tabId ? directPublishState?.captchaContext : null)
+              || null,
+            handoff,
+            lastCheckedAt: new Date().toISOString()
+          }));
           return attachCaptchaHandoff(attachDirectPublishState(responseWithPreparation), handoff);
         }
 
@@ -6865,7 +6926,7 @@ async function handleMessage(message, sender) {
 
     case 'GET_CAPTCHA_CONTEXT': {
       const explicitTabId = message.data?.tabId || null;
-      const savedState = explicitTabId ? null : await getLiveDirectPublishState();
+      const savedState = await getDirectPublishStateForTargetTab(explicitTabId);
       const tabId = explicitTabId || savedState?.tabId || currentTabId;
       const captchaContextResult = await getCaptchaContextForTab(tabId);
 
@@ -6874,11 +6935,13 @@ async function handleMessage(message, sender) {
       }
 
       if (savedState?.tabId && savedState.tabId === tabId) {
-        await updateDirectPublishState({
+        await updateDirectPublishState(buildMergedDirectPublishCaptchaState({
+          existingState: savedState,
+          tabId,
           url: captchaContextResult.captchaContext?.url || savedState.url,
           captchaContext: captchaContextResult.captchaContext,
           lastCheckedAt: new Date().toISOString()
-        });
+        }));
       }
 
       return attachSolveHints({
@@ -6891,17 +6954,22 @@ async function handleMessage(message, sender) {
 
     case 'GET_CAPTCHA_ARTIFACTS': {
       const explicitTabId = message.data?.tabId || null;
-      const savedState = explicitTabId ? null : await getLiveDirectPublishState();
+      const savedState = await getDirectPublishStateForTargetTab(explicitTabId);
       const tabId = explicitTabId || savedState?.tabId || currentTabId;
       const artifactResult = await getCaptchaArtifactsForTab(tabId, message.data || {});
 
       if (savedState?.tabId && savedState.tabId === tabId) {
-        await updateDirectPublishState({
+        await updateDirectPublishState(buildMergedDirectPublishCaptchaState({
+          existingState: savedState,
+          tabId,
           url: artifactResult.captureContext?.url || savedState.url,
           captchaContext: artifactResult.captureContext || savedState.captchaContext || null,
-          lastCheckedAt: new Date().toISOString(),
-          lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(artifactResult)
-        });
+          handoff: {
+            captchaContext: artifactResult.captureContext || null,
+            captchaArtifacts: artifactResult
+          },
+          lastCheckedAt: new Date().toISOString()
+        }));
       }
 
       return attachSolveHints({
@@ -6912,7 +6980,7 @@ async function handleMessage(message, sender) {
 
     case 'INFER_CAPTCHA_ANSWER': {
       const explicitTabId = message.data?.tabId || null;
-      const savedState = explicitTabId ? null : await getLiveDirectPublishState({ includeCaptchaContext: true });
+      const savedState = await getDirectPublishStateForTargetTab(explicitTabId, { includeCaptchaContext: true });
       const tabId = explicitTabId || savedState?.tabId || currentTabId;
       const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, savedState);
 
@@ -6925,7 +6993,7 @@ async function handleMessage(message, sender) {
 
     case 'SUBMIT_CAPTCHA': {
       const explicitTabId = message.data?.tabId || null;
-      const savedState = explicitTabId ? null : await getLiveDirectPublishState({ includeCaptchaContext: true });
+      const savedState = await getDirectPublishStateForTargetTab(explicitTabId, { includeCaptchaContext: true });
       const tabId = explicitTabId || savedState?.tabId || currentTabId;
       const answerResolution = await resolveCaptchaAnswerInput(tabId, message.data || {}, savedState);
       if (!answerResolution.success) {
@@ -6945,12 +7013,14 @@ async function handleMessage(message, sender) {
       if (!submitResult.success || captchaStillAppears) {
         const handoff = await captureCaptchaHandoffForTab(tabId);
         if (directPublishState?.tabId === tabId) {
-          await updateDirectPublishState({
+          await updateDirectPublishState(buildMergedDirectPublishCaptchaState({
+            existingState: directPublishState,
+            tabId,
             url: handoff.captchaContext?.url || directPublishState?.url || null,
             captchaContext: handoff.captchaContext || directPublishState?.captchaContext || null,
-            lastCheckedAt: new Date().toISOString(),
-            lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
-          });
+            handoff,
+            lastCheckedAt: new Date().toISOString()
+          }));
         }
 
         return attachCaptchaHandoff({
@@ -7048,12 +7118,14 @@ async function handleMessage(message, sender) {
           await saveQueueState();
         }
         if (directPublishState?.tabId === tabId) {
-          await updateDirectPublishState({
+          await updateDirectPublishState(buildMergedDirectPublishCaptchaState({
+            existingState: directPublishState,
+            tabId,
             url: handoff.captchaContext?.url || directPublishState?.url || null,
             captchaContext: handoff.captchaContext || directPublishState?.captchaContext || null,
-            lastCheckedAt: new Date().toISOString(),
-            lastCaptchaArtifactCapture: summarizeCaptchaArtifactCapture(handoff.captchaArtifacts)
-          });
+            handoff,
+            lastCheckedAt: new Date().toISOString()
+          }));
         }
 
         return attachCaptchaHandoff({

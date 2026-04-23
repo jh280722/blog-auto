@@ -320,6 +320,53 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 13. 응답이 `captcha_still_present`인데 `answerRetrySummary.stoppedReason === "challenge_changed"`면 challenge가 새로고침된 것이므로, 새 artifact/OCR 후보로 다시 시작합니다.
 14. `editor_not_ready`면 `diagnostics.attempts[].editorProbe` / `contentScriptAlive` / `preflight.reason`을 보고 `PREPARE_EDITOR` 재호출
 
+### 4. 크론/CLI 래퍼 (`scripts/blog_auto_call.mjs`)
+
+크론이 `chrome.runtime.sendMessage(...)` callback을 무기한 기다리다가 **셸 hard timeout**에만 의존하지 않도록, repo에는 구조화된 호출 래퍼 `scripts/blog_auto_call.mjs`가 포함됩니다.
+
+```bash
+# 기본: 127.0.0.1:18800 의 운영 Chrome + extension API page 재사용
+node scripts/blog_auto_call.mjs \
+  --action PREPARE_EDITOR \
+  --data-json '{"blogName":"nakseo-dev"}'
+
+node scripts/blog_auto_call.mjs \
+  --action WRITE_POST \
+  --data-file /path/to/payload.json
+```
+
+주요 동작:
+- `chrome-extension://<EXTENSION_ID>/api/api-page.html` 탭을 자동 재사용/복구
+- `BLOG_AUTO_CALL_TIMEOUT_MS` 또는 `--timeout-ms` 기준으로 **page-context Promise timeout** 적용
+- timeout 시 터미널 hard timeout까지 멍하게 기다리지 않고 즉시 `status: "bridge_timeout"` 반환
+- timeout 응답에는 follow-up diagnostics 포함:
+  - `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)`
+  - `GET_QUEUE`
+  - 가능할 때 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS`
+- bulky `artifact.dataUrl`는 제거하고 compact summary만 남겨, 크론 로그가 base64 blob으로 오염되지 않음
+- 정상 응답에도 `bridgeMeta.startedAt/finishedAt/runtimeTimeoutMs/apiTarget`를 붙여 호출 provenance를 남김
+
+timeout 예시:
+
+```json
+{
+  "success": false,
+  "status": "bridge_timeout",
+  "error": "PREPARE_EDITOR did not return a callback within 300ms.",
+  "bridgeDiagnostics": {
+    "inferredCause": "editor_prepare_unresolved",
+    "directState": { "directPublish": null },
+    "queueState": { "total": 0 },
+    "captchaContext": null,
+    "captchaArtifacts": null
+  }
+}
+```
+
+운영 팁:
+- wrapper-level timeout (`bridge_timeout`)은 **확장 응답이 아예 없는 경우**를 surface하는 용도입니다. extension이 정상적으로 `editor_not_ready`, `captcha_required`, `captcha_wait_timeout` 등을 돌려주면 그 응답은 그대로 통과시킵니다.
+- 실제 크론에서는 이 래퍼를 먼저 쓰고, 터미널/cron hard timeout은 wrapper timeout보다 넉넉한 마지막 safety net으로만 둡니다.
+
 ---
 
 ## 구조
@@ -337,10 +384,15 @@ chrome.runtime.sendMessage(EXTENSION_ID, {
 │   └── popup.js               # 이벤트 핸들링, 재개 버튼
 ├── api/
 │   └── api-page.html          # 외부 API 테스트 페이지
+├── scripts/
+│   └── blog_auto_call.mjs     # 크론/CLI용 structured bridge wrapper
 ├── utils/
+│   ├── blog-auto-call.js      # blog_auto_call.mjs용 CDP/diagnostics helper
 │   ├── image-handler.js       # 이미지 유틸리티
 │   ├── captcha-submit-recovery.js # frame submit 응답 누락 복구 유틸
 │   └── queue-runtime.js       # MV3 queue wake-up / restart recovery 유틸
+├── tests/
+│   └── blog-auto-call.test.mjs # wrapper timeout/diagnostics regression tests
 ├── icons/                     # 확장 프로그램 아이콘
 └── docs/
     └── README.md              # 이 문서

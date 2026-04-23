@@ -304,3 +304,37 @@ export function getQueueCaptchaSelectionFailure({
 
   return null;
 }
+
+export function resolveQueueCaptchaTargetSelection({
+  queue = [],
+  itemId = null,
+  tabId = null,
+  directPublishTabId = null
+} = {}) {
+  const queueSelection = summarizeQueueCaptchaSelection(queue, { itemId, tabId });
+  const normalizedItemId = typeof itemId === 'string' ? itemId.trim() : '';
+  const tabIdProvided = isProvidedSelector(tabId);
+  const normalizedDirectPublishTabId = normalizePositiveInteger(directPublishTabId);
+  const shouldResolveByDefault = !normalizedItemId && !tabIdProvided && normalizedDirectPublishTabId === null;
+  const shouldResolve = !!normalizedItemId || tabIdProvided || shouldResolveByDefault;
+  const matchedItem = shouldResolve
+    ? findQueueCaptchaItem(queue, { itemId, tabId })
+    : null;
+  const failure = shouldResolve
+    ? getQueueCaptchaSelectionFailure({
+        queue,
+        itemId,
+        tabId,
+        matchedItem,
+        directPublishTabId: normalizedDirectPublishTabId
+      })
+    : null;
+
+  return {
+    shouldResolve,
+    shouldResolveByDefault,
+    matchedItem,
+    failure,
+    queueSelection
+  };
+}

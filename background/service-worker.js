@@ -54,6 +54,7 @@ import {
   decideQueueCaptchaResumeProbeAction,
   findQueueCaptchaItem,
   getQueueCaptchaSelectionFailure,
+  resolveQueueCaptchaTargetSelection,
   summarizeQueueCaptchaSelection
 } from '../utils/queue-captcha.js';
 import {
@@ -3355,6 +3356,91 @@ async function resolveCaptchaActionTarget({ explicitTabId = null, savedState = n
     requireActionablePath,
     currentTabContextResult
   });
+}
+
+function summarizeQueueCaptchaTargetItem(queueItem = null) {
+  if (!queueItem || typeof queueItem !== 'object') {
+    return null;
+  }
+
+  return {
+    id: queueItem.id || null,
+    captchaTabId: Number.isInteger(Number(queueItem.captchaTabId)) ? Number(queueItem.captchaTabId) : null,
+    captchaStage: typeof queueItem.captchaStage === 'string' ? queueItem.captchaStage : null,
+    lastCheckedAt: queueItem.lastCheckedAt || null
+  };
+}
+
+async function resolveQueueCaptchaReadTarget({ itemId = null, explicitTabId = null, directPublishState = null } = {}) {
+  const queueTarget = resolveQueueCaptchaTargetSelection({
+    queue: publishQueue,
+    itemId,
+    tabId: explicitTabId,
+    directPublishTabId: directPublishState?.tabId || null
+  });
+
+  if (!queueTarget.shouldResolve) {
+    return {
+      success: false,
+      queueSelection: queueTarget.queueSelection,
+      queueCaptchaItem: null,
+      queueSelectionFailure: null
+    };
+  }
+
+  if (queueTarget.failure) {
+    return {
+      success: false,
+      queueSelection: queueTarget.queueSelection,
+      queueCaptchaItem: queueTarget.matchedItem,
+      queueSelectionFailure: queueTarget.failure
+    };
+  }
+
+  const queueCaptchaItem = queueTarget.matchedItem;
+  const tabId = Number.isInteger(Number(queueCaptchaItem?.captchaTabId))
+    ? Number(queueCaptchaItem.captchaTabId)
+    : (explicitTabId || directPublishState?.tabId || currentTabId || null);
+
+  return {
+    success: true,
+    source: 'queue',
+    tabId,
+    queueSelection: queueTarget.queueSelection,
+    queueCaptchaItem,
+    captchaState: buildQueueCaptchaSavedStateForAnswerResolution({
+      queueItem: queueCaptchaItem,
+      directPublishState,
+      requestedTabId: tabId
+    })
+  };
+}
+
+async function refreshQueueCaptchaReadState(queueCaptchaItem, { tabId = null, captchaContext = null, captchaArtifacts = null } = {}) {
+  if (!queueCaptchaItem || queueCaptchaItem.status !== 'captcha_paused') {
+    return;
+  }
+
+  Object.assign(queueCaptchaItem, buildQueueCaptchaPauseState({
+    existingItem: queueCaptchaItem,
+    tabId,
+    response: captchaContext
+      ? {
+          captchaStage: queueCaptchaItem.captchaStage,
+          diagnostics: queueCaptchaItem.diagnostics,
+          captchaContext,
+          solveHints: captchaContext?.solveHints || null
+        }
+      : null,
+    handoff: captchaArtifacts
+      ? {
+          captchaContext: captchaContext || captchaArtifacts.captureContext || null,
+          captchaArtifacts
+        }
+      : null,
+    error: queueCaptchaItem.error || 'CAPTCHA 감지 — 같은 탭에서 solve 후 재개'
+  }));
+  await saveQueueState();
 }
 
 function normalizeCaptchaAnswer(answer) {
@@ -6996,16 +7082,42 @@ async function handleMessage(message, sender) {
     }
 
     case 'GET_CAPTCHA_CONTEXT': {
+      const explicitItemId = typeof message.data?.id === 'string' ? message.data.id.trim() : '';
       const explicitTabId = message.data?.tabId || null;
-      const savedState = await getDirectPublishStateForTargetTab(explicitTabId);
-      const target = await resolveCaptchaActionTarget({
+      const savedState = await getLiveDirectPublishState({ includeCaptchaContext: true });
+      const queueReadTarget = await resolveQueueCaptchaReadTarget({
+        itemId: explicitItemId || null,
         explicitTabId,
-        savedState,
-        requireActionablePath: false
+        directPublishState: savedState
       });
+      if (queueReadTarget.queueSelectionFailure) {
+        return {
+          ...queueReadTarget.queueSelectionFailure,
+          queueItemId: queueReadTarget.queueCaptchaItem?.id || null,
+          queueCaptcha: summarizeQueueCaptchaTargetItem(queueReadTarget.queueCaptchaItem),
+          directPublish: savedState?.tabId ? { ...directPublishState } : null
+        };
+      }
+
+      const target = queueReadTarget.success
+        ? {
+            success: true,
+            tabId: queueReadTarget.tabId,
+            savedStateForTab: savedState?.tabId === queueReadTarget.tabId ? savedState : null,
+            captchaState: queueReadTarget.captchaState,
+            currentTabContextResult: null,
+            queueCaptchaItem: queueReadTarget.queueCaptchaItem,
+            queueSelection: queueReadTarget.queueSelection
+          }
+        : await resolveCaptchaActionTarget({
+            explicitTabId,
+            savedState,
+            requireActionablePath: false
+          });
       if (!target.success) {
         return {
           ...target,
+          queueSelection: queueReadTarget.queueSelection,
           directPublish: savedState?.tabId ? { ...directPublishState } : null
         };
       }
@@ -7017,7 +7129,12 @@ async function handleMessage(message, sender) {
         : await getCaptchaContextForTab(tabId);
 
       if (!captchaContextResult.success) {
-        return captchaContextResult;
+        return {
+          ...captchaContextResult,
+          queueItemId: target.queueCaptchaItem?.id || null,
+          queueSelection: target.queueSelection || queueReadTarget.queueSelection,
+          queueCaptcha: summarizeQueueCaptchaTargetItem(target.queueCaptchaItem)
+        };
       }
 
       if (savedStateForTab?.tabId && savedStateForTab.tabId === tabId) {
@@ -7029,26 +7146,60 @@ async function handleMessage(message, sender) {
           lastCheckedAt: new Date().toISOString()
         }));
       }
+      if (target.queueCaptchaItem) {
+        await refreshQueueCaptchaReadState(target.queueCaptchaItem, {
+          tabId,
+          captchaContext: captchaContextResult.captchaContext || null
+        });
+      }
 
       return attachSolveHints({
         success: true,
         tabId,
         captchaContext: captchaContextResult.captchaContext,
+        queueItemId: target.queueCaptchaItem?.id || null,
+        queueSelection: target.queueSelection || queueReadTarget.queueSelection,
+        queueCaptcha: summarizeQueueCaptchaTargetItem(target.queueCaptchaItem),
         directPublish: savedStateForTab?.tabId === tabId ? enrichDirectPublishStateWithSolveHints({ ...directPublishState }) : null
       }, captchaContextResult.captchaContext);
     }
 
     case 'GET_CAPTCHA_ARTIFACTS': {
+      const explicitItemId = typeof message.data?.id === 'string' ? message.data.id.trim() : '';
       const explicitTabId = message.data?.tabId || null;
-      const savedState = await getDirectPublishStateForTargetTab(explicitTabId);
-      const target = await resolveCaptchaActionTarget({
+      const savedState = await getLiveDirectPublishState({ includeCaptchaContext: true });
+      const queueReadTarget = await resolveQueueCaptchaReadTarget({
+        itemId: explicitItemId || null,
         explicitTabId,
-        savedState,
-        requireActionablePath: false
+        directPublishState: savedState
       });
+      if (queueReadTarget.queueSelectionFailure) {
+        return {
+          ...queueReadTarget.queueSelectionFailure,
+          queueItemId: queueReadTarget.queueCaptchaItem?.id || null,
+          queueCaptcha: summarizeQueueCaptchaTargetItem(queueReadTarget.queueCaptchaItem),
+          directPublish: savedState?.tabId ? { ...directPublishState } : null
+        };
+      }
+
+      const target = queueReadTarget.success
+        ? {
+            success: true,
+            tabId: queueReadTarget.tabId,
+            savedStateForTab: savedState?.tabId === queueReadTarget.tabId ? savedState : null,
+            captchaState: queueReadTarget.captchaState,
+            queueCaptchaItem: queueReadTarget.queueCaptchaItem,
+            queueSelection: queueReadTarget.queueSelection
+          }
+        : await resolveCaptchaActionTarget({
+            explicitTabId,
+            savedState,
+            requireActionablePath: false
+          });
       if (!target.success) {
         return {
           ...target,
+          queueSelection: queueReadTarget.queueSelection,
           directPublish: savedState?.tabId ? { ...directPublishState } : null
         };
       }
@@ -7070,24 +7221,59 @@ async function handleMessage(message, sender) {
           lastCheckedAt: new Date().toISOString()
         }));
       }
+      if (target.queueCaptchaItem) {
+        await refreshQueueCaptchaReadState(target.queueCaptchaItem, {
+          tabId,
+          captchaContext: artifactResult.captureContext || null,
+          captchaArtifacts: artifactResult
+        });
+      }
 
       return attachSolveHints({
         ...artifactResult,
+        queueItemId: target.queueCaptchaItem?.id || null,
+        queueSelection: target.queueSelection || queueReadTarget.queueSelection,
+        queueCaptcha: summarizeQueueCaptchaTargetItem(target.queueCaptchaItem),
         directPublish: savedStateForTab?.tabId === tabId ? enrichDirectPublishStateWithSolveHints({ ...directPublishState }) : null
       }, artifactResult.captureContext || null);
     }
 
     case 'INFER_CAPTCHA_ANSWER': {
+      const explicitItemId = typeof message.data?.id === 'string' ? message.data.id.trim() : '';
       const explicitTabId = message.data?.tabId || null;
-      const savedState = await getDirectPublishStateForTargetTab(explicitTabId, { includeCaptchaContext: true });
-      const target = await resolveCaptchaActionTarget({
+      const savedState = await getLiveDirectPublishState({ includeCaptchaContext: true });
+      const queueReadTarget = await resolveQueueCaptchaReadTarget({
+        itemId: explicitItemId || null,
         explicitTabId,
-        savedState,
-        requireActionablePath: false
+        directPublishState: savedState
       });
+      if (queueReadTarget.queueSelectionFailure) {
+        return {
+          ...queueReadTarget.queueSelectionFailure,
+          queueItemId: queueReadTarget.queueCaptchaItem?.id || null,
+          queueCaptcha: summarizeQueueCaptchaTargetItem(queueReadTarget.queueCaptchaItem),
+          directPublish: savedState?.tabId ? { ...directPublishState } : null
+        };
+      }
+
+      const target = queueReadTarget.success
+        ? {
+            success: true,
+            tabId: queueReadTarget.tabId,
+            savedStateForTab: savedState?.tabId === queueReadTarget.tabId ? savedState : null,
+            captchaState: queueReadTarget.captchaState,
+            queueCaptchaItem: queueReadTarget.queueCaptchaItem,
+            queueSelection: queueReadTarget.queueSelection
+          }
+        : await resolveCaptchaActionTarget({
+            explicitTabId,
+            savedState,
+            requireActionablePath: false
+          });
       if (!target.success) {
         return {
           ...target,
+          queueSelection: queueReadTarget.queueSelection,
           directPublish: savedState?.tabId ? { ...directPublishState } : null
         };
       }
@@ -7098,6 +7284,9 @@ async function handleMessage(message, sender) {
       return {
         ...answerResolution,
         tabId,
+        queueItemId: target.queueCaptchaItem?.id || null,
+        queueSelection: target.queueSelection || queueReadTarget.queueSelection,
+        queueCaptcha: summarizeQueueCaptchaTargetItem(target.queueCaptchaItem),
         directPublish: target.savedStateForTab?.tabId === tabId ? { ...directPublishState } : null
       };
     }

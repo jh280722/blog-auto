@@ -8,6 +8,7 @@ import {
   decideQueueCaptchaResumeProbeAction,
   findQueueCaptchaItem,
   getQueueCaptchaSelectionFailure,
+  resolveQueueCaptchaTargetSelection,
   summarizeQueueCaptchaSelection
 } from '../utils/queue-captcha.js';
 
@@ -280,6 +281,106 @@ test('getQueueCaptchaSelectionFailure requires a selector when multiple paused q
   assert.deepEqual(failure, {
     status: 'queue_captcha_target_required',
     error: 'captcha_paused 큐 항목이 여러 개입니다. id 또는 tabId를 지정하세요.',
+    queueSelection: {
+      pausedCount: 2,
+      requestedItemId: null,
+      requestedTabId: null,
+      pausedItemIds: ['paused-a', 'paused-b'],
+      pausedTabIds: [101, 202]
+    }
+  });
+});
+
+test('resolveQueueCaptchaTargetSelection auto-selects the only paused queue item when direct publish state is absent', () => {
+  const resolution = resolveQueueCaptchaTargetSelection({
+    queue: [
+      { id: 'pending', status: 'pending' },
+      { id: 'paused-only', status: 'captcha_paused', captchaTabId: 777 }
+    ],
+    directPublishTabId: null
+  });
+
+  assert.deepEqual(resolution, {
+    shouldResolve: true,
+    shouldResolveByDefault: true,
+    matchedItem: { id: 'paused-only', status: 'captcha_paused', captchaTabId: 777 },
+    failure: null,
+    queueSelection: {
+      pausedCount: 1,
+      requestedItemId: null,
+      requestedTabId: null,
+      pausedItemIds: ['paused-only'],
+      pausedTabIds: [777]
+    }
+  });
+});
+
+test('resolveQueueCaptchaTargetSelection skips implicit queue selection while a direct publish captcha target exists', () => {
+  const resolution = resolveQueueCaptchaTargetSelection({
+    queue: [
+      { id: 'paused-only', status: 'captcha_paused', captchaTabId: 777 }
+    ],
+    directPublishTabId: 888
+  });
+
+  assert.deepEqual(resolution, {
+    shouldResolve: false,
+    shouldResolveByDefault: false,
+    matchedItem: null,
+    failure: null,
+    queueSelection: {
+      pausedCount: 1,
+      requestedItemId: null,
+      requestedTabId: null,
+      pausedItemIds: ['paused-only'],
+      pausedTabIds: [777]
+    }
+  });
+});
+
+test('resolveQueueCaptchaTargetSelection honors an explicit queue item id even when direct publish state exists', () => {
+  const resolution = resolveQueueCaptchaTargetSelection({
+    queue: buildQueue(),
+    itemId: 'paused-b',
+    directPublishTabId: 999
+  });
+
+  assert.deepEqual(resolution, {
+    shouldResolve: true,
+    shouldResolveByDefault: false,
+    matchedItem: { id: 'paused-b', status: 'captcha_paused', captchaTabId: 202 },
+    failure: null,
+    queueSelection: {
+      pausedCount: 2,
+      requestedItemId: 'paused-b',
+      requestedTabId: null,
+      pausedItemIds: ['paused-a', 'paused-b'],
+      pausedTabIds: [101, 202]
+    }
+  });
+});
+
+test('resolveQueueCaptchaTargetSelection surfaces the same fail-closed diagnostics for ambiguous queue captcha targets', () => {
+  const resolution = resolveQueueCaptchaTargetSelection({
+    queue: buildQueue(),
+    directPublishTabId: null
+  });
+
+  assert.deepEqual(resolution, {
+    shouldResolve: true,
+    shouldResolveByDefault: true,
+    matchedItem: null,
+    failure: {
+      status: 'queue_captcha_target_required',
+      error: 'captcha_paused 큐 항목이 여러 개입니다. id 또는 tabId를 지정하세요.',
+      queueSelection: {
+        pausedCount: 2,
+        requestedItemId: null,
+        requestedTabId: null,
+        pausedItemIds: ['paused-a', 'paused-b'],
+        pausedTabIds: [101, 202]
+      }
+    },
     queueSelection: {
       pausedCount: 2,
       requestedItemId: null,

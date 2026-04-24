@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
   hasPublishProgressText,
-  isPostCaptchaPublishStillInFlight
+  isPostCaptchaPublishStillInFlight,
+  isStableCaptchaClearAfterDelay
 } from '../utils/captcha-post-submit-settle.js';
 
 test('hasPublishProgressText recognizes common publish progress labels', () => {
@@ -39,4 +40,21 @@ test('isPostCaptchaPublishStillInFlight ignores ready-to-submit publish layers',
     completeButtonText: '완료',
     completeButton: { disabled: false }
   }), false);
+});
+
+test('isStableCaptchaClearAfterDelay requires the delayed check to remain clear', () => {
+  assert.equal(isStableCaptchaClearAfterDelay(
+    { success: true, captchaPresent: false },
+    { success: true, captchaPresent: false }
+  ), true);
+
+  assert.equal(isStableCaptchaClearAfterDelay(
+    { success: true, captchaPresent: false },
+    { success: true, captchaPresent: true }
+  ), false);
+
+  assert.equal(isStableCaptchaClearAfterDelay(
+    { success: true, captchaPresent: false },
+    { success: false, status: 'editor_not_ready' }
+  ), false);
 });

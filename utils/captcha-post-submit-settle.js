@@ -26,3 +26,14 @@ export function isPostCaptchaPublishStillInFlight(captchaContext = null) {
     || hasPublishProgressText(completeText)
     || ((confirmDisabled || completeDisabled) && !!(confirmText || completeText));
 }
+
+export function isStableCaptchaClearAfterDelay(initialCheck = null, delayedCheck = null) {
+  return !!(
+    initialCheck
+    && delayedCheck
+    && initialCheck.success
+    && delayedCheck.success
+    && !initialCheck.captchaPresent
+    && !delayedCheck.captchaPresent
+  );
+}

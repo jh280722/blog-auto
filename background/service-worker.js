@@ -28,7 +28,10 @@ import {
   buildCaptchaAnswerAttemptCandidates,
   supportsRankedCaptchaAnswerRetries
 } from '../utils/captcha-answer-retry.js';
-import { isPostCaptchaPublishStillInFlight } from '../utils/captcha-post-submit-settle.js';
+import {
+  isPostCaptchaPublishStillInFlight,
+  isStableCaptchaClearAfterDelay
+} from '../utils/captcha-post-submit-settle.js';
 import { hasActionableCaptchaAnswerPath } from '../utils/captcha-submit-capability.js';
 import { decideCaptchaTargetSelection } from '../utils/captcha-target.js';
 import {
@@ -63,6 +66,16 @@ import {
   DIRECT_PUBLISH_CONTINUATION_ALARM
 } from '../utils/direct-publish-runtime.js';
 import { buildMergedDirectPublishCaptchaState } from '../utils/direct-publish-captcha.js';
+import { normalizeTistoryTagsForInput } from '../utils/tistory-tags.js';
+
+function normalizeTistoryPostPayload(payload = {}) {
+  if (!payload || typeof payload !== 'object') return payload;
+  if (!Array.isArray(payload.tags)) return payload;
+  return {
+    ...payload,
+    tags: normalizeTistoryTagsForInput(payload.tags)
+  };
+}
 
 // ── 발행 큐 / 직접 발행 상태 ─────────────────────
 let publishQueue = [];
@@ -4244,32 +4257,62 @@ async function waitForCaptchaResolutionOnTab(tabId, options = {}) {
     }
 
     if (lastCheck.success && !lastCheck.captchaPresent) {
+      const initialClearCheck = lastCheck;
       let postClearDelay = {
         enabled: false,
         baseMs: postClearDelayMs,
         extraMs: 0,
         waitMs: postClearDelayMs
       };
+      let delayedCheck = initialClearCheck;
 
       if (postClearDelayMs > 0) {
         postClearDelay = await delayWithStageJitter(postClearDelayMs, postClearJitterOptions);
+        try {
+          delayedCheck = await getBlockingCaptchaStateForTab(tabId);
+          if (delayedCheck?.success) successfulChecks += 1;
+          else failedChecks += 1;
+        } catch (error) {
+          return {
+            success: false,
+            status: 'editor_not_ready',
+            error: error.message,
+            tabId,
+            waitedMs: Date.now() - startedAt,
+            attempts,
+            successfulChecks,
+            failedChecks,
+            pollIntervalMs,
+            postClearDelayMs,
+            postClearDelayAppliedMs: postClearDelay.waitMs,
+            postClearDelayExtraMs: postClearDelay.extraMs,
+            lastCheck: null,
+            firstClearCheck: initialClearCheck,
+            captchaStillPresent: null
+          };
+        }
       }
 
-      return {
-        success: true,
-        status: 'captcha_cleared',
-        tabId,
-        waitedMs: Date.now() - startedAt,
-        attempts,
-        successfulChecks,
-        failedChecks,
-        pollIntervalMs,
-        postClearDelayMs,
-        postClearDelayAppliedMs: postClearDelay.waitMs,
-        postClearDelayExtraMs: postClearDelay.extraMs,
-        lastCheck,
-        captchaStillPresent: false
-      };
+      if (isStableCaptchaClearAfterDelay(initialClearCheck, delayedCheck)) {
+        return {
+          success: true,
+          status: 'captcha_cleared',
+          tabId,
+          waitedMs: Date.now() - startedAt,
+          attempts,
+          successfulChecks,
+          failedChecks,
+          pollIntervalMs,
+          postClearDelayMs,
+          postClearDelayAppliedMs: postClearDelay.waitMs,
+          postClearDelayExtraMs: postClearDelay.extraMs,
+          lastCheck: delayedCheck,
+          firstClearCheck: initialClearCheck,
+          captchaStillPresent: false
+        };
+      }
+
+      lastCheck = delayedCheck;
     }
 
     const elapsedMs = Date.now() - startedAt;
@@ -5636,6 +5679,7 @@ async function processNextInQueue() {
     const blogName = item.data.blogName || await getBlogName();
     if (!blogName) throw new Error('블로그 이름을 설정해주세요.');
 
+    const normalizedItemData = normalizeTistoryPostPayload(item.data || {});
     const preparation = await prepareEditorTab({ blogName });
     if (!preparation.success) {
       item.status = 'failed';
@@ -5648,7 +5692,7 @@ async function processNextInQueue() {
 
       let responseWithPreparation;
       try {
-        const response = await sendEditorMessage(preparation.tabId, 'WRITE_POST', { ...item.data, autoPublish: true });
+        const response = await sendEditorMessage(preparation.tabId, 'WRITE_POST', { ...normalizedItemData, autoPublish: true });
         responseWithPreparation = normalizePublishResponse(withPreparationDetails(response, preparation));
       } catch (error) {
         preparation.diagnostics.attempts.push({
@@ -5658,7 +5702,7 @@ async function processNextInQueue() {
           at: new Date().toISOString()
         });
 
-        const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(preparation, item.data || {});
+        const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(preparation, normalizedItemData);
         if (!recoveredResponse) {
           throw error;
         }
@@ -5772,6 +5816,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
   }
 
   const previousQueueCaptchaSnapshot = cloneJsonValue(item) || { ...item };
+  const normalizedItemData = normalizeTistoryPostPayload(item.data || {});
   Object.assign(item, clearQueueCaptchaPauseState());
   item.status = 'processing';
   isProcessing = true;
@@ -5828,7 +5873,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
 
   try {
     if (resumeAction.action === 'wait_for_post_captcha_settle') {
-      const postCaptchaSettle = await waitForPostCaptchaCompletionOrResume(resumePreparation, item.data || {});
+      const postCaptchaSettle = await waitForPostCaptchaCompletionOrResume(resumePreparation, normalizedItemData);
       if (postCaptchaSettle.completed && postCaptchaSettle.response) {
         return handleQueueResumeResponse(normalizePublishResponse(postCaptchaSettle.response));
       }
@@ -5844,7 +5889,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
       }
     }
 
-    const draftRestore = await restoreDraftIfNeeded(tabId, item.data || {});
+    const draftRestore = await restoreDraftIfNeeded(tabId, normalizedItemData);
     if (!draftRestore.success) {
       item.status = 'failed';
       item.error = draftRestore.error || '발행 재개 전 초안 복구 실패';
@@ -5873,7 +5918,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
       const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure({
         ...resumePreparation,
         status: resumeAction.status || resumePreparation?.status || 'editor_ready'
-      }, item.data || {}, {
+      }, normalizedItemData, {
         blogName: item.data?.blogName || null
       });
 
@@ -6910,14 +6955,15 @@ async function handleMessage(message, sender) {
     // Popup / API → Content Script로 직접 발행
     case 'WRITE_POST': {
       await clearDirectPublishState();
-      const preparation = await prepareEditorTab({ blogName: message.data?.blogName || null });
+      const normalizedData = normalizeTistoryPostPayload(message.data || {});
+      const preparation = await prepareEditorTab({ blogName: normalizedData?.blogName || null });
       if (!preparation.success) {
         return preparation;
       }
 
       try {
         await ensurePageWorldVisibilityInterceptor(preparation.tabId);
-        const response = await sendEditorMessage(preparation.tabId, message.action, message.data);
+        const response = await sendEditorMessage(preparation.tabId, message.action, normalizedData);
         const responseWithPreparation = normalizePublishResponse(withPreparationDetails(response, preparation));
 
         if (responseWithPreparation.status === 'captcha_required') {
@@ -6925,7 +6971,7 @@ async function handleMessage(message, sender) {
           const blockedWriteState = buildDirectPublishState({
             response: responseWithPreparation,
             preparation,
-            requestData: message.data || {},
+            requestData: normalizedData,
             captchaContext: handoff.captchaContext || responseWithPreparation.captchaContext || null
           });
           await setDirectPublishState(buildMergedDirectPublishCaptchaState({
@@ -6960,7 +7006,7 @@ async function handleMessage(message, sender) {
           originalError: err?.message || String(err)
         });
 
-        const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(preparation, message.data || {});
+        const recoveredResponse = await recoverPublishedResponseAfterSendMessageFailure(preparation, normalizedData);
         if (recoveredResponse) {
           return recoveredResponse;
         }
@@ -6985,14 +7031,17 @@ async function handleMessage(message, sender) {
     case 'INSERT_IMAGES':
     case 'PUBLISH':
     case 'GET_PAGE_INFO': {
-      const preparation = await prepareEditorTab({ blogName: message.data?.blogName || null });
+      const actionData = message.action === 'SET_TAGS'
+        ? normalizeTistoryPostPayload(message.data || {})
+        : (message.data || {});
+      const preparation = await prepareEditorTab({ blogName: actionData?.blogName || null });
       if (!preparation.success) {
         return preparation;
       }
 
       try {
         await ensurePageWorldVisibilityInterceptor(preparation.tabId);
-        const response = await sendEditorMessage(preparation.tabId, message.action, message.data);
+        const response = await sendEditorMessage(preparation.tabId, message.action, actionData);
         return normalizePublishResponse(withPreparationDetails(response, preparation));
       } catch (err) {
         return makePreparationResponse({

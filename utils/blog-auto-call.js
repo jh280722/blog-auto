@@ -317,13 +317,16 @@ function classifyBridgeTimeoutCause({ action, directState, queueState, captchaCo
   return 'extension_bridge_no_callback';
 }
 
-function buildTimeoutDiagnosticFailurePayload(error) {
-  const message = error?.message || String(error) || 'Unknown diagnostic collection error';
-  const failure = {
+function normalizeBridgeDiagnosticError(error, status = 'bridge_diagnostic_error') {
+  return {
     success: false,
-    status: 'bridge_diagnostic_error',
-    error: message
+    status,
+    error: error?.message || String(error) || 'Unknown diagnostic collection error'
   };
+}
+
+function buildTimeoutDiagnosticFailurePayload(error) {
+  const failure = normalizeBridgeDiagnosticError(error);
 
   return {
     directState: { ...failure },
@@ -364,6 +367,166 @@ function buildBridgeTimeoutResult({
     action,
     runtimeTimeoutMs,
     bridgeDiagnostics
+  };
+}
+
+function summarizeBrowserVersionForDiagnostics(versionResult) {
+  if (!isPlainObject(versionResult)) return versionResult ?? null;
+  return {
+    success: true,
+    browser: versionResult.Browser ?? null,
+    protocolVersion: versionResult['Protocol-Version'] ?? null,
+    userAgent: versionResult['User-Agent'] ?? null,
+    hasWebSocketDebuggerUrl: Boolean(versionResult.webSocketDebuggerUrl)
+  };
+}
+
+function summarizeDebugTargetsForDiagnostics(targets, apiPageUrl) {
+  if (!Array.isArray(targets)) return targets ?? null;
+
+  const pageTargets = targets.filter((target) => target?.type === 'page');
+  const apiTarget = pageTargets.find((target) => target?.url === apiPageUrl) || null;
+
+  return {
+    success: true,
+    total: targets.length,
+    pageTargetCount: pageTargets.length,
+    otherPageTargetCount: Math.max(pageTargets.length - (apiTarget ? 1 : 0), 0),
+    apiTarget: apiTarget
+      ? {
+          present: true,
+          id: apiTarget.id ?? null,
+          title: apiTarget.title ?? null,
+          url: apiTarget.url ?? null,
+          attached: apiTarget.attached ?? null,
+          hasWebSocketDebuggerUrl: Boolean(apiTarget.webSocketDebuggerUrl)
+        }
+      : {
+          present: false,
+          url: apiPageUrl
+        }
+  };
+}
+
+function buildSetupDiagnosticFailurePayload(error) {
+  const failure = normalizeBridgeDiagnosticError(error);
+  return {
+    browserVersion: { ...failure },
+    debugTargets: { ...failure }
+  };
+}
+
+async function collectSetupDiagnostics({
+  chromeDebugBaseUrl = DEFAULT_CHROME_DEBUG_BASE_URL,
+  apiPageUrl,
+  timeoutMs = DEFAULT_DIAGNOSTIC_TIMEOUT_MS
+}) {
+  const browserVersion = await getBrowserVersion(chromeDebugBaseUrl, { timeoutMs })
+    .then((result) => summarizeBrowserVersionForDiagnostics(result))
+    .catch((error) => normalizeBridgeDiagnosticError(error));
+
+  const debugTargets = await listDebugTargets(chromeDebugBaseUrl, { timeoutMs })
+    .then((targets) => summarizeDebugTargetsForDiagnostics(targets, apiPageUrl))
+    .catch((error) => normalizeBridgeDiagnosticError(error));
+
+  return {
+    browserVersion,
+    debugTargets
+  };
+}
+
+function classifyBridgeSetupFailure({ stage, error, browserVersion, debugTargets, apiTarget } = {}) {
+  const message = error?.message || String(error) || '';
+
+  if (stage === 'call_extension_action') {
+    if (apiTarget && !apiTarget.webSocketDebuggerUrl) {
+      return 'api_page_target_missing_websocket';
+    }
+    if (/Timed out connecting to Chrome DevTools websocket/i.test(message)) {
+      return 'devtools_websocket_connect_timeout';
+    }
+    if (/Timed out waiting for Chrome DevTools response/i.test(message)) {
+      return 'devtools_command_timeout';
+    }
+    if (/websocket closed/i.test(message)) {
+      return 'devtools_websocket_closed';
+    }
+    if (/Protocol error/i.test(message)) {
+      return 'devtools_protocol_error';
+    }
+    if (browserVersion?.success === false || debugTargets?.success === false) {
+      return 'bridge_transport_error';
+    }
+    return 'bridge_transport_error';
+  }
+
+  if (browserVersion?.success === false || debugTargets?.success === false) {
+    if (/fetch failed|network|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENOTFOUND|Chrome DevTools endpoint|DevTools websocket|timed out/i.test(message)) {
+      return 'devtools_unreachable';
+    }
+    return 'devtools_diagnostic_unavailable';
+  }
+
+  if (stage === 'ensure_api_target') {
+    if (debugTargets?.apiTarget?.present === false) {
+      return 'api_page_target_missing';
+    }
+    if (debugTargets?.apiTarget?.present === true && !debugTargets.apiTarget.hasWebSocketDebuggerUrl) {
+      return 'api_page_target_missing_websocket';
+    }
+    if (/Failed to create or discover API page target/i.test(message)) {
+      return 'api_page_target_create_failed';
+    }
+  }
+
+  return 'bridge_setup_error';
+}
+
+function buildBridgeSetupFailureResult({
+  action,
+  stage,
+  error,
+  runtimeTimeoutMs,
+  startedAt,
+  failedAt,
+  chromeDebugBaseUrl,
+  apiPageUrl,
+  apiTarget,
+  browserVersion,
+  debugTargets
+}) {
+  const normalizedError = error instanceof Error
+    ? error
+    : new Error(String(error || 'Unknown bridge setup error'));
+
+  return {
+    success: false,
+    status: stage === 'call_extension_action' ? 'bridge_transport_error' : 'bridge_setup_error',
+    error: normalizedError.message,
+    action,
+    bridgeDiagnostics: {
+      stage,
+      startedAt,
+      failedAt,
+      runtimeTimeoutMs,
+      chromeDebugBaseUrl,
+      apiPageUrl,
+      apiTarget: apiTarget ? {
+        id: apiTarget.id ?? null,
+        title: apiTarget.title ?? null,
+        url: apiTarget.url ?? null,
+        hasWebSocketDebuggerUrl: Boolean(apiTarget.webSocketDebuggerUrl)
+      } : null,
+      inferredCause: classifyBridgeSetupFailure({
+        stage,
+        error: normalizedError,
+        browserVersion,
+        debugTargets,
+        apiTarget
+      }),
+      browserVersion: cloneJsonSafe(browserVersion) ?? null,
+      debugTargets: cloneJsonSafe(debugTargets) ?? null
+    }
   };
 }
 
@@ -726,16 +889,22 @@ export {
   DEFAULT_EXTENSION_ID,
   DEFAULT_RUNTIME_TIMEOUT_MS,
   buildApiPageUrl,
+  buildBridgeSetupFailureResult,
   buildBridgeTimeoutResult,
+  buildSetupDiagnosticFailurePayload,
   buildTimeoutDiagnosticFailurePayload,
   callExtensionAction,
+  classifyBridgeSetupFailure,
   classifyBridgeTimeoutCause,
+  collectSetupDiagnostics,
   collectTimeoutDiagnostics,
   ensureApiTarget,
   evaluateOnTarget,
   listDebugTargets,
   parseCliArgs,
   pickDiagnosticCaptchaTarget,
+  summarizeBrowserVersionForDiagnostics,
   summarizeCaptchaArtifactsForDiagnostics,
+  summarizeDebugTargetsForDiagnostics,
   summarizeQueueStateForDiagnostics
 };

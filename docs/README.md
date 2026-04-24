@@ -2,8 +2,9 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.25 (2026-04-23 queue-aware CAPTCHA inspection/inference patch 포함)**
+> 현재 운영 기준: **v1.8.26 (2026-04-24 structured bridge setup/transport diagnostics patch 포함)**
 > - DKAPTCHA 핸드오프/재개 지원
+> - **v1.8.26부터 `scripts/blog_auto_call.mjs`가 extension callback 무응답뿐 아니라 Chrome DevTools/API page bootstrap 실패도 `bridge_setup_error` / `bridge_transport_error`로 구조화해 돌려줍니다.** 따라서 크론이 `fetch failed` 같은 단일 문구만 남기고 셸 hard timeout이나 generic wrapper error로 끝나지 않고, `bridgeDiagnostics.stage` / `inferredCause` / `browserVersion` / `debugTargets`로 DevTools 미기동·API page target 부재·websocket transport 단절을 바로 분리할 수 있습니다.
 > - **v1.8.25부터 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `INFER_CAPTCHA_ANSWER`도 queue `captcha_paused` 항목의 `id`를 직접 받을 수 있고, direct publish state가 없고 paused 항목이 하나뿐이면 해당 항목을 자동 선택합니다.** 따라서 크론/API 페이지가 매번 `GET_QUEUE` → `captchaTabId` 재주입을 선행하지 않아도, 저장된 queue `captchaContext` / `solveHints`를 그대로 재사용해 같은 탭 CAPTCHA inspection → artifact capture → OCR answer inference를 더 짧게 이어갈 수 있습니다. 여러 paused 항목이 있으면 기존처럼 fail-closed로 `id` 또는 `tabId`를 요구합니다.
 > - **v1.8.24부터 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `INFER_CAPTCHA_ANSWER` / `SUBMIT_CAPTCHA*`는 저장된 blocked tab이 없을 때 아무 탭에나 `currentTabId`를 쓰지 않고, 현재 탭에 live CAPTCHA가 실제로 남아 있을 때만 current-tab fallback을 허용합니다. 제출 계열(`SUBMIT_CAPTCHA`, `SUBMIT_CAPTCHA_AND_RESUME`)은 current tab에 actionable answer path까지 확인하지 못하면 `captcha_target_not_found`로 fail-closed 하므로, stale editor/currentTab drift 때문에 잘못된 탭에 답을 넣는 위험을 줄이고 크론은 `GET_DIRECT_PUBLISH_STATE` / `GET_QUEUE`로 다시 대상 탭을 잡으면 됩니다.**
 > - **v1.8.23부터 direct publish same-tab CAPTCHA 재시도/재조회가 중간에 live handoff를 다시 못 읽더라도, 서비스워커가 기존 `directPublishState.captchaContext` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 보존한 채 새 결과만 덮어씁니다.** 따라서 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `SUBMIT_CAPTCHA*` 중 한 번이 `editor_not_ready`·빈 handoff·부분 컨텍스트로 돌아와도, 이전 `challengeText` / `challengeMasked` / solve hint가 direct publish state에서 사라져 false `captcha_challenge_context_missing`로 재개가 끊기는 회차를 더 줄입니다.
@@ -338,13 +339,39 @@ node scripts/blog_auto_call.mjs \
 주요 동작:
 - `chrome-extension://<EXTENSION_ID>/api/api-page.html` 탭을 자동 재사용/복구
 - `BLOG_AUTO_CALL_TIMEOUT_MS` 또는 `--timeout-ms` 기준으로 **page-context Promise timeout** 적용
-- timeout 시 터미널 hard timeout까지 멍하게 기다리지 않고 즉시 `status: "bridge_timeout"` 반환
-- timeout 응답에는 follow-up diagnostics 포함:
+- extension callback이 끝내 돌아오지 않으면 터미널 hard timeout까지 멍하게 기다리지 않고 즉시 `status: "bridge_timeout"` 반환
+- Chrome DevTools가 안 떠 있거나 API page target/bootstrap이 실패하면 `status: "bridge_setup_error"`로 끊고, `bridgeDiagnostics.stage === "ensure_api_target"` + `inferredCause` / `browserVersion` / `debugTargets`를 남겨 DevTools 미기동 vs API page target 부재를 바로 구분
+- API target을 찾은 뒤 websocket/evaluate transport가 끊기면 `status: "bridge_transport_error"`로 끊고, `bridgeDiagnostics.stage === "call_extension_action"` + 동일 진단 필드를 남겨 bridge callback 무응답과 CDP transport 실패를 분리
+- `bridge_timeout` 응답에는 follow-up diagnostics 포함:
   - `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)`
   - `GET_QUEUE`
   - 가능할 때 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS`
 - bulky `artifact.dataUrl`는 제거하고 compact summary만 남겨, 크론 로그가 base64 blob으로 오염되지 않음
 - 정상 응답에도 `bridgeMeta.startedAt/finishedAt/runtimeTimeoutMs/apiTarget`를 붙여 호출 provenance를 남김
+
+setup failure 예시:
+
+```json
+{
+  "success": false,
+  "status": "bridge_setup_error",
+  "error": "fetch failed",
+  "bridgeDiagnostics": {
+    "stage": "ensure_api_target",
+    "inferredCause": "devtools_unreachable",
+    "browserVersion": {
+      "success": false,
+      "status": "bridge_diagnostic_error",
+      "error": "fetch failed"
+    },
+    "debugTargets": {
+      "success": false,
+      "status": "bridge_diagnostic_error",
+      "error": "fetch failed"
+    }
+  }
+}
+```
 
 timeout 예시:
 
@@ -365,6 +392,8 @@ timeout 예시:
 
 운영 팁:
 - wrapper-level timeout (`bridge_timeout`)은 **확장 응답이 아예 없는 경우**를 surface하는 용도입니다. extension이 정상적으로 `editor_not_ready`, `captcha_required`, `captcha_wait_timeout` 등을 돌려주면 그 응답은 그대로 통과시킵니다.
+- `bridge_setup_error`는 callback timeout 전에 **Chrome DevTools / API page 준비 단계**에서 막힌 경우입니다. `bridgeDiagnostics.inferredCause`가 `devtools_unreachable`이면 Chrome/CDP 자체를, `api_page_target_missing`이면 extension API page 탭/로드 상태를 먼저 봅니다.
+- `bridge_transport_error`는 API page target은 잡았지만 `Runtime.evaluate` / websocket transport가 중간에 끊긴 경우입니다. MV3 worker idle 종료 문제가 아니라 CDP lane 자체가 흔들린 것이므로, browser/DevTools 쪽 복구를 우선합니다.
 - 실제 크론에서는 이 래퍼를 먼저 쓰고, 터미널/cron hard timeout은 wrapper timeout보다 넉넉한 마지막 safety net으로만 둡니다.
 
 ---

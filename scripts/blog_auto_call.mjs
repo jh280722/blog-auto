@@ -8,9 +8,12 @@ import {
   DEFAULT_DIAGNOSTIC_TIMEOUT_MS,
   DEFAULT_EXTENSION_ID,
   DEFAULT_RUNTIME_TIMEOUT_MS,
+  buildBridgeSetupFailureResult,
   buildBridgeTimeoutResult,
+  buildSetupDiagnosticFailurePayload,
   buildTimeoutDiagnosticFailurePayload,
   callExtensionAction,
+  collectSetupDiagnostics,
   collectTimeoutDiagnostics,
   ensureApiTarget,
   parseCliArgs
@@ -88,18 +91,82 @@ async function main() {
   const data = await loadPayload(options);
   const startedAt = new Date().toISOString();
 
-  const apiTarget = await ensureApiTarget({
-    chromeDebugBaseUrl: options.chromeDebugBaseUrl,
-    apiPageUrl: options.apiPageUrl
-  });
+  let apiTarget;
+  try {
+    apiTarget = await ensureApiTarget({
+      chromeDebugBaseUrl: options.chromeDebugBaseUrl,
+      apiPageUrl: options.apiPageUrl
+    });
+  } catch (error) {
+    const failedAt = new Date().toISOString();
+    let setupDiagnostics;
+    try {
+      setupDiagnostics = await collectSetupDiagnostics({
+        chromeDebugBaseUrl: options.chromeDebugBaseUrl,
+        apiPageUrl: options.apiPageUrl,
+        timeoutMs: options.diagnosticTimeoutMs
+      });
+    } catch (diagnosticError) {
+      setupDiagnostics = buildSetupDiagnosticFailurePayload(diagnosticError);
+    }
 
-  const response = await callExtensionAction({
-    targetWebSocketUrl: apiTarget.webSocketDebuggerUrl,
-    extensionId: options.extensionId,
-    action: options.action,
-    data,
-    runtimeTimeoutMs: options.runtimeTimeoutMs
-  });
+    const setupFailure = buildBridgeSetupFailureResult({
+      action: options.action,
+      stage: 'ensure_api_target',
+      error,
+      runtimeTimeoutMs: options.runtimeTimeoutMs,
+      startedAt,
+      failedAt,
+      chromeDebugBaseUrl: options.chromeDebugBaseUrl,
+      apiPageUrl: options.apiPageUrl,
+      apiTarget: null,
+      ...setupDiagnostics
+    });
+
+    console.log(JSON.stringify(setupFailure, null, 2));
+    process.exit(4);
+    return;
+  }
+
+  let response;
+  try {
+    response = await callExtensionAction({
+      targetWebSocketUrl: apiTarget.webSocketDebuggerUrl,
+      extensionId: options.extensionId,
+      action: options.action,
+      data,
+      runtimeTimeoutMs: options.runtimeTimeoutMs
+    });
+  } catch (error) {
+    const failedAt = new Date().toISOString();
+    let setupDiagnostics;
+    try {
+      setupDiagnostics = await collectSetupDiagnostics({
+        chromeDebugBaseUrl: options.chromeDebugBaseUrl,
+        apiPageUrl: options.apiPageUrl,
+        timeoutMs: options.diagnosticTimeoutMs
+      });
+    } catch (diagnosticError) {
+      setupDiagnostics = buildSetupDiagnosticFailurePayload(diagnosticError);
+    }
+
+    const transportFailure = buildBridgeSetupFailureResult({
+      action: options.action,
+      stage: 'call_extension_action',
+      error,
+      runtimeTimeoutMs: options.runtimeTimeoutMs,
+      startedAt,
+      failedAt,
+      chromeDebugBaseUrl: options.chromeDebugBaseUrl,
+      apiPageUrl: options.apiPageUrl,
+      apiTarget,
+      ...setupDiagnostics
+    });
+
+    console.log(JSON.stringify(transportFailure, null, 2));
+    process.exit(5);
+    return;
+  }
 
   if (response?.__bridgeTimeout) {
     const timedOutAt = new Date().toISOString();

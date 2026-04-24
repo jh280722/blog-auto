@@ -2,13 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  buildBridgeSetupFailureResult,
   buildBridgeTimeoutResult,
+  buildSetupDiagnosticFailurePayload,
   buildTimeoutDiagnosticFailurePayload,
+  classifyBridgeSetupFailure,
   classifyBridgeTimeoutCause,
   parseCliArgs,
   pickDiagnosticCaptchaTarget,
+  summarizeBrowserVersionForDiagnostics,
   summarizeQueueStateForDiagnostics,
-  summarizeCaptchaArtifactsForDiagnostics
+  summarizeCaptchaArtifactsForDiagnostics,
+  summarizeDebugTargetsForDiagnostics
 } from '../utils/blog-auto-call.js';
 
 test('classifyBridgeTimeoutCause surfaces direct-publish captcha waits before generic bridge failures', () => {
@@ -223,6 +228,132 @@ test('buildTimeoutDiagnosticFailurePayload preserves the original timeout report
       error: 'DevTools websocket closed'
     }
   });
+});
+
+test('summarizeDebugTargetsForDiagnostics highlights the extension API target without dumping every tab', () => {
+  const summary = summarizeDebugTargetsForDiagnostics([
+    {
+      id: 'page-1',
+      type: 'page',
+      title: 'Example App',
+      url: 'https://example.com',
+      attached: false,
+      webSocketDebuggerUrl: 'ws://example/page-1'
+    },
+    {
+      id: 'page-2',
+      type: 'page',
+      title: 'Tistory Auto Publisher - API',
+      url: 'chrome-extension://ext/api/api-page.html',
+      attached: true,
+      webSocketDebuggerUrl: 'ws://example/page-2'
+    },
+    {
+      id: 'worker-1',
+      type: 'service_worker',
+      title: 'Service Worker',
+      url: 'chrome-extension://ext/background.js'
+    }
+  ], 'chrome-extension://ext/api/api-page.html');
+
+  assert.equal(summary.success, true);
+  assert.equal(summary.total, 3);
+  assert.equal(summary.pageTargetCount, 2);
+  assert.equal(summary.otherPageTargetCount, 1);
+  assert.deepEqual(summary.apiTarget, {
+    present: true,
+    id: 'page-2',
+    title: 'Tistory Auto Publisher - API',
+    url: 'chrome-extension://ext/api/api-page.html',
+    attached: true,
+    hasWebSocketDebuggerUrl: true
+  });
+  assert.equal('sampleTargets' in summary, false);
+});
+
+test('buildSetupDiagnosticFailurePayload mirrors setup probe failures across browser and target diagnostics', () => {
+  const failure = buildSetupDiagnosticFailurePayload(new Error('fetch failed'));
+
+  assert.deepEqual(failure, {
+    browserVersion: {
+      success: false,
+      status: 'bridge_diagnostic_error',
+      error: 'fetch failed'
+    },
+    debugTargets: {
+      success: false,
+      status: 'bridge_diagnostic_error',
+      error: 'fetch failed'
+    }
+  });
+});
+
+test('classifyBridgeSetupFailure maps unreachable DevTools into a stable inferred cause', () => {
+  const cause = classifyBridgeSetupFailure({
+    stage: 'ensure_api_target',
+    error: new Error('fetch failed'),
+    browserVersion: { success: false, status: 'bridge_diagnostic_error', error: 'fetch failed' },
+    debugTargets: { success: false, status: 'bridge_diagnostic_error', error: 'fetch failed' }
+  });
+
+  assert.equal(cause, 'devtools_unreachable');
+});
+
+test('classifyBridgeSetupFailure keeps transport-specific causes even when follow-up probes also fail', () => {
+  const cause = classifyBridgeSetupFailure({
+    stage: 'call_extension_action',
+    error: new Error('Chrome DevTools websocket closed before the command resolved'),
+    apiTarget: {
+      id: 'page-2',
+      title: 'Tistory Auto Publisher - API',
+      url: 'chrome-extension://ext/api/api-page.html',
+      webSocketDebuggerUrl: 'ws://example/page-2'
+    },
+    browserVersion: { success: false, status: 'bridge_diagnostic_error', error: 'fetch failed' },
+    debugTargets: { success: false, status: 'bridge_diagnostic_error', error: 'fetch failed' }
+  });
+
+  assert.equal(cause, 'devtools_websocket_closed');
+});
+
+test('buildBridgeSetupFailureResult packages setup-stage diagnostics for cron callers', () => {
+  const browserVersion = summarizeBrowserVersionForDiagnostics({
+    Browser: 'Chrome/145.0.0.0',
+    'Protocol-Version': '1.3',
+    'User-Agent': 'Chrome/145.0.0.0',
+    webSocketDebuggerUrl: 'ws://example/browser'
+  });
+  const debugTargets = summarizeDebugTargetsForDiagnostics([
+    {
+      id: 'page-1',
+      type: 'page',
+      title: 'Other page',
+      url: 'https://example.com',
+      attached: false,
+      webSocketDebuggerUrl: 'ws://example/page-1'
+    }
+  ], 'chrome-extension://ext/api/api-page.html');
+
+  const result = buildBridgeSetupFailureResult({
+    action: 'GET_QUEUE',
+    stage: 'ensure_api_target',
+    error: new Error('Failed to create or discover API page target for chrome-extension://ext/api/api-page.html'),
+    runtimeTimeoutMs: 90000,
+    startedAt: '2026-04-24T01:00:00.000Z',
+    failedAt: '2026-04-24T01:00:05.000Z',
+    chromeDebugBaseUrl: 'http://127.0.0.1:18800',
+    apiPageUrl: 'chrome-extension://ext/api/api-page.html',
+    apiTarget: null,
+    browserVersion,
+    debugTargets
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.status, 'bridge_setup_error');
+  assert.equal(result.bridgeDiagnostics.stage, 'ensure_api_target');
+  assert.equal(result.bridgeDiagnostics.inferredCause, 'api_page_target_missing');
+  assert.equal(result.bridgeDiagnostics.browserVersion.browser, 'Chrome/145.0.0.0');
+  assert.equal(result.bridgeDiagnostics.debugTargets.apiTarget.present, false);
 });
 
 test('parseCliArgs rejects value-taking flags when the next token is another flag', () => {

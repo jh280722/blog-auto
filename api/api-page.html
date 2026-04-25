@@ -102,6 +102,17 @@
             resize: vertical;
         }
 
+        .hint {
+            margin: -6px 0 12px;
+            color: var(--text2);
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
+        .hint code {
+            color: #c8bbff;
+        }
+
         .btn {
             padding: 12px 24px;
             border: none;
@@ -281,6 +292,7 @@
             <label>이미지 URL (줄바꿈 구분)</label>
             <textarea id="api-images" rows="3"
                 placeholder="https://example.com/image1.jpg&#10;https://example.com/image2.jpg"></textarea>
+            <p class="hint">생성 이미지가 필요한 경우 운영 크론에서 Hermes <code>image_generate</code> → <code>openai-codex</code> / <code>gpt-image-2-medium</code>로 만든 뒤 <code>generation</code> provenance를 포함해 호출하세요. 이 텍스트박스는 상품/외부 이미지 URL smoke용입니다.</p>
             <label>
                 <input type="checkbox" id="resume-wait-for-captcha" checked>
                 RESUME_DIRECT_PUBLISH가 CAPTCHA 해제까지 대기

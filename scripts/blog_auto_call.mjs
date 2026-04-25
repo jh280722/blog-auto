@@ -18,6 +18,11 @@ import {
   ensureApiTarget,
   parseCliArgs
 } from '../utils/blog-auto-call.js';
+import {
+  buildBodyImagePolicyFailureResult,
+  buildBodyImagePolicyReport,
+  shouldValidateBodyImagePolicy
+} from '../utils/blog-image-policy.js';
 
 function printUsage() {
   console.error(`Usage:
@@ -89,6 +94,22 @@ async function main() {
     throw new Error('--action is required');
   }
   const data = await loadPayload(options);
+
+  if (shouldValidateBodyImagePolicy(options.action)) {
+    const bodyImagePolicy = buildBodyImagePolicyReport({
+      action: options.action,
+      payload: data
+    });
+    if (!bodyImagePolicy.ok) {
+      console.log(JSON.stringify(buildBodyImagePolicyFailureResult({
+        action: options.action,
+        report: bodyImagePolicy
+      }), null, 2));
+      process.exit(6);
+      return;
+    }
+  }
+
   const startedAt = new Date().toISOString();
 
   let apiTarget;

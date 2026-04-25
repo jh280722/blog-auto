@@ -2,7 +2,8 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.26 (2026-04-24 structured bridge setup/transport diagnostics patch 포함)**
+> 현재 운영 기준: **v1.8.27 (2026-04-24 generated body image route policy guard 포함)**
+> - **v1.8.27부터 `scripts/blog_auto_call.mjs`가 `WRITE_POST` / `ADD_TO_QUEUE` payload의 본문용 generated image provenance를 먼저 검사합니다.** `generated: true` 또는 `generation` 메타데이터가 붙은 이미지는 반드시 `generation.tool: "Hermes image_generate"`, `generation.runner: "openai-codex"`, `generation.model: "gpt-image-2-medium"` 경로여야 하며, PIL/Pillow 수제 인포그래픽·`baoyu-*` 우회 경로는 `body_image_policy_violation`으로 Chrome 호출 전에 fail-fast 합니다. 상품 대표 이미지나 외부 사진처럼 생성 이미지가 아니면 generated metadata를 붙이지 않으면 통과합니다.
 > - DKAPTCHA 핸드오프/재개 지원
 > - **v1.8.26부터 `scripts/blog_auto_call.mjs`가 extension callback 무응답뿐 아니라 Chrome DevTools/API page bootstrap 실패도 `bridge_setup_error` / `bridge_transport_error`로 구조화해 돌려줍니다.** 따라서 크론이 `fetch failed` 같은 단일 문구만 남기고 셸 hard timeout이나 generic wrapper error로 끝나지 않고, `bridgeDiagnostics.stage` / `inferredCause` / `browserVersion` / `debugTargets`로 DevTools 미기동·API page target 부재·websocket transport 단절을 바로 분리할 수 있습니다.
 > - **v1.8.25부터 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS` / `INFER_CAPTCHA_ANSWER`도 queue `captcha_paused` 항목의 `id`를 직접 받을 수 있고, direct publish state가 없고 paused 항목이 하나뿐이면 해당 항목을 자동 선택합니다.** 따라서 크론/API 페이지가 매번 `GET_QUEUE` → `captchaTabId` 재주입을 선행하지 않아도, 저장된 queue `captchaContext` / `solveHints`를 그대로 재사용해 같은 탭 CAPTCHA inspection → artifact capture → OCR answer inference를 더 짧게 이어갈 수 있습니다. 여러 paused 항목이 있으면 기존처럼 fail-closed로 `id` 또는 `tabId`를 요구합니다.
@@ -339,6 +340,7 @@ node scripts/blog_auto_call.mjs \
 주요 동작:
 - `chrome-extension://<EXTENSION_ID>/api/api-page.html` 탭을 자동 재사용/복구
 - `BLOG_AUTO_CALL_TIMEOUT_MS` 또는 `--timeout-ms` 기준으로 **page-context Promise timeout** 적용
+- `WRITE_POST` / `ADD_TO_QUEUE` payload에 generated body image가 명시된 경우 Chrome/CDP 호출 전에 provenance를 검사해, Hermes `image_generate` → `openai-codex` / `gpt-image-2-medium` 외의 PIL/Pillow·수제 인포그래픽·`baoyu-*` 기본 우회 경로를 `body_image_policy_violation`으로 즉시 차단
 - extension callback이 끝내 돌아오지 않으면 터미널 hard timeout까지 멍하게 기다리지 않고 즉시 `status: "bridge_timeout"` 반환
 - Chrome DevTools가 안 떠 있거나 API page target/bootstrap이 실패하면 `status: "bridge_setup_error"`로 끊고, `bridgeDiagnostics.stage === "ensure_api_target"` + `inferredCause` / `browserVersion` / `debugTargets`를 남겨 DevTools 미기동 vs API page target 부재를 바로 구분
 - API target을 찾은 뒤 websocket/evaluate transport가 끊기면 `status: "bridge_transport_error"`로 끊고, `bridgeDiagnostics.stage === "call_extension_action"` + 동일 진단 필드를 남겨 bridge callback 무응답과 CDP transport 실패를 분리
@@ -392,6 +394,25 @@ timeout 예시:
 
 운영 팁:
 - wrapper-level timeout (`bridge_timeout`)은 **확장 응답이 아예 없는 경우**를 surface하는 용도입니다. extension이 정상적으로 `editor_not_ready`, `captcha_required`, `captcha_wait_timeout` 등을 돌려주면 그 응답은 그대로 통과시킵니다.
+- `body_image_policy_violation`은 Chrome을 호출하기 전 payload 품질 gate에서 막힌 것입니다. 생성 이미지가 필요하면 먼저 Hermes `image_generate`(운영 backend: `openai-codex` / `gpt-image-2-medium`)로 만들고, 업로드 URL에 아래 provenance를 함께 붙여 호출하세요. 상품 대표 이미지/공식 이미지처럼 생성물이 아니면 `generated` / `generation` 필드를 생략합니다.
+
+```json
+{
+  "images": [
+    {
+      "url": "https://i.imgur.com/example.png",
+      "alt": "본문용 생성 이미지",
+      "generated": true,
+      "generation": {
+        "tool": "Hermes image_generate",
+        "runner": "openai-codex",
+        "model": "gpt-image-2-medium"
+      }
+    }
+  ]
+}
+```
+
 - `bridge_setup_error`는 callback timeout 전에 **Chrome DevTools / API page 준비 단계**에서 막힌 경우입니다. `bridgeDiagnostics.inferredCause`가 `devtools_unreachable`이면 Chrome/CDP 자체를, `api_page_target_missing`이면 extension API page 탭/로드 상태를 먼저 봅니다.
 - `bridge_transport_error`는 API page target은 잡았지만 `Runtime.evaluate` / websocket transport가 중간에 끊긴 경우입니다. MV3 worker idle 종료 문제가 아니라 CDP lane 자체가 흔들린 것이므로, browser/DevTools 쪽 복구를 우선합니다.
 - 실제 크론에서는 이 래퍼를 먼저 쓰고, 터미널/cron hard timeout은 wrapper timeout보다 넉넉한 마지막 safety net으로만 둡니다.
@@ -417,6 +438,7 @@ timeout 예시:
 │   └── blog_auto_call.mjs     # 크론/CLI용 structured bridge wrapper
 ├── utils/
 │   ├── blog-auto-call.js      # blog_auto_call.mjs용 CDP/diagnostics helper
+│   ├── blog-image-policy.js   # generated body image provenance guard (Hermes image_generate only)
 │   ├── image-handler.js       # 이미지 유틸리티
 │   ├── captcha-submit-recovery.js # frame submit 응답 누락 복구 유틸
 │   └── queue-runtime.js       # MV3 queue wake-up / restart recovery 유틸
@@ -440,13 +462,14 @@ timeout 예시:
 
 ---
 
-## 발행 상태 코드 (v1.8.25)
+## 발행 상태 코드 (v1.8.27)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 
 | 상태 | 설명 | 다음 액션 |
 |------|------|-----------|
 | `editor_ready` | `PREPARE_EDITOR`가 실제 TinyMCE/editor body까지 준비된 탭 확보 완료 | `WRITE_POST` 호출 |
+| `body_image_policy_violation` | `scripts/blog_auto_call.mjs`가 Chrome 호출 전 generated body image provenance를 검사했고, Hermes `image_generate` → `openai-codex` / `gpt-image-2-medium` 외 경로(PIL/Pillow, `baoyu-*`, 수제 인포그래픽 등)를 발견 | payload 이미지 생성 경로를 Hermes `image_generate`로 다시 만들고 `generation` metadata를 붙여 재호출. 상품/외부 이미지면 generated metadata를 붙이지 않음 |
 | `blog_not_configured` | 자동으로 열 블로그명을 알 수 없음 | 설정 저장 또는 `data.blogName` 전달 |
 | `published` | 발행 성공 | — |
 | `captcha_required` | CAPTCHA 감지됨 (직접 발행) | 응답의 `captchaArtifacts` 우선 확인 → `preferredSolveMode`가 `extension_dom` / `extension_frame_dom`이면 `SUBMIT_CAPTCHA_AND_RESUME`, 드물게 `browser_handoff`면 browser/CDP fallback + `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })` |

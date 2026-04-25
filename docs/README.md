@@ -2,7 +2,8 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.27 (2026-04-24 generated body image route policy guard 포함)**
+> 현재 운영 기준: **v1.8.28 (2026-04-25 publish confirmation recovery diagnostics 포함)**
+> - **v1.8.28부터 최종 티스토리 발행 확인 버튼 클릭 뒤 `manage/post` 요청이 관측되지 않으면, 열린 발행 레이어/버튼 상태를 구조화해 `publish_confirm_unresolved` 또는 `publish_confirm_in_flight`로 반환합니다.** 크론은 같은 탭의 레이어를 유지한 채 `RESUME_DIRECT_PUBLISH`/재조회로 이어가면 되고, 새 탭 재작성으로 공개 글을 중복 오염시키지 않습니다.
 > - **v1.8.27부터 `scripts/blog_auto_call.mjs`가 `WRITE_POST` / `ADD_TO_QUEUE` payload의 본문용 generated image provenance를 먼저 검사합니다.** `generated: true` 또는 `generation` 메타데이터가 붙은 이미지는 반드시 `generation.tool: "Hermes image_generate"`, `generation.runner: "openai-codex"`, `generation.model: "gpt-image-2-medium"` 경로여야 하며, PIL/Pillow 수제 인포그래픽·`baoyu-*` 우회 경로는 `body_image_policy_violation`으로 Chrome 호출 전에 fail-fast 합니다. 상품 대표 이미지나 외부 사진처럼 생성 이미지가 아니면 generated metadata를 붙이지 않으면 통과합니다.
 > - DKAPTCHA 핸드오프/재개 지원
 > - **v1.8.26부터 `scripts/blog_auto_call.mjs`가 extension callback 무응답뿐 아니라 Chrome DevTools/API page bootstrap 실패도 `bridge_setup_error` / `bridge_transport_error`로 구조화해 돌려줍니다.** 따라서 크론이 `fetch failed` 같은 단일 문구만 남기고 셸 hard timeout이나 generic wrapper error로 끝나지 않고, `bridgeDiagnostics.stage` / `inferredCause` / `browserVersion` / `debugTargets`로 DevTools 미기동·API page target 부재·websocket transport 단절을 바로 분리할 수 있습니다.
@@ -441,9 +442,11 @@ timeout 예시:
 │   ├── blog-image-policy.js   # generated body image provenance guard (Hermes image_generate only)
 │   ├── image-handler.js       # 이미지 유틸리티
 │   ├── captcha-submit-recovery.js # frame submit 응답 누락 복구 유틸
+│   ├── publish-confirmation.js # 최종 발행 확인 단계 상태 분류 유틸
 │   └── queue-runtime.js       # MV3 queue wake-up / restart recovery 유틸
 ├── tests/
-│   └── blog-auto-call.test.mjs # wrapper timeout/diagnostics regression tests
+│   ├── blog-auto-call.test.mjs # wrapper timeout/diagnostics regression tests
+│   └── publish-confirmation.test.mjs # final confirmation state regression tests
 ├── icons/                     # 확장 프로그램 아이콘
 └── docs/
     └── README.md              # 이 문서
@@ -462,7 +465,7 @@ timeout 예시:
 
 ---
 
-## 발행 상태 코드 (v1.8.27)
+## 발행 상태 코드 (v1.8.28)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 
@@ -478,6 +481,8 @@ timeout 예시:
 | `captcha_target_not_found` | 저장된 blocked tab이 없고 현재 탭에도 live/actionable CAPTCHA가 없음 | `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` 또는 `GET_QUEUE`로 대상 `tabId` / `id`를 다시 확인한 뒤 재시도 |
 | `captcha_wait_timeout` | `RESUME_DIRECT_PUBLISH(waitForCaptcha)` 대기 시간이 초과됨 | 같은 탭 solve 진행 상태 확인 후 재시도 또는 `waitTimeoutMs` 증가 |
 | `captcha_paused` | 큐 항목 CAPTCHA 일시정지 | `GET_QUEUE`로 `id` / `captchaTabId`뿐 아니라 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 함께 확인한 뒤 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })` 권장. v1.8.21부터는 이 queue submit path가 저장된 `captchaContext` / `solveHints`를 answer inference에 우선 재사용해 false `captcha_challenge_context_missing`를 줄입니다. v1.8.18부터는 `publish_layer_open` 상태도 same-tab 재개/settle 확인으로 이어지고, 팝업 수동 solve라면 `RESUME_AFTER_CAPTCHA` |
+| `publish_confirm_unresolved` | 최종 발행 확인 버튼 클릭 뒤 `manage/post` 요청이 아직 관측되지 않았고 발행 레이어/확인 버튼이 같은 탭에 남아 있음 | 새 글쓰기 탭을 열지 말고 같은 탭에서 `RESUME_DIRECT_PUBLISH` 또는 동일 payload 재호출로 final confirm만 재시도. 응답의 `confirmationState.recommendedAction`, `sameTabRequired`, `retryable` 확인 |
+| `publish_confirm_in_flight` | 확인 버튼 클릭 뒤 버튼/레이어가 저장중·발행중 또는 disabled 상태인데 `manage/post` 요청은 아직 관측되지 않음 | 중복 클릭/새 탭 재작성을 피하고 같은 탭을 먼저 poll. 짧게 재조회 후 완료 URL/`GET_DIRECT_PUBLISH_STATE`/`GET_DRAFT_SNAPSHOT` 확인, 계속 고착되면 same-tab resume 판단 |
 | `editor_not_ready` | 실제 editor body 준비/복구 실패 또는 `WRITE_POST` preflight 실패 | `diagnostics`/`preflight` 확인 후 `PREPARE_EDITOR` 재호출 |
 | `item_not_found` | 재개할 큐 항목 없음 | 큐 확인 |
 | `content_empty` | 본문 비어있거나 에디터 미반영 | 본문 확인 후 재시도 |

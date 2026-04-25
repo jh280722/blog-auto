@@ -24,6 +24,7 @@
   const MANAGE_POST_SEQ_ATTR = 'data-blog-auto-last-manage-post-seq';
   const CAPTCHA_CHALLENGE_UTILS = window.__BLOG_AUTO_CAPTCHA_CHALLENGE__ || {};
   const DRAFT_SNAPSHOT_UTILS = window.__BLOG_AUTO_DRAFT_SNAPSHOT__ || {};
+  const PUBLISH_CONFIRMATION_UTILS = window.__BLOG_AUTO_PUBLISH_CONFIRMATION__ || {};
   const buildCaptchaChallengeFromTexts = CAPTCHA_CHALLENGE_UTILS.buildCaptchaChallengeFromTexts
     || (() => ({
       challengeText: null,
@@ -47,6 +48,31 @@
       imageCount: Math.max(Number(localMetrics.imageCount) || 0, Number(mainWorldSnapshot?.imageCount) || 0),
       contentPreview: String(localMetrics.contentPreview || '').trim() || String(mainWorldSnapshot?.textPreview || '').replace(/\s+/g, ' ').trim().slice(0, 160)
     }));
+  const normalizePublishConfirmationState = PUBLISH_CONFIRMATION_UTILS.normalizePublishConfirmationState
+    || ((state = {}) => ({
+      state: state.publishLayerPresent ? 'confirm_ready' : 'layer_closed',
+      publishLayerPresent: !!state.publishLayerPresent,
+      confirmButtonPresent: !!state.confirmButtonPresent,
+      confirmButtonText: state.confirmButtonText || null,
+      confirmButtonDisabled: !!state.confirmButtonDisabled,
+      captchaPresent: !!state.captchaPresent,
+      safeToRetryFinalConfirm: !!(state.publishLayerPresent && state.confirmButtonPresent && !state.captchaPresent),
+      recommendedAction: state.publishLayerPresent ? 'retry_final_confirm_same_tab' : 'recover_or_prepare_editor'
+    }));
+  const buildUnobservedPublishRequestFailure = PUBLISH_CONFIRMATION_UTILS.buildUnobservedPublishRequestFailure
+    || (({ requestObserved = false, confirmationState = {} } = {}) => {
+      if (requestObserved || !confirmationState.publishLayerPresent) return null;
+      return {
+        status: confirmationState.captchaPresent ? 'captcha_required' : 'publish_confirm_unresolved',
+        error: confirmationState.captchaPresent
+          ? '발행 확인 단계에서 CAPTCHA가 감지되었습니다.'
+          : '발행 확인 단계가 완료되지 않았고 manage/post 요청도 확인되지 않았습니다.',
+        retryable: true,
+        sameTabRequired: true,
+        recommendedAction: confirmationState.captchaPresent ? 'solve_captcha_same_tab_then_resume' : 'retry_final_confirm_same_tab',
+        confirmationState
+      };
+    });
   const STAGE_JITTER_DEFAULTS = {
     enabled: true,
     extraRatio: 0.18,
@@ -620,6 +646,60 @@
         return /(발행|저장)/.test(text) && button.closest('.layer_foot, .wrap_btn, .ReactModal__Content, .publish-layer, #publish-layer, .layer-publish');
       })
       || null;
+  }
+
+  function summarizePublishActionButton(button) {
+    if (!button) {
+      return {
+        present: false,
+        text: null,
+        disabled: false,
+        ariaDisabled: null
+      };
+    }
+
+    const ariaDisabled = button.getAttribute?.('aria-disabled') || null;
+    return {
+      present: true,
+      text: normalizeText(button.textContent || button.getAttribute?.('aria-label') || button.getAttribute?.('title') || ''),
+      disabled: !!(button.disabled || button.classList?.contains('disabled') || ariaDisabled === 'true'),
+      ariaDisabled
+    };
+  }
+
+  function capturePublishConfirmationState(extra = {}) {
+    const publishLayer = getVisiblePublishLayer();
+    const confirmBtn = getConfirmButton();
+    const completeBtn = findElement(S.publish.completeButton, S.publish.fallback);
+    const captchaContext = getCaptchaContext();
+    const snapshot = getEditorSnapshot();
+    const confirmSummary = summarizePublishActionButton(confirmBtn);
+    const completeSummary = summarizePublishActionButton(completeBtn);
+    const normalized = normalizePublishConfirmationState({
+      publishLayerPresent: !!publishLayer,
+      confirmButtonPresent: confirmSummary.present,
+      confirmButtonText: confirmSummary.text,
+      confirmButtonDisabled: confirmSummary.disabled,
+      confirmButtonAriaDisabled: confirmSummary.ariaDisabled,
+      completeButtonPresent: completeSummary.present,
+      completeButtonText: completeSummary.text,
+      completeButtonDisabled: completeSummary.disabled,
+      completeButtonAriaDisabled: completeSummary.ariaDisabled,
+      captchaPresent: !!captchaContext?.captchaPresent
+    });
+
+    return {
+      ...normalized,
+      url: window.location.href,
+      captchaSummary: captchaContext ? {
+        captchaPresent: !!captchaContext.captchaPresent,
+        preferredSolveMode: captchaContext.preferredSolveMode || null,
+        candidateCount: captchaContext.candidateCount || 0,
+        iframeCaptchaPresent: !!captchaContext.iframeCaptchaPresent
+      } : null,
+      snapshot: summarizeSnapshotForLog(snapshot),
+      ...extra
+    };
   }
 
   function resolveVisibilityControl(scope, visibility = 'public') {
@@ -2809,10 +2889,51 @@
 
         const requestDiag = await waitForNextManagePostDiag(managePostSeqBefore, 12000);
         const lateCaptchaContext = getCaptchaContext();
+        const confirmationState = capturePublishConfirmationState({
+          phase: 'after_final_confirm',
+          requestObserved: !!requestDiag,
+          urlBefore,
+          urlAfter
+        });
         mark(requestDiag ? 'manage_post_diag_observed' : 'manage_post_diag_missing', {
           requestSequence: requestDiag?.sequence || null,
-          captchaPresentDuringVerification: !!lateCaptchaContext?.captchaPresent
+          captchaPresentDuringVerification: !!lateCaptchaContext?.captchaPresent,
+          confirmationState: confirmationState.state,
+          confirmationRecommendedAction: confirmationState.recommendedAction || null
         });
+        if (!requestDiag) {
+          const confirmationFailure = buildUnobservedPublishRequestFailure({
+            requestObserved: false,
+            confirmationState
+          });
+          if (confirmationFailure) {
+            mark('publish_confirmation_unresolved', {
+              status: confirmationFailure.status,
+              confirmationState: confirmationState.state,
+              recommendedAction: confirmationFailure.recommendedAction || null
+            });
+            return respond({
+              success: false,
+              error: confirmationFailure.error,
+              status: confirmationFailure.status,
+              url: urlAfter,
+              confirmationState,
+              retryable: confirmationFailure.retryable,
+              sameTabRequired: confirmationFailure.sameTabRequired,
+              recommendedAction: confirmationFailure.recommendedAction,
+              persistenceCheck: {
+                confirmed: false,
+                status: confirmationFailure.status,
+                issues: ['publish_request_missing'],
+                error: confirmationFailure.error,
+                requestDiag: null,
+                confirmationState
+              },
+              captchaContext: confirmationFailure.status === 'captcha_required' ? lateCaptchaContext : undefined,
+              captchaStage: confirmationFailure.status === 'captcha_required' ? 'during_verification' : undefined
+            }, 'publish_confirmation_unresolved');
+          }
+        }
         if (!requestDiag && lateCaptchaContext?.captchaPresent) {
           return respond({
             success: false,
@@ -2886,10 +3007,50 @@
 
       const requestDiag = await waitForNextManagePostDiag(managePostSeqBefore, 12000);
       const lateCaptchaContext = getCaptchaContext();
+      const confirmationState = capturePublishConfirmationState({
+        phase: 'without_layer_verification',
+        requestObserved: !!requestDiag,
+        urlAfter: window.location.href
+      });
       mark(requestDiag ? 'manage_post_diag_observed_without_layer' : 'manage_post_diag_missing_without_layer', {
         requestSequence: requestDiag?.sequence || null,
-        captchaPresentDuringVerification: !!lateCaptchaContext?.captchaPresent
+        captchaPresentDuringVerification: !!lateCaptchaContext?.captchaPresent,
+        confirmationState: confirmationState.state,
+        confirmationRecommendedAction: confirmationState.recommendedAction || null
       });
+      if (!requestDiag) {
+        const confirmationFailure = buildUnobservedPublishRequestFailure({
+          requestObserved: false,
+          confirmationState
+        });
+        if (confirmationFailure) {
+          mark('publish_confirmation_unresolved_without_layer', {
+            status: confirmationFailure.status,
+            confirmationState: confirmationState.state,
+            recommendedAction: confirmationFailure.recommendedAction || null
+          });
+          return respond({
+            success: false,
+            error: confirmationFailure.error,
+            status: confirmationFailure.status,
+            url: window.location.href,
+            confirmationState,
+            retryable: confirmationFailure.retryable,
+            sameTabRequired: confirmationFailure.sameTabRequired,
+            recommendedAction: confirmationFailure.recommendedAction,
+            persistenceCheck: {
+              confirmed: false,
+              status: confirmationFailure.status,
+              issues: ['publish_request_missing'],
+              error: confirmationFailure.error,
+              requestDiag: null,
+              confirmationState
+            },
+            captchaContext: confirmationFailure.status === 'captcha_required' ? lateCaptchaContext : undefined,
+            captchaStage: confirmationFailure.status === 'captcha_required' ? 'without_layer_verification' : undefined
+          }, 'publish_confirmation_unresolved_without_layer');
+        }
+      }
       if (!requestDiag && lateCaptchaContext?.captchaPresent) {
         return respond({
           success: false,

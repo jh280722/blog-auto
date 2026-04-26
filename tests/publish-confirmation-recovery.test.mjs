@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   buildDirectPublishConfirmationRecoveryPatch,
   buildQueuePublishConfirmationPauseState,
+  buildQueuePublishConfirmationResumePreflight,
   findQueuePublishConfirmationItem,
   getQueuePublishConfirmationSelectionFailure,
   isPublishConfirmationRecoveryStatus,
@@ -120,6 +121,71 @@ test('buildQueuePublishConfirmationPauseState pauses a queue item without CAPTCH
   });
 });
 
+test('buildQueuePublishConfirmationResumePreflight keeps in-flight confirmation paused without retrying final confirm', () => {
+  const preflight = buildQueuePublishConfirmationResumePreflight({
+    existingItem: { id: 'item-1', status: 'publish_confirm_paused', publishConfirmTabId: 123 },
+    tabId: 123,
+    confirmationState: {
+      state: 'confirm_in_flight',
+      publishLayerPresent: true,
+      confirmButtonPresent: true,
+      confirmButtonText: '저장중',
+      confirmButtonDisabled: true,
+      safeToPollSameTab: true,
+      recommendedAction: 'poll_same_tab_before_retry'
+    },
+    nowIso: '2026-04-26T01:03:04.000Z'
+  });
+
+  assert.equal(preflight.shouldResume, false);
+  assert.equal(preflight.status, 'publish_confirm_in_flight');
+  assert.equal(preflight.pauseState.status, 'publish_confirm_paused');
+  assert.equal(preflight.pauseState.publishConfirmTabId, 123);
+  assert.equal(preflight.pauseState.confirmationState.state, 'confirm_in_flight');
+  assert.equal(preflight.pauseState.publishConfirmationRecovery.recommendedAction, 'poll_same_tab_before_retry');
+});
+
+test('buildQueuePublishConfirmationResumePreflight allows retry only when confirmation is ready', () => {
+  const preflight = buildQueuePublishConfirmationResumePreflight({
+    existingItem: { id: 'item-1', status: 'publish_confirm_paused', publishConfirmTabId: 123 },
+    tabId: 123,
+    confirmationState: {
+      state: 'confirm_ready',
+      publishLayerPresent: true,
+      confirmButtonPresent: true,
+      confirmButtonText: '공개 발행',
+      confirmButtonDisabled: false,
+      safeToRetryFinalConfirm: true,
+      recommendedAction: 'retry_final_confirm_same_tab'
+    },
+    nowIso: '2026-04-26T01:03:04.000Z'
+  });
+
+  assert.deepEqual(preflight, {
+    shouldResume: true,
+    status: 'confirm_ready',
+    recommendedAction: 'retry_final_confirm_same_tab'
+  });
+});
+
+test('buildQueuePublishConfirmationResumePreflight fails closed when confirmation layer disappeared', () => {
+  const preflight = buildQueuePublishConfirmationResumePreflight({
+    existingItem: { id: 'item-1', status: 'publish_confirm_paused', publishConfirmTabId: 123 },
+    tabId: 123,
+    confirmationState: {
+      state: 'layer_closed',
+      publishLayerPresent: false,
+      confirmButtonPresent: false,
+      recommendedAction: 'recover_or_prepare_editor'
+    },
+    nowIso: '2026-04-26T01:03:04.000Z'
+  });
+
+  assert.equal(preflight.shouldResume, false);
+  assert.equal(preflight.status, 'publish_confirm_target_not_found');
+  assert.equal(preflight.sameTabRequired, true);
+  assert.equal(preflight.confirmationState.state, 'layer_closed');
+});
 test('findQueuePublishConfirmationItem selects only publish_confirm_paused queue entries by id or same tab', () => {
   const queue = [
     { id: 'a', status: 'captcha_paused', captchaTabId: 111 },

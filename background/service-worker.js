@@ -69,6 +69,7 @@ import { buildMergedDirectPublishCaptchaState } from '../utils/direct-publish-ca
 import {
   buildDirectPublishConfirmationRecoveryPatch,
   buildQueuePublishConfirmationPauseState,
+  buildQueuePublishConfirmationResumePreflight,
   clearQueuePublishConfirmationPauseState,
   findQueuePublishConfirmationItem,
   getQueuePublishConfirmationSelectionFailure,
@@ -5877,6 +5878,100 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
     }
   } catch (_error) {
     // 확인 실패 시 발행 시도는 계속 진행
+  }
+
+  if (item?.status === 'publish_confirm_paused') {
+    let confirmationProbe = null;
+    try {
+      confirmationProbe = await sendEditorMessage(tabId, 'GET_PUBLISH_CONFIRMATION_STATE', {
+        phase: 'queue_publish_confirmation_resume_preflight'
+      });
+      resumeDiagnostics.attempts.push({
+        step: 'publish_confirmation_resume_preflight',
+        tabId,
+        status: confirmationProbe?.status || null,
+        confirmationState: confirmationProbe?.confirmationState?.state || null,
+        recommendedAction: confirmationProbe?.confirmationState?.recommendedAction || null,
+        at: new Date().toISOString()
+      });
+    } catch (error) {
+      resumeDiagnostics.attempts.push({
+        step: 'publish_confirmation_resume_preflight_failed',
+        tabId,
+        error: error?.message || String(error),
+        at: new Date().toISOString()
+      });
+      return {
+        success: false,
+        status: 'publish_confirm_target_not_found',
+        error: '최종 확인 단계 재개 전 같은 탭 상태를 읽지 못했습니다. 새 탭 재작성 없이 GET_QUEUE와 탭 상태를 다시 확인하세요.',
+        tabId,
+        sameTabRequired: true,
+        diagnostics: resumeDiagnostics
+      };
+    }
+
+    const confirmationPreflight = buildQueuePublishConfirmationResumePreflight({
+      existingItem: item,
+      tabId,
+      confirmationState: confirmationProbe?.confirmationState || null
+    });
+
+    if (confirmationPreflight.status === 'captcha_required') {
+      const handoff = await captureCaptchaHandoffForTab(tabId);
+      const handoffSolveHints = handoff?.captchaContext?.solveHints || handoff?.captchaArtifacts?.solveHints || null;
+      Object.assign(item, buildQueueCaptchaPauseState({
+        existingItem: item,
+        tabId,
+        response: {
+          success: false,
+          status: 'captcha_required',
+          error: confirmationPreflight.error,
+          captchaContext: handoff.captchaContext || confirmationProbe?.confirmationState?.captchaSummary || null,
+          captchaStage: 'publish_confirmation_resume_preflight',
+          diagnostics: resumeDiagnostics
+        },
+        handoff,
+        error: confirmationPreflight.error || '최종 확인 재개 전 CAPTCHA 감지 — 같은 탭에서 solve 후 재개'
+      }));
+      await saveQueueState();
+      isProcessing = false;
+      await resetQueueRuntimeState();
+      return {
+        success: false,
+        status: 'captcha_required',
+        error: confirmationPreflight.error,
+        tabId,
+        queueItemId: item.id || null,
+        confirmationState: confirmationPreflight.confirmationState,
+        captchaContext: handoff.captchaContext || null,
+        captchaArtifacts: handoff.captchaArtifacts || null,
+        solveHints: handoffSolveHints,
+        sameTabRequired: true,
+        diagnostics: resumeDiagnostics
+      };
+    }
+
+    if (!confirmationPreflight.shouldResume) {
+      if (confirmationPreflight.pauseState) {
+        Object.assign(item, confirmationPreflight.pauseState);
+        await saveQueueState();
+      }
+      isProcessing = false;
+      await resetQueueRuntimeState();
+      return {
+        success: false,
+        status: confirmationPreflight.status,
+        error: confirmationPreflight.error,
+        tabId,
+        queueItemId: item.id || null,
+        confirmationState: confirmationPreflight.confirmationState,
+        publishConfirmationRecovery: confirmationPreflight.pauseState?.publishConfirmationRecovery || null,
+        sameTabRequired: confirmationPreflight.sameTabRequired !== false,
+        recommendedAction: confirmationPreflight.recommendedAction || null,
+        diagnostics: resumeDiagnostics
+      };
+    }
   }
 
   const previousQueueCaptchaSnapshot = cloneJsonValue(item) || { ...item };

@@ -115,6 +115,98 @@ export function buildQueuePublishConfirmationPauseState({
   };
 }
 
+export function buildQueuePublishConfirmationResumePreflight({
+  existingItem = null,
+  tabId = null,
+  confirmationState = null,
+  nowIso = new Date().toISOString()
+} = {}) {
+  const summarizedState = summarizePublishConfirmationStateForRecovery(confirmationState);
+  const state = summarizedState.state || 'unknown';
+  const recommendedAction = summarizedState.recommendedAction
+    || (summarizedState.safeToRetryFinalConfirm ? 'retry_final_confirm_same_tab' : null);
+
+  if (state === 'confirm_ready' && summarizedState.safeToRetryFinalConfirm) {
+    return {
+      shouldResume: true,
+      status: 'confirm_ready',
+      recommendedAction: recommendedAction || 'retry_final_confirm_same_tab'
+    };
+  }
+
+  if (state === 'captcha_present' || summarizedState.captchaPresent) {
+    return {
+      shouldResume: false,
+      status: 'captcha_required',
+      error: '티스토리 최종 확인 재개 전 CAPTCHA가 감지되었습니다. 같은 탭 CAPTCHA pause로 전환하세요.',
+      sameTabRequired: true,
+      recommendedAction: recommendedAction || 'solve_captcha_same_tab_then_resume',
+      confirmationState: summarizedState
+    };
+  }
+
+  if (state === 'confirm_in_flight') {
+    const response = {
+      status: 'publish_confirm_in_flight',
+      retryable: false,
+      sameTabRequired: true,
+      recommendedAction: recommendedAction || 'poll_same_tab_before_retry',
+      confirmationState: summarizedState,
+      error: '티스토리 최종 확인이 아직 저장중/발행중입니다. 중복 클릭하지 말고 같은 탭을 다시 poll 하세요.'
+    };
+    return {
+      shouldResume: false,
+      status: response.status,
+      error: response.error,
+      sameTabRequired: true,
+      recommendedAction: response.recommendedAction,
+      confirmationState: summarizedState,
+      pauseState: buildQueuePublishConfirmationPauseState({
+        existingItem,
+        tabId,
+        response,
+        error: response.error,
+        nowIso
+      })
+    };
+  }
+
+  if (state === 'layer_open_without_confirm_button') {
+    const response = {
+      status: 'publish_confirm_unresolved',
+      retryable: false,
+      sameTabRequired: true,
+      recommendedAction: recommendedAction || 'inspect_publish_layer_same_tab',
+      confirmationState: summarizedState,
+      error: '티스토리 최종 확인 레이어는 열려 있지만 확인 버튼을 찾지 못했습니다. 같은 탭 레이어를 먼저 재조회하세요.'
+    };
+    return {
+      shouldResume: false,
+      status: response.status,
+      error: response.error,
+      sameTabRequired: true,
+      recommendedAction: response.recommendedAction,
+      confirmationState: summarizedState,
+      pauseState: buildQueuePublishConfirmationPauseState({
+        existingItem,
+        tabId,
+        response,
+        error: response.error,
+        nowIso
+      })
+    };
+  }
+
+  return {
+    shouldResume: false,
+    status: 'publish_confirm_target_not_found',
+    error: '저장된 최종 확인 레이어를 같은 탭에서 찾지 못했습니다. 새 탭 재작성 없이 GET_QUEUE와 실제 탭 상태를 다시 확인하세요.',
+    sameTabRequired: true,
+    recommendedAction: recommendedAction || 'recover_or_prepare_editor',
+    confirmationState: summarizedState
+  };
+}
+
 export function findQueuePublishConfirmationItem(queue = [], { itemId = null, tabId = null } = {}) {
   const pausedItems = Array.isArray(queue)
     ? queue.filter((item) => item && item.status === 'publish_confirm_paused')

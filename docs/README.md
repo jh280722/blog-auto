@@ -3,7 +3,7 @@
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
 > 현재 운영 기준: **v1.8.29 (2026-04-26 queue publish confirmation pause/resume 포함)**
-> - **v1.8.29부터 직접 발행뿐 아니라 큐 발행도 `publish_confirm_unresolved` / `publish_confirm_in_flight`를 실패로 넘기지 않고 `publish_confirm_paused`로 보존합니다.** `GET_QUEUE`에서 `publishConfirmTabId`, `confirmationState`, `publishConfirmationRecovery`를 확인한 뒤 `RESUME_AFTER_PUBLISH_CONFIRMATION({ id | tabId })`로 같은 탭 final-confirm 재개를 호출할 수 있고, 여러 paused 항목이 있으면 fail-closed로 명시 대상 선택을 요구합니다. `RESUME_DIRECT_PUBLISH`도 같은 상태를 direct publish state에 저장해 새 탭 재작성/중복 공개 오염 대신 같은 탭 복구를 유도합니다.
+> - **v1.8.29부터 직접 발행뿐 아니라 큐 발행도 `publish_confirm_unresolved` / `publish_confirm_in_flight`를 실패로 넘기지 않고 `publish_confirm_paused`로 보존합니다.** `GET_QUEUE`에서 `publishConfirmTabId`, `confirmationState`, `publishConfirmationRecovery`를 확인한 뒤 `RESUME_AFTER_PUBLISH_CONFIRMATION({ id | tabId })`로 같은 탭 final-confirm 재개를 호출할 수 있고, 여러 paused 항목이 있으면 fail-closed로 명시 대상 선택을 요구합니다. 재개 직전에는 content script가 같은 탭의 현재 발행 확인 레이어를 `GET_PUBLISH_CONFIRMATION_STATE`로 다시 읽어 `confirm_ready`일 때만 최종 확인 재시도를 허용하며, `confirm_in_flight`/레이어 소실/CAPTCHA 감지 상태는 새 탭 재작성 없이 poll·fail-closed·CAPTCHA pause로 보존합니다. `RESUME_DIRECT_PUBLISH`도 같은 상태를 direct publish state에 저장해 새 탭 재작성/중복 공개 오염 대신 같은 탭 복구를 유도합니다.
 > - **v1.8.28부터 최종 티스토리 발행 확인 버튼 클릭 뒤 `manage/post` 요청이 관측되지 않으면, 열린 발행 레이어/버튼 상태를 구조화해 `publish_confirm_unresolved` 또는 `publish_confirm_in_flight`로 반환합니다.** 크론은 같은 탭의 레이어를 유지한 채 `RESUME_DIRECT_PUBLISH`/재조회로 이어가면 되고, 새 탭 재작성으로 공개 글을 중복 오염시키지 않습니다.
 > - **v1.8.27부터 `scripts/blog_auto_call.mjs`가 `WRITE_POST` / `ADD_TO_QUEUE` payload의 본문용 generated image provenance를 먼저 검사합니다.** `generated: true` 또는 `generation` 메타데이터가 붙은 이미지는 반드시 `generation.tool: "Hermes image_generate"`, `generation.runner: "openai-codex"`, `generation.model: "gpt-image-2-medium"` 경로여야 하며, PIL/Pillow 수제 인포그래픽·`baoyu-*` 우회 경로는 `body_image_policy_violation`으로 Chrome 호출 전에 fail-fast 합니다. 상품 대표 이미지나 외부 사진처럼 생성 이미지가 아니면 generated metadata를 붙이지 않으면 통과합니다.
 > - DKAPTCHA 핸드오프/재개 지원
@@ -62,7 +62,7 @@
 - **이미지 삽입**: 로컬 파일, 드래그앤드롭, URL 모두 지원
 - **대량 발행 큐**: JSON으로 여러 글을 한번에 등록, 순차 발행
 - **MV3 queue durability**: `START_QUEUE` 이후에는 in-memory timer + `chrome.alarms` wake-up을 함께 유지하고, queue continuation wake 자체도 tracked helper로 묶어 startup recovery / alarm / explicit start가 모두 같은 in-flight 가드를 공유합니다. 따라서 `GET_QUEUE`는 `queueRuntimeState`뿐 아니라 `captcha_paused` 항목의 최신 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult` 메타데이터와 `publish_confirm_paused` 항목의 `publishConfirmTabId` / `confirmationState` / `publishConfirmationRecovery`를 함께 보존해 service worker restart/idle shutdown 이후 자동 재개 여부와 same-tab CAPTCHA/최종확인 재개 힌트를 같이 추적할 수 있음. v1.8.21부터는 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ocrTexts })`가 이 저장된 queue `captchaContext` / `solveHints`를 answer inference에 우선 재주입하므로, live probe가 잠깐 비어도 `challengeText` 기반 OCR 추론이 이어집니다.
-- **publish confirmation same-tab recovery**: `publish_confirm_unresolved` / `publish_confirm_in_flight`는 실패 항목으로 확정하지 않고 direct publish state 또는 queue `publish_confirm_paused`에 보존합니다. direct publish는 `RESUME_DIRECT_PUBLISH`, queue는 `RESUME_AFTER_PUBLISH_CONFIRMATION({ id | tabId })`로 같은 탭 final confirm 레이어에서만 재개합니다.
+- **publish confirmation same-tab recovery**: `publish_confirm_unresolved` / `publish_confirm_in_flight`는 실패 항목으로 확정하지 않고 direct publish state 또는 queue `publish_confirm_paused`에 보존합니다. direct publish는 `RESUME_DIRECT_PUBLISH`, queue는 `RESUME_AFTER_PUBLISH_CONFIRMATION({ id | tabId })`로 같은 탭 final confirm 레이어에서만 재개합니다. 큐 재개 전에는 같은 탭의 현재 확인 레이어 상태를 다시 읽어 `confirm_ready`일 때만 최종 확인을 재시도하고, `confirm_in_flight`는 poll 상태로 유지, CAPTCHA는 `captcha_paused` handoff로 전환, 레이어 소실/탭 probe 실패는 `publish_confirm_target_not_found`로 fail-closed 처리합니다.
 - **direct publish wait durability**: `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })`가 `directPublishRuntimeState`를 storage에 남기고, service worker restart 뒤에도 saved blocked tab의 same-tab CAPTCHA 대기/재개를 alarm 기반으로 다시 이어감 (`GET_DIRECT_PUBLISH_STATE` 응답에도 runtime state 포함)
 - **외부 API**: `externally_connectable`로 외부 도구에서 데이터 전송 가능
 - **직접 발행 상태 추적**: `captcha_required` 시 blocked tab / blog / visibility / diagnostics / requestData와 `publishTrace` / `stage`를 저장
@@ -467,7 +467,7 @@ timeout 예시:
 
 ---
 
-## 발행 상태 코드 (v1.8.28)
+## 발행 상태 코드 (v1.8.29)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 
@@ -483,7 +483,8 @@ timeout 예시:
 | `captcha_target_not_found` | 저장된 blocked tab이 없고 현재 탭에도 live/actionable CAPTCHA가 없음 | `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` 또는 `GET_QUEUE`로 대상 `tabId` / `id`를 다시 확인한 뒤 재시도 |
 | `captcha_wait_timeout` | `RESUME_DIRECT_PUBLISH(waitForCaptcha)` 대기 시간이 초과됨 | 같은 탭 solve 진행 상태 확인 후 재시도 또는 `waitTimeoutMs` 증가 |
 | `captcha_paused` | 큐 항목 CAPTCHA 일시정지 | `GET_QUEUE`로 `id` / `captchaTabId`뿐 아니라 `captchaContext` / `solveHints` / `lastCaptchaArtifactCapture` / `lastCaptchaSubmitResult`를 함께 확인한 뒤 `SUBMIT_CAPTCHA_AND_RESUME({ id | tabId, ... })` 권장. v1.8.21부터는 이 queue submit path가 저장된 `captchaContext` / `solveHints`를 answer inference에 우선 재사용해 false `captcha_challenge_context_missing`를 줄입니다. v1.8.18부터는 `publish_layer_open` 상태도 same-tab 재개/settle 확인으로 이어지고, 팝업 수동 solve라면 `RESUME_AFTER_CAPTCHA` |
-| `publish_confirm_paused` | 큐 항목이 티스토리 최종 확인 레이어/저장중 상태에서 멈춰 다음 항목으로 넘어가지 않도록 일시정지됨 | `GET_QUEUE`에서 `id`, `publishConfirmTabId`, `confirmationState`, `publishConfirmationRecovery` 확인 후 같은 탭에서 `RESUME_AFTER_PUBLISH_CONFIRMATION({ id | tabId })`. 여러 항목이면 id 또는 tabId를 명시해야 하며, `RETRY_ITEM`은 처음부터 재작성하므로 공개 오염 위험 검토 후 사용 |
+| `publish_confirm_paused` | 큐 항목이 티스토리 최종 확인 레이어/저장중 상태에서 멈춰 다음 항목으로 넘어가지 않도록 일시정지됨 | `GET_QUEUE`에서 `id`, `publishConfirmTabId`, `confirmationState`, `publishConfirmationRecovery` 확인 후 같은 탭에서 `RESUME_AFTER_PUBLISH_CONFIRMATION({ id | tabId })`. 이 호출은 재개 직전 같은 탭 레이어를 다시 probe해 `confirm_ready`일 때만 final confirm을 누르고, `confirm_in_flight`는 poll 유지, CAPTCHA는 `captcha_paused` 전환, 레이어 소실은 `publish_confirm_target_not_found`로 중단합니다. 여러 항목이면 id 또는 tabId를 명시해야 하며, `RETRY_ITEM`은 처음부터 재작성하므로 공개 오염 위험 검토 후 사용 |
+| `publish_confirm_target_not_found` | 저장된 최종 확인 탭/레이어를 재개 직전 확인하지 못함 | 새 탭 재작성/`RETRY_ITEM`로 바로 가지 말고 `GET_QUEUE`와 실제 탭 상태를 다시 확인. 이미 저장됐는지 관리자 최신 글도 먼저 확인한 뒤 수동 복구 여부 결정 |
 | `publish_confirm_unresolved` | 최종 발행 확인 버튼 클릭 뒤 `manage/post` 요청이 아직 관측되지 않았고 발행 레이어/확인 버튼이 같은 탭에 남아 있음 | 새 글쓰기 탭을 열지 말고 같은 탭에서 `RESUME_DIRECT_PUBLISH` 또는 queue라면 저장된 항목에 `RESUME_AFTER_PUBLISH_CONFIRMATION`으로 final confirm만 재시도. 응답의 `confirmationState.recommendedAction`, `sameTabRequired`, `retryable` 확인 |
 | `publish_confirm_in_flight` | 확인 버튼 클릭 뒤 버튼/레이어가 저장중·발행중 또는 disabled 상태인데 `manage/post` 요청은 아직 관측되지 않음 | 중복 클릭/새 탭 재작성을 피하고 같은 탭을 먼저 poll. 짧게 재조회 후 완료 URL/`GET_DIRECT_PUBLISH_STATE`/`GET_DRAFT_SNAPSHOT` 확인, 계속 고착되면 same-tab resume 판단 |
 | `editor_not_ready` | 실제 editor body 준비/복구 실패 또는 `WRITE_POST` preflight 실패 | `diagnostics`/`preflight` 확인 후 `PREPARE_EDITOR` 재호출 |
@@ -675,7 +676,7 @@ v1.8.11부터는 DKAPTCHA frame/main DOM에서 입력창은 잡혔지만 visible
 | `SUBMIT_CAPTCHA` | 저장된 direct publish 탭 또는 지정 탭(`data.tabId`)에 CAPTCHA 답안 입력 + 확인 버튼 클릭 (`answer` 또는 `ocrTexts[]`) |
 | `RESUME_DIRECT_PUBLISH` | CAPTCHA 해결 후 직접 발행 재개 (saved blocked tab 우선, `waitForCaptcha`/`waitTimeoutMs`/`pollIntervalMs` 지원) |
 | `RESUME_AFTER_CAPTCHA` | CAPTCHA 해결 후 큐 항목 재개 (`data.id` 권장, 단일 paused 항목이면 자동 선택 가능) |
-| `RESUME_AFTER_PUBLISH_CONFIRMATION` | `publish_confirm_paused` 큐 항목을 같은 탭 최종 확인 레이어에서 재개 (`data.id` 또는 `data.tabId`; 여러 paused 항목이면 필수) |
+| `RESUME_AFTER_PUBLISH_CONFIRMATION` | `publish_confirm_paused` 큐 항목을 같은 탭 최종 확인 레이어에서 재개 (`data.id` 또는 `data.tabId`; 여러 paused 항목이면 필수). 재개 직전 현재 확인 레이어 상태를 다시 probe해 안전하지 않으면 fail-closed |
 | `RETRY_ITEM` | 큐 항목 처음부터 재시도 (`data.id` 필요) |
 | `ADD_TO_QUEUE` | 큐에 추가 |
 | `START_QUEUE` | 큐 처리 시작 |

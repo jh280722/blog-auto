@@ -2797,6 +2797,38 @@
       }
 
       if (confirmBtn) {
+        if (layerAlreadyOpen) {
+          const reuseState = capturePublishConfirmationState({
+            phase: 'before_reusing_open_publish_layer',
+            requestObserved: false
+          });
+          mark('publish_layer_reuse_state_checked', {
+            confirmationState: reuseState.state,
+            recommendedAction: reuseState.recommendedAction || null,
+            safeToRetryFinalConfirm: !!reuseState.safeToRetryFinalConfirm
+          });
+          if (!reuseState.safeToRetryFinalConfirm) {
+            const confirmationFailure = buildUnobservedPublishRequestFailure({
+              requestObserved: false,
+              confirmationState: reuseState
+            });
+            if (confirmationFailure) {
+              return respond({
+                success: false,
+                error: confirmationFailure.error,
+                status: confirmationFailure.status,
+                url: window.location.href,
+                confirmationState: reuseState,
+                retryable: confirmationFailure.retryable,
+                sameTabRequired: confirmationFailure.sameTabRequired,
+                recommendedAction: confirmationFailure.recommendedAction,
+                captchaContext: confirmationFailure.status === 'captcha_required' ? getCaptchaContext() : undefined,
+                captchaStage: confirmationFailure.status === 'captcha_required' ? 'before_reusing_open_publish_layer' : undefined
+              }, 'publish_layer_reuse_not_retryable');
+            }
+          }
+        }
+
         // 발행 레이어가 열린 뒤 최종 공개 설정을 적용
         const visibilityResult = await setVisibility(visibility);
         mark(visibilityResult.success ? 'visibility_applied' : 'visibility_apply_failed', {
@@ -3486,6 +3518,16 @@
 
         case 'GET_CAPTCHA_CONTEXT':
           return getCaptchaContext();
+
+        case 'GET_PUBLISH_CONFIRMATION_STATE':
+          return {
+            success: true,
+            status: 'publish_confirmation_state',
+            confirmationState: capturePublishConfirmationState({
+              phase: message.data?.phase || 'manual_probe',
+              requestObserved: false
+            })
+          };
 
         case 'PREPARE_CAPTCHA_CAPTURE':
           return await prepareCaptchaCapture();

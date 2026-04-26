@@ -66,6 +66,15 @@ import {
   DIRECT_PUBLISH_CONTINUATION_ALARM
 } from '../utils/direct-publish-runtime.js';
 import { buildMergedDirectPublishCaptchaState } from '../utils/direct-publish-captcha.js';
+import {
+  buildDirectPublishConfirmationRecoveryPatch,
+  buildQueuePublishConfirmationPauseState,
+  clearQueuePublishConfirmationPauseState,
+  findQueuePublishConfirmationItem,
+  getQueuePublishConfirmationSelectionFailure,
+  isPublishConfirmationRecoveryStatus,
+  summarizeQueuePublishConfirmationSelection
+} from '../utils/publish-confirmation-recovery.js';
 import { normalizeTistoryTagsForInput } from '../utils/tistory-tags.js';
 
 function normalizeTistoryPostPayload(payload = {}) {
@@ -5004,6 +5013,41 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
       return attachCaptchaWait(attachCaptchaHandoff(attachDirectPublishState(responseWithPreparation), handoff), captchaWait);
     }
 
+    if (isPublishConfirmationRecoveryStatus(responseWithPreparation.status)) {
+      const blockedResumeState = buildDirectPublishState({
+        response: responseWithPreparation,
+        preparation,
+        requestData: {
+          ...mergedRequestData,
+          blogName: mergedRequestData.blogName || directPublishState?.blogName || preparation.blogName,
+          visibility: mergedRequestData.visibility || directPublishState?.visibility || null
+        }
+      });
+      await setDirectPublishState({
+        ...(directPublishState?.tabId === preparation.tabId ? directPublishState : {}),
+        ...blockedResumeState,
+        ...buildDirectPublishConfirmationRecoveryPatch({
+          response: responseWithPreparation,
+          nowIso: new Date().toISOString()
+        }),
+        tabId: preparation.tabId,
+        url: preparation.url || blockedResumeState.url || directPublishState?.url || null,
+        requestData: blockedResumeState.requestData,
+        lastDraftRestore: {
+          success: true,
+          restored: !!draftRestore.restored,
+          missing: [],
+          checkedAt: new Date().toISOString(),
+          snapshot: draftRestore.snapshot || null
+        },
+        lastCaptchaWait: captchaWait
+          ? summarizeCaptchaWaitResult(captchaWait, waitOptions)
+          : (directPublishState?.lastCaptchaWait || null),
+        lastCheckedAt: new Date().toISOString()
+      });
+      return attachCaptchaWait(attachDirectPublishState(responseWithPreparation), captchaWait);
+    }
+
     return attachCaptchaWait(attachDirectPublishState(responseWithPreparation), captchaWait);
   } catch (e) {
     preparation.diagnostics?.attempts?.push({
@@ -5729,6 +5773,18 @@ async function processNextInQueue() {
         isProcessing = false;
         await resetQueueRuntimeState();
         return; // 다음 항목 처리하지 않음 (사용자가 Resume 해야 함)
+      } else if (isPublishConfirmationRecoveryStatus(responseWithPreparation.status)) {
+        Object.assign(item, buildQueuePublishConfirmationPauseState({
+          existingItem: item,
+          tabId: currentTabId,
+          response: responseWithPreparation,
+          error: '티스토리 최종 확인 단계 감지 — 같은 탭에서 확인/재개 필요'
+        }));
+        console.warn('[TistoryAuto BG] publish confirmation 감지 — 큐 일시정지 (publish_confirm_paused). tabId:', currentTabId);
+        await saveQueueState();
+        isProcessing = false;
+        await resetQueueRuntimeState();
+        return; // 같은 탭 재개가 필요하므로 다음 항목으로 넘어가지 않음
       } else {
         item.status = 'failed';
         item.error = responseWithPreparation.error || responseWithPreparation.message || '발행 실패';
@@ -5748,7 +5804,7 @@ async function processNextInQueue() {
 }
 
 async function resumeQueueItemAfterCaptcha(item, options = {}) {
-  const tabId = options.tabId || item?.captchaTabId || currentTabId;
+  const tabId = options.tabId || item?.captchaTabId || item?.publishConfirmTabId || currentTabId;
   if (!tabId) {
     return { success: false, error: '에디터 탭을 찾을 수 없음. 페이지를 새로 열어주세요.', status: 'editor_not_ready' };
   }
@@ -5762,10 +5818,18 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
   };
 
   const resumeProbe = await probeTabReady(tabId, resumeDiagnostics, 'probe_resume_tab');
-  const resumeAction = decideQueueCaptchaResumeProbeAction({
+  let resumeAction = decideQueueCaptchaResumeProbeAction({
     probeResult: resumeProbe,
     captchaStage: item?.captchaStage || null
   });
+  if (item?.status === 'publish_confirm_paused' && resumeProbe?.reason === 'publish_layer_open') {
+    resumeAction = {
+      action: 'resume_publish_layer_open',
+      status: 'resume_publish_layer_open',
+      reason: resumeProbe.reason,
+      error: resumeProbe.error || null
+    };
+  }
   if (resumeAction.action === 'editor_not_ready') {
     return {
       success: false,
@@ -5817,7 +5881,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
 
   const previousQueueCaptchaSnapshot = cloneJsonValue(item) || { ...item };
   const normalizedItemData = normalizeTistoryPostPayload(item.data || {});
-  Object.assign(item, clearQueueCaptchaPauseState());
+  Object.assign(item, clearQueueCaptchaPauseState(), clearQueuePublishConfirmationPauseState());
   item.status = 'processing';
   isProcessing = true;
   await clearQueueContinuationAlarm();
@@ -5834,7 +5898,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
       item.error = null;
       item.completedAt = new Date().toISOString();
       item.publishStatus = normalizedResponse.status || 'published';
-      Object.assign(item, clearQueueCaptchaPauseState());
+      Object.assign(item, clearQueueCaptchaPauseState(), clearQueuePublishConfirmationPauseState());
       await saveQueueState();
       isProcessing = false;
       const queueContinuation = await scheduleNextPendingQueueItem();
@@ -5861,10 +5925,23 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
       return normalizedResponse;
     }
 
+    if (isPublishConfirmationRecoveryStatus(normalizedResponse.status)) {
+      Object.assign(item, buildQueuePublishConfirmationPauseState({
+        existingItem: previousQueueCaptchaSnapshot,
+        tabId,
+        response: normalizedResponse,
+        error: '티스토리 최종 확인 단계가 아직 미완료 — 같은 탭에서 다시 재개'
+      }));
+      await saveQueueState();
+      isProcessing = false;
+      await resetQueueRuntimeState();
+      return normalizedResponse;
+    }
+
     item.status = 'failed';
     item.error = normalizedResponse.error || '재개 후 발행 실패';
     item.publishStatus = normalizedResponse.status;
-    Object.assign(item, clearQueueCaptchaPauseState());
+    Object.assign(item, clearQueueCaptchaPauseState(), clearQueuePublishConfirmationPauseState());
     await saveQueueState();
     isProcessing = false;
     await resetQueueRuntimeState();
@@ -5894,7 +5971,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
       item.status = 'failed';
       item.error = draftRestore.error || '발행 재개 전 초안 복구 실패';
       item.publishStatus = draftRestore.status || 'draft_restore_failed';
-      Object.assign(item, clearQueueCaptchaPauseState());
+      Object.assign(item, clearQueueCaptchaPauseState(), clearQueuePublishConfirmationPauseState());
       await saveQueueState();
       isProcessing = false;
       await resetQueueRuntimeState();
@@ -5933,7 +6010,7 @@ async function resumeQueueItemAfterCaptcha(item, options = {}) {
   } catch (error) {
     item.status = 'failed';
     item.error = error.message;
-    Object.assign(item, clearQueueCaptchaPauseState());
+    Object.assign(item, clearQueueCaptchaPauseState(), clearQueuePublishConfirmationPauseState());
     await saveQueueState();
     isProcessing = false;
     await resetQueueRuntimeState();
@@ -6993,6 +7070,27 @@ async function handleMessage(message, sender) {
           return attachCaptchaHandoff(attachDirectPublishState(responseWithPreparation), handoff);
         }
 
+        if (isPublishConfirmationRecoveryStatus(responseWithPreparation.status)) {
+          const baseWriteState = buildDirectPublishState({
+            response: responseWithPreparation,
+            preparation,
+            requestData: normalizedData
+          });
+          await setDirectPublishState({
+            ...(directPublishState?.tabId === preparation.tabId ? directPublishState : {}),
+            ...baseWriteState,
+            ...buildDirectPublishConfirmationRecoveryPatch({
+              response: responseWithPreparation,
+              nowIso: new Date().toISOString()
+            }),
+            tabId: preparation.tabId,
+            url: preparation.url || baseWriteState.url || directPublishState?.url || null,
+            requestData: baseWriteState.requestData,
+            lastCheckedAt: new Date().toISOString()
+          });
+          return attachDirectPublishState(responseWithPreparation);
+        }
+
         if (responseWithPreparation.success) {
           await clearDirectPublishState();
         }
@@ -7631,6 +7729,42 @@ async function handleMessage(message, sender) {
       };
     }
 
+    // 티스토리 최종 확인 단계에서 멈춘 큐 항목을 같은 탭에서 재개
+    case 'RESUME_AFTER_PUBLISH_CONFIRMATION': {
+      const queueSelection = summarizeQueuePublishConfirmationSelection(publishQueue, {
+        itemId: message.data?.id || null,
+        tabId: message.data?.tabId || null
+      });
+      const item = findQueuePublishConfirmationItem(publishQueue, {
+        itemId: message.data?.id || null,
+        tabId: message.data?.tabId || null
+      });
+      const queueSelectionFailure = getQueuePublishConfirmationSelectionFailure({
+        queue: publishQueue,
+        itemId: message.data?.id || null,
+        tabId: message.data?.tabId || null,
+        matchedItem: item,
+        directPublishTabId: null
+      });
+      if (queueSelectionFailure) {
+        return {
+          success: false,
+          error: queueSelectionFailure.error,
+          status: queueSelectionFailure.status,
+          queueSelection
+        };
+      }
+
+      const resumeResult = await resumeQueueItemAfterCaptcha(item, {
+        tabId: message.data?.tabId || item.publishConfirmTabId || currentTabId
+      });
+      return {
+        ...resumeResult,
+        queueItemId: item.id,
+        queueSelection
+      };
+    }
+
     // 실패/일시정지 항목 처음부터 재시도
     case 'RETRY_ITEM': {
       const itemId = message.data?.id;
@@ -7638,7 +7772,7 @@ async function handleMessage(message, sender) {
       if (!item) return { success: false, error: '항목을 찾을 수 없음' };
       item.status = 'pending';
       item.error = null;
-      Object.assign(item, clearQueueCaptchaPauseState());
+      Object.assign(item, clearQueueCaptchaPauseState(), clearQueuePublishConfirmationPauseState());
       item.completedAt = null;
       item.publishStatus = null;
       await saveQueueState();

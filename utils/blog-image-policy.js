@@ -254,6 +254,13 @@ function shouldValidateBodyImagePolicy(action) {
   return BODY_IMAGE_POLICY_ACTIONS.has(action);
 }
 
+function buildBodyImagePolicyActionGuard({ action, payload }) {
+  if (!shouldValidateBodyImagePolicy(action)) return null;
+  const report = buildBodyImagePolicyReport({ action, payload });
+  if (report.ok) return null;
+  return buildBodyImagePolicyFailureResult({ action, report });
+}
+
 function buildBodyImagePolicyFailureResult({ action, report }) {
   return {
     success: false,
@@ -270,6 +277,7 @@ export {
   REQUIRED_MODEL,
   REQUIRED_RUNNER,
   REQUIRED_TOOL_LABEL,
+  buildBodyImagePolicyActionGuard,
   buildBodyImagePolicyFailureResult,
   buildBodyImagePolicyReport,
   extractImagesFromHtml,

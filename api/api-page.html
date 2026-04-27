@@ -292,7 +292,7 @@
             <label>이미지 URL (줄바꿈 구분)</label>
             <textarea id="api-images" rows="3"
                 placeholder="https://example.com/image1.jpg&#10;https://example.com/image2.jpg"></textarea>
-            <p class="hint">생성 이미지가 필요한 경우 운영 크론에서 Hermes <code>image_generate</code> → <code>openai-codex</code> / <code>gpt-image-2-medium</code>로 만든 뒤 <code>generation</code> provenance를 포함해 호출하세요. 이 텍스트박스는 상품/외부 이미지 URL smoke용입니다.</p>
+            <p class="hint">생성 이미지가 필요한 경우 운영 크론에서 Hermes <code>image_generate</code> → <code>openai-codex</code> / <code>gpt-image-2-medium</code>로 만든 뒤 <code>generation</code> provenance를 포함해 호출하세요. v1.8.31부터 API 페이지/외부 메시지도 서비스워커가 <code>body_image_policy_violation</code>으로 fail-fast하므로, 이 텍스트박스에는 상품/외부 이미지 URL만 넣는 것을 권장합니다.</p>
             <label>
                 <input type="checkbox" id="resume-wait-for-captcha" checked>
                 RESUME_DIRECT_PUBLISH가 CAPTCHA 해제까지 대기
@@ -348,6 +348,7 @@
                 }, (response) => console.log(response));
 
                 <span class="key">// 2) 단건 발행</span>
+                <span class="key">// 생성 이미지 metadata가 있으면 서비스워커가 Hermes image_generate/openai-codex/gpt-image-2-medium 경로만 허용하고, 위반 시 body_image_policy_violation을 반환</span>
                 chrome.runtime.sendMessage(EXTENSION_ID, {
                 <span class="key">action</span>: <span class="str">"WRITE_POST"</span>,
                 <span class="key">data</span>: {

@@ -78,6 +78,9 @@ import {
   summarizeQueuePublishConfirmationSelection
 } from '../utils/publish-confirmation-recovery.js';
 import { normalizeTistoryTagsForInput } from '../utils/tistory-tags.js';
+import {
+  buildBodyImagePolicyActionGuard
+} from '../utils/blog-image-policy.js';
 
 function normalizeTistoryPostPayload(payload = {}) {
   if (!payload || typeof payload !== 'object') return payload;
@@ -7244,6 +7247,14 @@ async function prepareEditorTab(options = {}) {
 // ── 공통 메시지 처리 함수 ──────────────────────────
 async function handleMessage(message, sender) {
   await ensureRuntimeStateLoaded();
+
+  const bodyImagePolicyFailure = buildBodyImagePolicyActionGuard({
+    action: message.action,
+    payload: message.data
+  });
+  if (bodyImagePolicyFailure) {
+    return bodyImagePolicyFailure;
+  }
 
   switch (message.action) {
     // Content Script가 준비되었음을 알림

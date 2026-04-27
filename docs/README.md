@@ -2,7 +2,8 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.30 (2026-04-27 direct publish confirmation safe preflight 포함)**
+> 현재 운영 기준: **v1.8.31 (2026-04-27 service worker body image policy guard 포함)**
+> - **v1.8.31부터 generated body image provenance gate가 CLI 래퍼뿐 아니라 확장 서비스워커의 `WRITE_POST` / `ADD_TO_QUEUE` 메시지 입구에도 적용됩니다.** API 페이지나 다른 externally_connectable 호출이 `scripts/blog_auto_call.mjs`를 우회하더라도, `generated: true` 또는 `generation` 메타데이터가 붙은 본문 이미지는 Hermes `image_generate` → `openai-codex` / `gpt-image-2-medium` 경로만 통과하고, PIL/Pillow·수제 인포그래픽·`baoyu-*` 기본 우회 경로는 에디터 탭 열기/큐 저장 전에 `body_image_policy_violation`으로 fail-fast 합니다. 상품 대표 이미지/공식 이미지처럼 생성물이 아니면 generated metadata를 붙이지 않습니다.
 > - **v1.8.30부터 `RESUME_DIRECT_PUBLISH`도 저장된 direct publish state가 `publish_confirm_unresolved` / `publish_confirm_in_flight` 또는 `phase: "publish_confirmation"`이면, `RESUME_PUBLISH`를 바로 다시 누르기 전에 같은 탭에 `GET_PUBLISH_CONFIRMATION_STATE` preflight를 수행합니다.** 현재 레이어가 `confirm_ready`일 때만 final confirm 재시도를 계속하고, `confirm_in_flight`는 `publish_confirm_in_flight` 상태로 poll 유지, CAPTCHA는 `captcha_required` handoff로 전환, 레이어 소실/탭 probe 실패는 `publish_confirm_target_not_found`로 fail-closed 합니다. 직접 발행 크론에서도 저장중 상태 중복 클릭이나 fresh tab 재작성으로 인한 공개 글 중복 오염을 줄입니다.
 > - **v1.8.29부터 직접 발행뿐 아니라 큐 발행도 `publish_confirm_unresolved` / `publish_confirm_in_flight`를 실패로 넘기지 않고 `publish_confirm_paused`로 보존합니다.** `GET_QUEUE`에서 `publishConfirmTabId`, `confirmationState`, `publishConfirmationRecovery`를 확인한 뒤 `RESUME_AFTER_PUBLISH_CONFIRMATION({ id | tabId })`로 같은 탭 final-confirm 재개를 호출할 수 있고, 여러 paused 항목이 있으면 fail-closed로 명시 대상 선택을 요구합니다. 재개 직전에는 content script가 같은 탭의 현재 발행 확인 레이어를 `GET_PUBLISH_CONFIRMATION_STATE`로 다시 읽어 `confirm_ready`일 때만 최종 확인 재시도를 허용하며, `confirm_in_flight`/레이어 소실/CAPTCHA 감지 상태는 새 탭 재작성 없이 poll·fail-closed·CAPTCHA pause로 보존합니다. `RESUME_DIRECT_PUBLISH`도 같은 상태를 direct publish state에 저장해 새 탭 재작성/중복 공개 오염 대신 같은 탭 복구를 유도합니다.
 > - **v1.8.28부터 최종 티스토리 발행 확인 버튼 클릭 뒤 `manage/post` 요청이 관측되지 않으면, 열린 발행 레이어/버튼 상태를 구조화해 `publish_confirm_unresolved` 또는 `publish_confirm_in_flight`로 반환합니다.** 크론은 같은 탭의 레이어를 유지한 채 `RESUME_DIRECT_PUBLISH`/재조회로 이어가면 되고, 새 탭 재작성으로 공개 글을 중복 오염시키지 않습니다.
@@ -345,6 +346,7 @@ node scripts/blog_auto_call.mjs \
 - `chrome-extension://<EXTENSION_ID>/api/api-page.html` 탭을 자동 재사용/복구
 - `BLOG_AUTO_CALL_TIMEOUT_MS` 또는 `--timeout-ms` 기준으로 **page-context Promise timeout** 적용
 - `WRITE_POST` / `ADD_TO_QUEUE` payload에 generated body image가 명시된 경우 Chrome/CDP 호출 전에 provenance를 검사해, Hermes `image_generate` → `openai-codex` / `gpt-image-2-medium` 외의 PIL/Pillow·수제 인포그래픽·`baoyu-*` 기본 우회 경로를 `body_image_policy_violation`으로 즉시 차단
+- 같은 검사는 확장 서비스워커의 `WRITE_POST` / `ADD_TO_QUEUE` 메시지 입구에서도 한 번 더 실행되므로, API 페이지·외부 `chrome.runtime.sendMessage` 호출이 CLI 래퍼를 우회해도 unsafe generated image payload가 에디터 탭을 열거나 큐에 저장되기 전에 중단됨
 - extension callback이 끝내 돌아오지 않으면 터미널 hard timeout까지 멍하게 기다리지 않고 즉시 `status: "bridge_timeout"` 반환
 - Chrome DevTools가 안 떠 있거나 API page target/bootstrap이 실패하면 `status: "bridge_setup_error"`로 끊고, `bridgeDiagnostics.stage === "ensure_api_target"` + `inferredCause` / `browserVersion` / `debugTargets`를 남겨 DevTools 미기동 vs API page target 부재를 바로 구분
 - API target을 찾은 뒤 websocket/evaluate transport가 끊기면 `status: "bridge_transport_error"`로 끊고, `bridgeDiagnostics.stage === "call_extension_action"` + 동일 진단 필드를 남겨 bridge callback 무응답과 CDP transport 실패를 분리
@@ -398,7 +400,7 @@ timeout 예시:
 
 운영 팁:
 - wrapper-level timeout (`bridge_timeout`)은 **확장 응답이 아예 없는 경우**를 surface하는 용도입니다. extension이 정상적으로 `editor_not_ready`, `captcha_required`, `captcha_wait_timeout` 등을 돌려주면 그 응답은 그대로 통과시킵니다.
-- `body_image_policy_violation`은 Chrome을 호출하기 전 payload 품질 gate에서 막힌 것입니다. 생성 이미지가 필요하면 먼저 Hermes `image_generate`(운영 backend: `openai-codex` / `gpt-image-2-medium`)로 만들고, 업로드 URL에 아래 provenance를 함께 붙여 호출하세요. 상품 대표 이미지/공식 이미지처럼 생성물이 아니면 `generated` / `generation` 필드를 생략합니다.
+- `body_image_policy_violation`은 Chrome을 호출하기 전 payload 품질 gate에서 막힌 것입니다. v1.8.31부터는 동일 gate가 서비스워커 `WRITE_POST` / `ADD_TO_QUEUE` 입구에도 적용되므로, CLI 래퍼를 우회한 API 페이지/외부 메시지도 에디터 탭 열기나 큐 저장 전에 같은 status로 중단됩니다. 생성 이미지가 필요하면 먼저 Hermes `image_generate`(운영 backend: `openai-codex` / `gpt-image-2-medium`)로 만들고, 업로드 URL에 아래 provenance를 함께 붙여 호출하세요. 상품 대표 이미지/공식 이미지처럼 생성물이 아니면 `generated` / `generation` 필드를 생략합니다.
 
 ```json
 {
@@ -468,14 +470,14 @@ timeout 예시:
 
 ---
 
-## 발행 상태 코드 (v1.8.30)
+## 발행 상태 코드 (v1.8.31)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 
 | 상태 | 설명 | 다음 액션 |
 |------|------|-----------|
 | `editor_ready` | `PREPARE_EDITOR`가 실제 TinyMCE/editor body까지 준비된 탭 확보 완료 | `WRITE_POST` 호출 |
-| `body_image_policy_violation` | `scripts/blog_auto_call.mjs`가 Chrome 호출 전 generated body image provenance를 검사했고, Hermes `image_generate` → `openai-codex` / `gpt-image-2-medium` 외 경로(PIL/Pillow, `baoyu-*`, 수제 인포그래픽 등)를 발견 | payload 이미지 생성 경로를 Hermes `image_generate`로 다시 만들고 `generation` metadata를 붙여 재호출. 상품/외부 이미지면 generated metadata를 붙이지 않음 |
+| `body_image_policy_violation` | `scripts/blog_auto_call.mjs` 또는 서비스워커 `WRITE_POST` / `ADD_TO_QUEUE` 입구가 generated body image provenance를 검사했고, Hermes `image_generate` → `openai-codex` / `gpt-image-2-medium` 외 경로(PIL/Pillow, `baoyu-*`, 수제 인포그래픽 등)를 발견 | payload 이미지 생성 경로를 Hermes `image_generate`로 다시 만들고 `generation` metadata를 붙여 재호출. 상품/외부 이미지면 generated metadata를 붙이지 않음 |
 | `blog_not_configured` | 자동으로 열 블로그명을 알 수 없음 | 설정 저장 또는 `data.blogName` 전달 |
 | `published` | 발행 성공 | — |
 | `captcha_required` | CAPTCHA 감지됨 (직접 발행) | 응답의 `captchaArtifacts` 우선 확인 → `preferredSolveMode`가 `extension_dom` / `extension_frame_dom`이면 `SUBMIT_CAPTCHA_AND_RESUME`, 드물게 `browser_handoff`면 browser/CDP fallback + `RESUME_DIRECT_PUBLISH({ waitForCaptcha: true })` |

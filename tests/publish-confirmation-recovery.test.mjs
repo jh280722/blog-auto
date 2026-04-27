@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   buildDirectPublishConfirmationRecoveryPatch,
+  buildDirectPublishConfirmationResumePreflight,
   buildQueuePublishConfirmationPauseState,
   buildQueuePublishConfirmationResumePreflight,
   findQueuePublishConfirmationItem,
@@ -64,6 +65,66 @@ test('buildDirectPublishConfirmationRecoveryPatch preserves confirmation state f
       updatedAt: '2026-04-26T01:00:00.000Z'
     }
   });
+});
+
+test('buildDirectPublishConfirmationResumePreflight keeps in-flight direct confirmation in same-tab poll state', () => {
+  const preflight = buildDirectPublishConfirmationResumePreflight({
+    confirmationState: {
+      state: 'confirm_in_flight',
+      publishLayerPresent: true,
+      confirmButtonPresent: true,
+      confirmButtonText: '저장중',
+      confirmButtonDisabled: true,
+      safeToPollSameTab: true,
+      recommendedAction: 'poll_same_tab_before_retry'
+    },
+    nowIso: '2026-04-27T01:02:03.000Z'
+  });
+
+  assert.equal(preflight.shouldResume, false);
+  assert.equal(preflight.status, 'publish_confirm_in_flight');
+  assert.equal(preflight.sameTabRequired, true);
+  assert.equal(preflight.confirmationState.state, 'confirm_in_flight');
+  assert.equal(preflight.publishConfirmationRecovery.status, 'publish_confirm_in_flight');
+  assert.equal(preflight.publishConfirmationRecovery.recommendedAction, 'poll_same_tab_before_retry');
+});
+
+test('buildDirectPublishConfirmationResumePreflight allows direct final-confirm retry only when ready', () => {
+  const preflight = buildDirectPublishConfirmationResumePreflight({
+    confirmationState: {
+      state: 'confirm_ready',
+      publishLayerPresent: true,
+      confirmButtonPresent: true,
+      confirmButtonText: '비공개 저장',
+      confirmButtonDisabled: false,
+      safeToRetryFinalConfirm: true,
+      recommendedAction: 'retry_final_confirm_same_tab'
+    },
+    nowIso: '2026-04-27T01:02:03.000Z'
+  });
+
+  assert.deepEqual(preflight, {
+    shouldResume: true,
+    status: 'confirm_ready',
+    recommendedAction: 'retry_final_confirm_same_tab'
+  });
+});
+
+test('buildDirectPublishConfirmationResumePreflight converts direct confirmation CAPTCHA to captcha_required', () => {
+  const preflight = buildDirectPublishConfirmationResumePreflight({
+    confirmationState: {
+      state: 'captcha_present',
+      publishLayerPresent: true,
+      captchaPresent: true,
+      recommendedAction: 'solve_captcha_same_tab_then_resume'
+    },
+    nowIso: '2026-04-27T01:02:03.000Z'
+  });
+
+  assert.equal(preflight.shouldResume, false);
+  assert.equal(preflight.status, 'captcha_required');
+  assert.equal(preflight.sameTabRequired, true);
+  assert.equal(preflight.confirmationState.captchaPresent, true);
 });
 
 test('buildQueuePublishConfirmationPauseState pauses a queue item without CAPTCHA metadata or next-item continuation', () => {

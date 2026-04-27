@@ -68,6 +68,7 @@ import {
 import { buildMergedDirectPublishCaptchaState } from '../utils/direct-publish-captcha.js';
 import {
   buildDirectPublishConfirmationRecoveryPatch,
+  buildDirectPublishConfirmationResumePreflight,
   buildQueuePublishConfirmationPauseState,
   buildQueuePublishConfirmationResumePreflight,
   clearQueuePublishConfirmationPauseState,
@@ -4914,6 +4915,139 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
       requestData: normalizeDirectPublishRequestData(mergedRequestData)
     });
     return attachCaptchaWait(attachDirectPublishState(preparation), captchaWait);
+  }
+
+  const isDirectPublishConfirmationRecovery =
+    isPublishConfirmationRecoveryStatus(liveState?.status)
+    || isPublishConfirmationRecoveryStatus(directPublishState?.status)
+    || liveState?.phase === 'publish_confirmation'
+    || directPublishState?.phase === 'publish_confirmation';
+
+  if (isDirectPublishConfirmationRecovery) {
+    const confirmationDiagnostics = preparation.diagnostics || { attempts: [] };
+    if (!Array.isArray(confirmationDiagnostics.attempts)) confirmationDiagnostics.attempts = [];
+
+    let confirmationProbe = null;
+    try {
+      confirmationProbe = await sendEditorMessage(preparation.tabId, 'GET_PUBLISH_CONFIRMATION_STATE', {
+        phase: 'direct_publish_confirmation_resume_preflight'
+      });
+      confirmationDiagnostics.attempts.push({
+        step: 'direct_publish_confirmation_resume_preflight',
+        tabId: preparation.tabId,
+        status: confirmationProbe?.status || null,
+        confirmationState: confirmationProbe?.confirmationState?.state || null,
+        recommendedAction: confirmationProbe?.confirmationState?.recommendedAction || null,
+        at: new Date().toISOString()
+      });
+    } catch (error) {
+      confirmationDiagnostics.attempts.push({
+        step: 'direct_publish_confirmation_resume_preflight_failed',
+        tabId: preparation.tabId,
+        error: error?.message || String(error),
+        at: new Date().toISOString()
+      });
+      await updateDirectPublishState({
+        ...buildTransitionPatch(directPublishState || liveState || {}, 'publish_confirmation_probe_failed', {
+          phase: 'publish_confirmation',
+          status: 'publish_confirm_target_not_found',
+          tabId: preparation.tabId
+        }),
+        phase: 'publish_confirmation',
+        stage: 'probe_failed',
+        status: 'publish_confirm_target_not_found',
+        tabId: preparation.tabId,
+        url: preparation.url || directPublishState?.url || liveState?.url || null,
+        requestData: normalizeDirectPublishRequestData(mergedRequestData),
+        lastCheckedAt: new Date().toISOString()
+      });
+      return attachCaptchaWait(attachDirectPublishState(withPreparationDetails({
+        success: false,
+        status: 'publish_confirm_target_not_found',
+        error: '직접 발행 최종 확인 재개 전 같은 탭 상태를 읽지 못했습니다. 새 탭 재작성 없이 direct publish state와 탭 상태를 다시 확인하세요.',
+        tabId: preparation.tabId,
+        sameTabRequired: true,
+        diagnostics: confirmationDiagnostics
+      }, preparation)), captchaWait);
+    }
+
+    const confirmationPreflight = buildDirectPublishConfirmationResumePreflight({
+      confirmationState: confirmationProbe?.confirmationState || null
+    });
+
+    if (confirmationPreflight.status === 'captcha_required') {
+      const handoff = await captureCaptchaHandoffForTab(preparation.tabId);
+      const nextState = liveState || directPublishState || buildDirectPublishState({
+        response: { status: 'captcha_required', tabId: preparation.tabId },
+        preparation,
+        requestData: mergedRequestData,
+        captchaContext: handoff.captchaContext || confirmationProbe?.confirmationState?.captchaSummary || null
+      });
+      await setDirectPublishState({
+        ...buildMergedDirectPublishCaptchaState({
+          existingState: nextState,
+          tabId: preparation.tabId,
+          status: 'captcha_required',
+          url: preparation.url || nextState.url || null,
+          requestData: normalizeDirectPublishRequestData(mergedRequestData),
+          captchaContext: handoff.captchaContext || confirmationProbe?.confirmationState?.captchaSummary || null,
+          handoff,
+          lastCheckedAt: new Date().toISOString()
+        }),
+        ...buildTransitionPatch(nextState, 'publish_confirmation_captcha_detected', {
+          phase: 'publish_confirmation',
+          status: 'captcha_required',
+          tabId: preparation.tabId
+        }),
+        blogName: mergedRequestData.blogName || nextState.blogName || preparation.blogName
+      });
+      return attachCaptchaWait(attachCaptchaHandoff(attachDirectPublishState(withPreparationDetails({
+        success: false,
+        status: 'captcha_required',
+        error: confirmationPreflight.error,
+        tabId: preparation.tabId,
+        confirmationState: confirmationPreflight.confirmationState,
+        sameTabRequired: true,
+        diagnostics: confirmationDiagnostics
+      }, preparation)), handoff), captchaWait);
+    }
+
+    if (!confirmationPreflight.shouldResume) {
+      const nextState = liveState || directPublishState || buildDirectPublishState({
+        response: { status: confirmationPreflight.status, tabId: preparation.tabId },
+        preparation,
+        requestData: mergedRequestData
+      });
+      await setDirectPublishState({
+        ...nextState,
+        ...buildTransitionPatch(nextState, 'publish_confirmation_resume_blocked', {
+          phase: 'publish_confirmation',
+          status: confirmationPreflight.status,
+          confirmationState: confirmationPreflight.confirmationState?.state || null,
+          tabId: preparation.tabId
+        }),
+        phase: 'publish_confirmation',
+        stage: confirmationPreflight.confirmationState?.state || confirmationPreflight.status,
+        status: confirmationPreflight.status,
+        confirmationState: confirmationPreflight.confirmationState,
+        publishConfirmationRecovery: confirmationPreflight.publishConfirmationRecovery || null,
+        tabId: preparation.tabId,
+        url: preparation.url || nextState.url || null,
+        requestData: normalizeDirectPublishRequestData(mergedRequestData),
+        lastCheckedAt: new Date().toISOString()
+      });
+      return attachCaptchaWait(attachDirectPublishState(withPreparationDetails({
+        success: false,
+        status: confirmationPreflight.status,
+        error: confirmationPreflight.error,
+        tabId: preparation.tabId,
+        confirmationState: confirmationPreflight.confirmationState,
+        publishConfirmationRecovery: confirmationPreflight.publishConfirmationRecovery || null,
+        sameTabRequired: confirmationPreflight.sameTabRequired !== false,
+        recommendedAction: confirmationPreflight.recommendedAction || null,
+        diagnostics: confirmationDiagnostics
+      }, preparation)), captchaWait);
+    }
   }
 
   const draftRestore = await restoreDraftIfNeeded(preparation.tabId, mergedRequestData);

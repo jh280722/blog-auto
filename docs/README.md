@@ -2,7 +2,8 @@
 
 티스토리 블로그 글쓰기를 자동화하는 Chrome 확장 프로그램입니다.
 
-> 현재 운영 기준: **v1.8.32 (2026-04-28 direct publish confirmation target fail-closed 포함)**
+> 현재 운영 기준: **v1.8.33 (2026-04-28 bridge timeout publish-confirmation diagnostics 포함)**
+> - **v1.8.33부터 `scripts/blog_auto_call.mjs`의 `bridge_timeout` diagnostics가 direct/queue 최종 확인 대기 상태를 더 명확히 요약합니다.** `directPublish.phase: "publish_confirmation"` 또는 큐 `publish_confirm_paused`가 보이면 `bridgeDiagnostics.inferredCause`가 각각 `direct_publish_confirmation_pending` / `queue_publish_confirmation_paused`로 분류되고, compact `confirmationState`, `publishConfirmationRecovery`, `publishConfirmTabId`가 함께 내려와 크론이 새 탭 재작성 대신 같은 탭 poll/remote-state 확인으로 바로 분기할 수 있습니다.
 > - **v1.8.32부터 `RESUME_DIRECT_PUBLISH`가 저장된 direct publish state의 `phase: "publish_confirmation"` / `publish_confirm_*` 상태를 복구할 때 저장 탭이 사라졌으면 fresh editor tab을 열지 않고 즉시 `publish_confirm_target_not_found`로 fail-closed 합니다.** 응답에는 `sameTabRequired`, `recommendedAction: "verify_remote_state_before_retry"`, compact `confirmationState`, `publishConfirmationRecovery`가 붙으므로, 크론은 새 글 재작성 전에 관리자 최신 글/RSS/공개 URL로 원격 저장 여부를 먼저 확인할 수 있습니다.
 > - **v1.8.31부터 generated body image provenance gate가 CLI 래퍼뿐 아니라 확장 서비스워커의 `WRITE_POST` / `ADD_TO_QUEUE` 메시지 입구에도 적용됩니다.** API 페이지나 다른 externally_connectable 호출이 `scripts/blog_auto_call.mjs`를 우회하더라도, `generated: true` 또는 `generation` 메타데이터가 붙은 본문 이미지는 Hermes `image_generate` → `openai-codex` / `gpt-image-2-medium` 경로만 통과하고, PIL/Pillow·수제 인포그래픽·`baoyu-*` 기본 우회 경로는 에디터 탭 열기/큐 저장 전에 `body_image_policy_violation`으로 fail-fast 합니다. 상품 대표 이미지/공식 이미지처럼 생성물이 아니면 generated metadata를 붙이지 않습니다.
 > - **v1.8.30부터 `RESUME_DIRECT_PUBLISH`도 저장된 direct publish state가 `publish_confirm_unresolved` / `publish_confirm_in_flight` 또는 `phase: "publish_confirmation"`이면, `RESUME_PUBLISH`를 바로 다시 누르기 전에 같은 탭에 `GET_PUBLISH_CONFIRMATION_STATE` preflight를 수행합니다.** 현재 레이어가 `confirm_ready`일 때만 final confirm 재시도를 계속하고, `confirm_in_flight`는 `publish_confirm_in_flight` 상태로 poll 유지, CAPTCHA는 `captcha_required` handoff로 전환, 레이어 소실/탭 probe 실패는 `publish_confirm_target_not_found`로 fail-closed 합니다. 직접 발행 크론에서도 저장중 상태 중복 클릭이나 fresh tab 재작성으로 인한 공개 글 중복 오염을 줄입니다.
@@ -352,8 +353,8 @@ node scripts/blog_auto_call.mjs \
 - Chrome DevTools가 안 떠 있거나 API page target/bootstrap이 실패하면 `status: "bridge_setup_error"`로 끊고, `bridgeDiagnostics.stage === "ensure_api_target"` + `inferredCause` / `browserVersion` / `debugTargets`를 남겨 DevTools 미기동 vs API page target 부재를 바로 구분
 - API target을 찾은 뒤 websocket/evaluate transport가 끊기면 `status: "bridge_transport_error"`로 끊고, `bridgeDiagnostics.stage === "call_extension_action"` + 동일 진단 필드를 남겨 bridge callback 무응답과 CDP transport 실패를 분리
 - `bridge_timeout` 응답에는 follow-up diagnostics 포함:
-  - `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)`
-  - `GET_QUEUE`
+  - `GET_DIRECT_PUBLISH_STATE(includeCaptchaContext: true)` — v1.8.33부터 direct publish confirmation recovery 상태면 compact `confirmationState` / `publishConfirmationRecovery`를 함께 요약
+  - `GET_QUEUE` — v1.8.33부터 `publish_confirm_paused` 항목의 `publishConfirmTabId`, `confirmationState`, `publishConfirmationRecovery`를 recent/paused summary에 포함
   - 가능할 때 `GET_CAPTCHA_CONTEXT` / `GET_CAPTCHA_ARTIFACTS`
 - bulky `artifact.dataUrl`는 제거하고 compact summary만 남겨, 크론 로그가 base64 blob으로 오염되지 않음
 - 정상 응답에도 `bridgeMeta.startedAt/finishedAt/runtimeTimeoutMs/apiTarget`를 붙여 호출 provenance를 남김
@@ -388,11 +389,21 @@ timeout 예시:
 {
   "success": false,
   "status": "bridge_timeout",
-  "error": "PREPARE_EDITOR did not return a callback within 300ms.",
+  "error": "RESUME_AFTER_PUBLISH_CONFIRMATION did not return a callback within 300ms.",
   "bridgeDiagnostics": {
-    "inferredCause": "editor_prepare_unresolved",
+    "inferredCause": "queue_publish_confirmation_paused",
     "directState": { "directPublish": null },
-    "queueState": { "total": 0 },
+    "queueState": {
+      "total": 1,
+      "publishConfirmPausedItems": [
+        {
+          "id": "item-1",
+          "publishConfirmTabId": 777,
+          "confirmationState": "confirm_in_flight",
+          "recommendedAction": "poll_same_tab_before_retry"
+        }
+      ]
+    },
     "captchaContext": null,
     "captchaArtifacts": null
   }
@@ -422,6 +433,7 @@ timeout 예시:
 
 - `bridge_setup_error`는 callback timeout 전에 **Chrome DevTools / API page 준비 단계**에서 막힌 경우입니다. `bridgeDiagnostics.inferredCause`가 `devtools_unreachable`이면 Chrome/CDP 자체를, `api_page_target_missing`이면 extension API page 탭/로드 상태를 먼저 봅니다.
 - `bridge_transport_error`는 API page target은 잡았지만 `Runtime.evaluate` / websocket transport가 중간에 끊긴 경우입니다. MV3 worker idle 종료 문제가 아니라 CDP lane 자체가 흔들린 것이므로, browser/DevTools 쪽 복구를 우선합니다.
+- `bridge_timeout`의 `inferredCause`가 `direct_publish_confirmation_pending` 또는 `queue_publish_confirmation_paused`이면 wrapper가 죽은 것이 아니라 확장 callback이 같은 탭 최종 확인 상태에서 돌아오지 않은 것입니다. `bridgeDiagnostics.directState` 또는 `queueState.publishConfirmPausedItems[]`의 tab/state를 보고 같은 탭 poll/remote-state 확인으로 이어가고, fresh editor rewrite는 마지막 fallback으로만 둡니다.
 - 실제 크론에서는 이 래퍼를 먼저 쓰고, 터미널/cron hard timeout은 wrapper timeout보다 넉넉한 마지막 safety net으로만 둡니다.
 
 ---
@@ -471,12 +483,15 @@ timeout 예시:
 
 ---
 
-## 발행 상태 코드 (v1.8.32)
+## 발행 상태 코드 (v1.8.33)
 
 응답의 `status` 필드로 발행 결과를 세밀하게 구분할 수 있습니다:
 
 | 상태 | 설명 | 다음 액션 |
 |------|------|-----------|
+| `bridge_setup_error` | CLI 래퍼가 extension callback 전 Chrome DevTools/API page bootstrap에 실패 | `bridgeDiagnostics.stage` / `inferredCause` 확인 후 Chrome/CDP 또는 API page target 복구 |
+| `bridge_transport_error` | API page target은 있으나 websocket/evaluate transport가 실패 | CDP/browser lane 안정화 후 재시도 |
+| `bridge_timeout` | extension callback이 wrapper timeout 안에 돌아오지 않음. v1.8.33부터 direct/queue publish-confirmation 상태를 `direct_publish_confirmation_pending` / `queue_publish_confirmation_paused`로 분리 | `bridgeDiagnostics`의 direct/queue state를 보고 CAPTCHA/최종확인 same-tab recovery를 먼저 처리 |
 | `editor_ready` | `PREPARE_EDITOR`가 실제 TinyMCE/editor body까지 준비된 탭 확보 완료 | `WRITE_POST` 호출 |
 | `body_image_policy_violation` | `scripts/blog_auto_call.mjs` 또는 서비스워커 `WRITE_POST` / `ADD_TO_QUEUE` 입구가 generated body image provenance를 검사했고, Hermes `image_generate` → `openai-codex` / `gpt-image-2-medium` 외 경로(PIL/Pillow, `baoyu-*`, 수제 인포그래픽 등)를 발견 | payload 이미지 생성 경로를 Hermes `image_generate`로 다시 만들고 `generation` metadata를 붙여 재호출. 상품/외부 이미지면 generated metadata를 붙이지 않음 |
 | `blog_not_configured` | 자동으로 열 블로그명을 알 수 없음 | 설정 저장 또는 `data.blogName` 전달 |

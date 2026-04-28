@@ -175,6 +175,33 @@ function compactCaptchaSubmitResult(result) {
   };
 }
 
+function compactPublishConfirmationState(confirmationState) {
+  if (!isPlainObject(confirmationState)) return confirmationState ?? null;
+  return {
+    state: confirmationState.state ?? null,
+    publishLayerPresent: confirmationState.publishLayerPresent ?? null,
+    confirmButtonPresent: confirmationState.confirmButtonPresent ?? null,
+    confirmButtonText: confirmationState.confirmButtonText ?? null,
+    confirmButtonDisabled: confirmationState.confirmButtonDisabled ?? null,
+    progressTextPresent: confirmationState.progressTextPresent ?? null,
+    captchaPresent: confirmationState.captchaPresent ?? null,
+    safeToRetryFinalConfirm: confirmationState.safeToRetryFinalConfirm ?? null,
+    safeToPollSameTab: confirmationState.safeToPollSameTab ?? null,
+    recommendedAction: confirmationState.recommendedAction ?? null
+  };
+}
+
+function compactPublishConfirmationRecovery(recovery) {
+  if (!isPlainObject(recovery)) return recovery ?? null;
+  return {
+    status: recovery.status ?? null,
+    retryable: recovery.retryable ?? null,
+    sameTabRequired: recovery.sameTabRequired ?? null,
+    recommendedAction: recovery.recommendedAction ?? null,
+    updatedAt: recovery.updatedAt ?? null
+  };
+}
+
 function summarizeDirectStateForDiagnostics(directState) {
   if (!isPlainObject(directState)) return directState ?? null;
   const directPublish = isPlainObject(directState.directPublish)
@@ -187,6 +214,9 @@ function summarizeDirectStateForDiagnostics(directState) {
         publishTrace: directState.directPublish.publishTrace ?? null,
         stage: directState.directPublish.stage ?? null,
         phase: directState.directPublish.phase ?? null,
+        status: directState.directPublish.status ?? null,
+        confirmationState: compactPublishConfirmationState(directState.directPublish.confirmationState),
+        publishConfirmationRecovery: compactPublishConfirmationRecovery(directState.directPublish.publishConfirmationRecovery),
         captchaContext: compactCaptchaContext(directState.directPublish.captchaContext),
         solveHints: compactSolveHints(directState.directPublish.solveHints),
         lastCaptchaSubmitResult: compactCaptchaSubmitResult(directState.directPublish.lastCaptchaSubmitResult),
@@ -217,6 +247,9 @@ function summarizeQueueStateForDiagnostics(queueState) {
     status: item?.status ?? null,
     publishStatus: item?.publishStatus ?? null,
     captchaTabId: item?.captchaTabId ?? null,
+    publishConfirmTabId: item?.publishConfirmTabId ?? null,
+    confirmationState: item?.confirmationState?.state ?? null,
+    publishConfirmationRecovery: compactPublishConfirmationRecovery(item?.publishConfirmationRecovery),
     error: item?.error ?? null
   }));
 
@@ -232,6 +265,20 @@ function summarizeQueueStateForDiagnostics(queueState) {
       submitField: item?.solveHints?.submitField ?? null
     }));
 
+  const publishConfirmPausedItems = queue
+    .filter((item) => item?.status === 'publish_confirm_paused')
+    .slice(0, 3)
+    .map((item) => ({
+      id: item?.id ?? null,
+      status: item?.status ?? null,
+      publishStatus: item?.publishStatus ?? null,
+      publishConfirmTabId: item?.publishConfirmTabId ?? null,
+      confirmationState: item?.confirmationState?.state ?? null,
+      recommendedAction: item?.publishConfirmationRecovery?.recommendedAction
+        ?? item?.confirmationState?.recommendedAction
+        ?? null
+    }));
+
   return {
     success: queueState.success ?? null,
     status: queueState.status ?? null,
@@ -241,6 +288,7 @@ function summarizeQueueStateForDiagnostics(queueState) {
     total: queue.length,
     counts,
     captchaPausedItems,
+    publishConfirmPausedItems,
     recentItems
   };
 }
@@ -292,10 +340,22 @@ function classifyBridgeTimeoutCause({ action, directState, queueState, captchaCo
     return 'direct_publish_captcha_wait_active';
   }
 
+  const directPublishStatus = String(directPublish?.status || '').trim();
+  if (directPublish?.phase === 'publish_confirmation'
+    || directPublishStatus.startsWith('publish_confirm_')
+    || directPublish?.publishConfirmationRecovery?.status) {
+    return 'direct_publish_confirmation_pending';
+  }
+
   const queueItems = Array.isArray(queueState?.queue) ? queueState.queue : [];
   const pausedItem = queueItems.find((item) => item?.status === 'captcha_paused');
   if (pausedItem) {
     return 'queue_captcha_paused';
+  }
+
+  const publishConfirmPausedItem = queueItems.find((item) => item?.status === 'publish_confirm_paused');
+  if (publishConfirmPausedItem) {
+    return 'queue_publish_confirmation_paused';
   }
 
   if (directRuntime?.active) {

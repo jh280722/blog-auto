@@ -70,6 +70,52 @@ test('classifyBridgeTimeoutCause reports paused queue captcha items when queue r
   assert.equal(cause, 'queue_captcha_paused');
 });
 
+test('classifyBridgeTimeoutCause surfaces direct publish confirmation recovery before generic runtime causes', () => {
+  const cause = classifyBridgeTimeoutCause({
+    action: 'RESUME_DIRECT_PUBLISH',
+    directState: {
+      success: true,
+      directPublish: {
+        tabId: 321,
+        phase: 'publish_confirmation',
+        status: 'publish_confirm_in_flight',
+        publishConfirmationRecovery: {
+          status: 'publish_confirm_in_flight',
+          recommendedAction: 'poll_same_tab_before_retry'
+        }
+      },
+      directPublishRuntimeState: { active: true }
+    },
+    queueState: { success: true, queue: [], queueRuntimeState: { active: false } }
+  });
+
+  assert.equal(cause, 'direct_publish_confirmation_pending');
+});
+
+test('classifyBridgeTimeoutCause reports queue publish confirmation pauses before generic queue runtime causes', () => {
+  const cause = classifyBridgeTimeoutCause({
+    action: 'RESUME_AFTER_PUBLISH_CONFIRMATION',
+    directState: { success: true, directPublish: null, directPublishRuntimeState: { active: false } },
+    queueState: {
+      success: true,
+      queue: [
+        { id: 'done', status: 'completed' },
+        {
+          id: 'confirm-1',
+          status: 'publish_confirm_paused',
+          publishConfirmTabId: 777,
+          confirmationState: { state: 'confirm_in_flight' },
+          publishConfirmationRecovery: { recommendedAction: 'poll_same_tab_before_retry' }
+        }
+      ],
+      isProcessing: true,
+      queueRuntimeState: { active: true }
+    }
+  });
+
+  assert.equal(cause, 'queue_publish_confirmation_paused');
+});
+
 test('summarizeQueueStateForDiagnostics keeps queue diagnostics compact but actionable', () => {
   const summary = summarizeQueueStateForDiagnostics({
     success: true,
@@ -86,6 +132,14 @@ test('summarizeQueueStateForDiagnostics keeps queue diagnostics compact but acti
         solveHints: { submitField: 'ocrTexts' },
         captchaContext: { preferredSolveMode: 'extension_frame_dom' }
       },
+      {
+        id: 'confirm-1',
+        status: 'publish_confirm_paused',
+        publishStatus: 'publish_confirm_in_flight',
+        publishConfirmTabId: 505,
+        confirmationState: { state: 'confirm_in_flight', recommendedAction: 'poll_same_tab_before_retry' },
+        publishConfirmationRecovery: { status: 'publish_confirm_in_flight', recommendedAction: 'poll_same_tab_before_retry' }
+      },
       { id: 'failed-1', status: 'failed', error: 'boom' },
       { id: 'done-1', status: 'completed' }
     ]
@@ -95,10 +149,11 @@ test('summarizeQueueStateForDiagnostics keeps queue diagnostics compact but acti
     pending: 1,
     processing: 1,
     captcha_paused: 1,
+    publish_confirm_paused: 1,
     failed: 1,
     completed: 1
   });
-  assert.equal(summary.total, 5);
+  assert.equal(summary.total, 6);
   assert.equal(summary.captchaPausedItems.length, 1);
   assert.deepEqual(summary.captchaPausedItems[0], {
     id: 'paused-1',
@@ -108,7 +163,17 @@ test('summarizeQueueStateForDiagnostics keeps queue diagnostics compact but acti
     preferredSolveMode: 'extension_frame_dom',
     submitField: 'ocrTexts'
   });
+  assert.deepEqual(summary.publishConfirmPausedItems[0], {
+    id: 'confirm-1',
+    status: 'publish_confirm_paused',
+    publishStatus: 'publish_confirm_in_flight',
+    publishConfirmTabId: 505,
+    confirmationState: 'confirm_in_flight',
+    recommendedAction: 'poll_same_tab_before_retry'
+  });
   assert.equal(summary.recentItems.length, 5);
+  assert.equal(summary.recentItems.at(-3).publishConfirmTabId, 505);
+  assert.equal(summary.recentItems.at(-3).confirmationState, 'confirm_in_flight');
 });
 
 test('summarizeCaptchaArtifactsForDiagnostics strips bulky image payloads but keeps artifact metadata', () => {

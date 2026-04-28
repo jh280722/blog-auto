@@ -26,8 +26,21 @@ const PUBLISH_CONFIRMATION_RECOVERY_STATUSES = new Set([
   'publish_confirm_in_flight'
 ]);
 
+const DIRECT_PUBLISH_CONFIRMATION_TERMINAL_STATUSES = new Set([
+  ...PUBLISH_CONFIRMATION_RECOVERY_STATUSES,
+  'publish_confirm_target_not_found'
+]);
+
 export function isPublishConfirmationRecoveryStatus(status) {
   return PUBLISH_CONFIRMATION_RECOVERY_STATUSES.has(normalizeCompactText(status));
+}
+
+export function isDirectPublishConfirmationRecoveryState(state = null) {
+  if (!state || typeof state !== 'object') return false;
+  const status = normalizeCompactText(state.status);
+  const phase = normalizeCompactText(state.phase);
+  return phase === 'publish_confirmation'
+    || DIRECT_PUBLISH_CONFIRMATION_TERMINAL_STATUSES.has(status);
 }
 
 export function summarizePublishConfirmationStateForRecovery(confirmationState = null) {
@@ -75,6 +88,37 @@ export function buildDirectPublishConfirmationRecoveryPatch({ response = null, n
     status: response.status,
     confirmationState,
     publishConfirmationRecovery: buildPublishConfirmationRecoverySummary({ response, nowIso })
+  };
+}
+
+export function buildDirectPublishConfirmationTargetMissingResult({
+  state = null,
+  tabId = null,
+  diagnostics = null,
+  error = null,
+  nowIso = new Date().toISOString()
+} = {}) {
+  const normalizedTabId = normalizePositiveInteger(tabId) ?? normalizePositiveInteger(state?.tabId);
+  const confirmationState = summarizePublishConfirmationStateForRecovery(state?.confirmationState);
+  const resolvedError = normalizeCompactText(error)
+    || '저장된 티스토리 최종 확인 탭을 찾지 못했습니다. 새 글쓰기 탭을 열어 재작성하지 말고, 원격 발행 상태를 먼저 확인한 뒤 재시도하세요.';
+
+  return {
+    success: false,
+    status: 'publish_confirm_target_not_found',
+    error: resolvedError,
+    tabId: normalizedTabId,
+    sameTabRequired: true,
+    recommendedAction: 'verify_remote_state_before_retry',
+    confirmationState,
+    publishConfirmationRecovery: {
+      status: 'publish_confirm_target_not_found',
+      retryable: false,
+      sameTabRequired: true,
+      recommendedAction: 'verify_remote_state_before_retry',
+      updatedAt: nowIso
+    },
+    diagnostics: cloneJsonValue(diagnostics) ?? null
   };
 }
 

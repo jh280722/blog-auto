@@ -69,11 +69,13 @@ import { buildMergedDirectPublishCaptchaState } from '../utils/direct-publish-ca
 import {
   buildDirectPublishConfirmationRecoveryPatch,
   buildDirectPublishConfirmationResumePreflight,
+  buildDirectPublishConfirmationTargetMissingResult,
   buildQueuePublishConfirmationPauseState,
   buildQueuePublishConfirmationResumePreflight,
   clearQueuePublishConfirmationPauseState,
   findQueuePublishConfirmationItem,
   getQueuePublishConfirmationSelectionFailure,
+  isDirectPublishConfirmationRecoveryState,
   isPublishConfirmationRecoveryStatus,
   summarizeQueuePublishConfirmationSelection
 } from '../utils/publish-confirmation-recovery.js';
@@ -3121,6 +3123,26 @@ async function getLiveDirectPublishState(options = {}) {
       await updateDirectPublishState({ url: tab.url });
     }
   } catch (error) {
+    if (isDirectPublishConfirmationRecoveryState(snapshot)) {
+      const nowIso = new Date().toISOString();
+      const missingTargetState = {
+        ...snapshot,
+        ...buildTransitionPatch(snapshot, 'publish_confirmation_target_missing', {
+          phase: 'publish_confirmation',
+          status: 'publish_confirm_target_not_found',
+          tabId: snapshot.tabId || null
+        }),
+        phase: 'publish_confirmation',
+        stage: 'target_tab_missing',
+        status: 'publish_confirm_target_not_found',
+        lastProbeError: error?.message || String(error),
+        lastProbeAt: nowIso,
+        lastCheckedAt: nowIso
+      };
+      await setDirectPublishState(missingTargetState);
+      return enrichDirectPublishStateWithSolveHints(missingTargetState);
+    }
+
     await clearDirectPublishState();
     return null;
   }
@@ -4696,6 +4718,44 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
       allowCaptchaBlocked: waitOptions.enabled
     });
   }
+  const directConfirmationRecoveryState = liveState || directPublishState || null;
+  if (!preparation && isDirectPublishConfirmationRecoveryState(directConfirmationRecoveryState)) {
+    const diagnostics = directConfirmationRecoveryState?.diagnostics || {
+      requestedBlogName: mergedRequestData.blogName || null,
+      blogName: mergedRequestData.blogName || directConfirmationRecoveryState?.blogName || null,
+      currentTabId,
+      candidateCount: directConfirmationRecoveryState?.tabId ? 1 : 0,
+      source: 'direct_publish_confirmation_state',
+      entryStrategy: 'fail_closed_before_fresh_editor',
+      entryPath: [{
+        step: 'direct_publish_confirmation_target_missing',
+        tabId: directConfirmationRecoveryState?.tabId || null,
+        url: directConfirmationRecoveryState?.url || null
+      }],
+      attempts: []
+    };
+    const nowIso = new Date().toISOString();
+    await setDirectPublishState({
+      ...directConfirmationRecoveryState,
+      ...buildTransitionPatch(directConfirmationRecoveryState, 'publish_confirmation_target_missing', {
+        phase: 'publish_confirmation',
+        status: 'publish_confirm_target_not_found',
+        tabId: directConfirmationRecoveryState?.tabId || null
+      }),
+      phase: 'publish_confirmation',
+      stage: 'target_tab_missing',
+      status: 'publish_confirm_target_not_found',
+      diagnostics,
+      requestData: normalizeDirectPublishRequestData(mergedRequestData),
+      lastCheckedAt: nowIso
+    });
+    return attachCaptchaWait(attachDirectPublishState(buildDirectPublishConfirmationTargetMissingResult({
+      state: directPublishState,
+      tabId: options.preferredTabId || directConfirmationRecoveryState?.tabId || null,
+      diagnostics,
+      nowIso
+    })), null);
+  }
   if (!preparation) {
     preparation = await prepareEditorTab({ blogName: mergedRequestData.blogName || directPublishState?.blogName || null });
   }
@@ -4921,10 +4981,8 @@ async function resumeDirectPublishFlow(requestData = {}, options = {}) {
   }
 
   const isDirectPublishConfirmationRecovery =
-    isPublishConfirmationRecoveryStatus(liveState?.status)
-    || isPublishConfirmationRecoveryStatus(directPublishState?.status)
-    || liveState?.phase === 'publish_confirmation'
-    || directPublishState?.phase === 'publish_confirmation';
+    isDirectPublishConfirmationRecoveryState(liveState)
+    || isDirectPublishConfirmationRecoveryState(directPublishState);
 
   if (isDirectPublishConfirmationRecovery) {
     const confirmationDiagnostics = preparation.diagnostics || { attempts: [] };

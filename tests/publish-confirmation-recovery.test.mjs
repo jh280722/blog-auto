@@ -4,10 +4,12 @@ import assert from 'node:assert/strict';
 import {
   buildDirectPublishConfirmationRecoveryPatch,
   buildDirectPublishConfirmationResumePreflight,
+  buildDirectPublishConfirmationTargetMissingResult,
   buildQueuePublishConfirmationPauseState,
   buildQueuePublishConfirmationResumePreflight,
   findQueuePublishConfirmationItem,
   getQueuePublishConfirmationSelectionFailure,
+  isDirectPublishConfirmationRecoveryState,
   isPublishConfirmationRecoveryStatus,
   summarizeQueuePublishConfirmationSelection
 } from '../utils/publish-confirmation-recovery.js';
@@ -125,6 +127,43 @@ test('buildDirectPublishConfirmationResumePreflight converts direct confirmation
   assert.equal(preflight.status, 'captcha_required');
   assert.equal(preflight.sameTabRequired, true);
   assert.equal(preflight.confirmationState.captchaPresent, true);
+});
+
+test('isDirectPublishConfirmationRecoveryState includes stored publish-confirmation phase and target-missing state', () => {
+  assert.equal(isDirectPublishConfirmationRecoveryState({ status: 'publish_confirm_unresolved' }), true);
+  assert.equal(isDirectPublishConfirmationRecoveryState({ phase: 'publish_confirmation', status: 'publish_confirm_target_not_found' }), true);
+  assert.equal(isDirectPublishConfirmationRecoveryState({ phase: 'captcha_handoff', status: 'captcha_required' }), false);
+  assert.equal(isDirectPublishConfirmationRecoveryState(null), false);
+});
+
+test('buildDirectPublishConfirmationTargetMissingResult fails closed before a fresh editor rewrite', () => {
+  const result = buildDirectPublishConfirmationTargetMissingResult({
+    state: {
+      tabId: 456,
+      phase: 'publish_confirmation',
+      status: 'publish_confirm_in_flight',
+      confirmationState: {
+        state: 'confirm_in_flight',
+        publishLayerPresent: true,
+        confirmButtonPresent: true,
+        confirmButtonText: '저장중',
+        confirmButtonDisabled: true,
+        safeToPollSameTab: true
+      }
+    },
+    diagnostics: { attempts: [{ step: 'probe_saved_direct_publish_tab', error: 'No tab with id: 456' }] },
+    nowIso: '2026-04-27T02:03:04.000Z'
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.status, 'publish_confirm_target_not_found');
+  assert.equal(result.tabId, 456);
+  assert.equal(result.sameTabRequired, true);
+  assert.equal(result.recommendedAction, 'verify_remote_state_before_retry');
+  assert.equal(result.confirmationState.state, 'confirm_in_flight');
+  assert.equal(result.publishConfirmationRecovery.status, 'publish_confirm_target_not_found');
+  assert.equal(result.publishConfirmationRecovery.updatedAt, '2026-04-27T02:03:04.000Z');
+  assert.deepEqual(result.diagnostics, { attempts: [{ step: 'probe_saved_direct_publish_tab', error: 'No tab with id: 456' }] });
 });
 
 test('buildQueuePublishConfirmationPauseState pauses a queue item without CAPTCHA metadata or next-item continuation', () => {
